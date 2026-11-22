@@ -20,7 +20,8 @@
 </p>
 
 quartz is a small inference engine for **two-card** gfx906 (MI50/MI60 32 GB) systems.<br>
-It runs a short list of models, all as plain **Q8_0** GGUF files. It does not run on a single card.
+It runs a short list of models as **Q8_0** GGUF files only (other quantisations are refused).<br>
+It needs **exactly two cards with P2P** between them: no single-card or 4-card mode.
 
 </div>
 
@@ -33,7 +34,7 @@ It runs a short list of models, all as plain **Q8_0** GGUF files. It does not ru
 
 | Role | Model |
 |:---|:---|
-| **Target** | [Qwen3.8-27B Q8_0](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF?show_file_info=Qwen3.8-27B-Q8_0.gguf) or any fine-tune like Swift. Must have MTP block |
+| **Target** | [Qwen3.8-27B Q8_0](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF?show_file_info=Qwen3.8-27B-Q8_0.gguf), or any fine-tune (e.g. Swift) quantised to Q8_0. It must keep the MTP block |
 | **DSpine drafter** *(optional)* | [Qwen3.8-27B DSpine draft](https://huggingface.co/aj9o9/Qwen3.8-27B-DSpine-b16-GGUF?show_file_info=Qwen3.8-27B-DSpine-b16-Q8_0.gguf) |
 | **Vision projector** *(optional)* | [Qwen3.8-27B mmproj](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/mmproj-F16.gguf) |
 
@@ -99,7 +100,8 @@ It runs a short list of models, all as plain **Q8_0** GGUF files. It does not ru
 
 ### Requirements
 
-- Two AMD MI50/60 32 GB cards and ROCm
+- Two AMD MI50/60 32 GB cards with PCIe peer access, and ROCm
+- About 59 GB of VRAM across the two cards at the default context with DSpine
 - A C++17 compiler, Python 3 with `jinja2`
 - The target model GGUF (optional: the DSpine draft and the vision projector)
 

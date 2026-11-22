@@ -9,34 +9,32 @@ defaults and environment variables are in
 
 | | Item | Needed for |
 |---|---|---|
-| GPU | 2× AMD MI50 (gfx906), 32 GB, PCIe peer access | all |
+| GPU | exactly 2× AMD MI50/MI60 (gfx906) 32 GB, with PCIe peer access | all |
 | Toolchain | ROCm: `hipcc`, HIP runtime, rocBLAS; a C++17 compiler | build, run |
-| Model (`--model`) | Qwen3.8-27B Q8_0 GGUF **with the nextn (MTP) block**, ~28 GB | all |
+| Model (`--model`) | Qwen3.8-27B (or a fine-tune) as **Q8_0** GGUF, **with the nextn (MTP) block**, ~28 GB | all |
 | Drafter (`--dspine`) | DSpine draft GGUF, ~2.1 GB | decode |
 | Projector (`--mmproj`) | `qwen3vl_merger` vision GGUF, ~0.9 GB | images |
 | Runtime | Python 3 with `jinja2` | server |
 
 ## Hardware
 
-- **Two gfx906 cards** with peer access between them. The server selects them
-  among the visible devices, so nothing has to be exported; `QZ_DEVICES` picks
-  a different pair when more than two are visible.
-- **gfx906 only.** The build targets `--offload-arch=gfx906`;
-  `quartz/dspine.h` carries `v_dot4_i32_i8` inline asm.
-- **60 CUs, 64 KB LDS.** Every persistent kernel launches 60 blocks × 512
-  threads and synchronizes through a grid barrier. Load checks the occupancy of
-  each specialization and aborts ("grid barrier would hang") when
-  `blocks_per_cu × CUs < 60`; extra CUs pass and stay unused.
-- **32 GB per card.** The default context takes 29.7 GB of 34.3 per card:
-  weights 15.2, KV 9.1, DSpine 3.8, scratch 0.6. The 8 prefix-cache snapshots
-  live in pinned host memory, ~75 MB per slot per card. The server prints the
-  per-card ledger at start.
-- **Prefill headroom.** Below the 2048-row prefill buffers plus 256 MB free on
-  either card, batched prefill is turned off, and with it DSpine and image
-  input: `--dspine` falls back to MTP with a log line, while a DSpine
-  *initialization* failure aborts the load.
-- **P2P over PCIe** requires `HSA_FORCE_FINE_GRAIN_PCIE=1`; the server sets it
-  and `GPU_MAX_HW_QUEUES=8` unless already set.
+- **Exactly two gfx906 cards, 32 GB each, with PCIe peer access (P2P)
+  between them.** The model is split across the pair and the cards exchange
+  data directly at every layer, so there is no single-card mode, no mode for
+  three or more cards, and no fallback without P2P. With more than two cards
+  visible the server uses one pair; `QZ_DEVICES=a,b` picks which.
+- **Memory.** The default context (262144 tokens) with DSpine uses about
+  **59 GB of the ~69 GB** the two cards report: weights 30.4, KV cache 18.2,
+  DSpine 7.6, buffers 3.2. Without DSpine it is about 52 GB, and a smaller
+  `--max-ctx` shrinks the KV cache. The prefix cache adds about 1.2 GB of
+  pinned host RAM. The server prints the full ledger at start.
+  If less than 256 MB stays free after the load, batched prefill is turned
+  off, and with it DSpine and image input (the start log says so).
+- **gfx906 only** (MI50, MI60). The kernels use gfx906 instructions and assume
+  its 60 CUs and 64 KB of LDS; load aborts on a card where they do not fit.
+- **P2P setup.** The server sets `HSA_FORCE_FINE_GRAIN_PCIE=1` and
+  `GPU_MAX_HW_QUEUES=8` unless already set. If the cards have no peer access,
+  see [Troubleshooting](troubleshooting.md#cards).
 
 ## Build
 
@@ -49,12 +47,17 @@ defaults and environment variables are in
 
 ## Models
 
-Those three GGUFs are the only supported ones: their geometry is fixed and
-checked at load, so another architecture, quantisation or vocabulary is refused
-with the reason. The target must carry the nextn (MTP) block — decode drafts
-with it or verifies with DSpine, there is no plain autoregressive path — and the
-draft must come from the same base, since it reads the target's embeddings.
-Images are resized to at most 4096 tokens and always decode on MTP.
+Only the GGUFs in the table above are supported, and the target and the
+draft must be **Q8_0** (the projector is the F16 file). This is a hard limit,
+not a tested-only list: the kernels read Q8_0 weights and nothing else, so
+Q6_K, Q4_K_M and other quantisations are refused at load with the reason. Any fine-tune of Qwen3.8-27B works if it is Q8_0 and keeps
+the nextn (MTP) block.
+
+- The target must have the MTP block: decode always drafts with MTP or
+  DSpine, there is no plain token-by-token path.
+- The DSpine draft must come from the same base model, since it reads the
+  target's embeddings.
+- Images are resized to at most 4096 tokens and always decode on MTP.
 
 ## Server
 

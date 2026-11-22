@@ -55,4 +55,4 @@ decode on MTP.
 At start quartz checks that the context fits on both cards and that the peer
 link works before loading anything (`preflight.h`), then prints a per-card
 ledger of what it allocated (`mem.h`). The default context (262144 tokens)
-takes about 30 GB per card with DSpine.
+takes about 59 GB in total with DSpine (half on each card).

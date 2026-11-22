@@ -20,7 +20,7 @@ Every switch and its default. Measured on 2× MI50 with the pi model and DSpine,
 | `--mmproj` | unset | `qwen3vl_merger` projector; enables image input |
 | `--lib` | `build/bin/libquartz.so` | Engine library |
 | `--host`, `--port` | `127.0.0.1`, `8090` | Bind address, no authentication |
-| `--max-ctx` | `262144` | Context length, at least 1024; 262144 takes 29.7 GB per card |
+| `--max-ctx` | `262144` | Context length, at least 1024; 262144 takes about 59 GB in total with DSpine |
 | `--slot-t` | `0` | Rows per cycle: 3, 4, or 0 adaptive |
 | `--slack` | `1` | Adaptive depth slack |
 | `--temp` | `1.0` | Default temperature, 0 is greedy |
