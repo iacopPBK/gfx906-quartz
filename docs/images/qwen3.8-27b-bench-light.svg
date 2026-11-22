@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 895" width="880" height="895" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<text x="30" y="36" font-size="20" font-weight="700" fill="#1f2328">Qwen3.8-27B Q8_0 on 2x MI50 @ 135W</text>
+<text x="30" y="58" font-size="12" fill="#656d76">Swift-1.5 fine-tune, tok/s, higher is better</text>
+<text x="30" y="96" font-size="14" font-weight="600" fill="#1f2328">Prefill, pp2048</text>
+<text x="30" y="136" font-size="12" fill="#1f2328">0 ctx</text>
+<rect x="150" y="112" width="543.9" height="18" rx="3" fill="#3b82f6"/>
+<text x="701.9" y="125" font-size="12" fill="#1f2328">777  <tspan fill="#656d76">quartz</tspan></text>
+<rect x="150" y="134" width="457.8" height="18" rx="3" fill="#9aa4af"/>
+<text x="615.8" y="147" font-size="12" fill="#1f2328">654  <tspan fill="#656d76">llama.cpp</tspan></text>
+<text x="30" y="194" font-size="12" fill="#1f2328">16k ctx</text>
+<rect x="150" y="170" width="441.7" height="18" rx="3" fill="#3b82f6"/>
+<text x="599.7" y="183" font-size="12" fill="#1f2328">631  <tspan fill="#656d76">quartz</tspan></text>
+<rect x="150" y="192" width="349.3" height="18" rx="3" fill="#9aa4af"/>
+<text x="507.3" y="205" font-size="12" fill="#1f2328">499  <tspan fill="#656d76">llama.cpp</tspan></text>
+<text x="30" y="250" font-size="14" font-weight="600" fill="#1f2328">Decode, 400 tokens, sampled</text>
+<rect x="520" y="238" width="12" height="12" rx="2" fill="#9aa4af"/><text x="538" y="249" font-size="12" fill="#1f2328">MTP</text>
+<rect x="610" y="238" width="12" height="12" rx="2" fill="#8b5cf6"/><text x="628" y="249" font-size="12" fill="#1f2328">DSpine</text>
+<rect x="700" y="238" width="12" height="12" rx="2" fill="#14b8a6"/><text x="718" y="249" font-size="12" fill="#1f2328">SWITCH</text>
+<line x1="172.0" y1="262" x2="172.0" y2="530" stroke="#d8dee4" stroke-width="1"/>
+<text x="172.0" y="544" font-size="11" text-anchor="middle" fill="#656d76">0</text>
+<line x1="345.3" y1="262" x2="345.3" y2="530" stroke="#d8dee4" stroke-width="1"/>
+<text x="345.3" y="544" font-size="11" text-anchor="middle" fill="#656d76">50</text>
+<line x1="518.7" y1="262" x2="518.7" y2="530" stroke="#d8dee4" stroke-width="1"/>
+<text x="518.7" y="544" font-size="11" text-anchor="middle" fill="#656d76">100</text>
+<line x1="692.0" y1="262" x2="692.0" y2="530" stroke="#d8dee4" stroke-width="1"/>
+<text x="692.0" y="544" font-size="11" text-anchor="middle" fill="#656d76">150</text>
+<text x="30" y="296" font-size="12" fill="#1f2328">C code</text>
+<rect x="172" y="266" width="329.3" height="14" rx="3" fill="#9aa4af"/>
+<text x="507.3" y="277" font-size="11" fill="#1f2328">95.0</text>
+<rect x="172" y="283" width="377.9" height="14" rx="3" fill="#8b5cf6"/>
+<text x="555.9" y="294" font-size="11" fill="#1f2328">109.0</text>
+<rect x="172" y="300" width="380.3" height="14" rx="3" fill="#14b8a6"/>
+<text x="558.3" y="311" font-size="11" fill="#1f2328">109.7</text>
+<text x="30" y="350" font-size="12" fill="#1f2328">Python code</text>
+<rect x="172" y="320" width="322.1" height="14" rx="3" fill="#9aa4af"/>
+<text x="500.1" y="331" font-size="11" fill="#1f2328">92.9</text>
+<rect x="172" y="337" width="393.8" height="14" rx="3" fill="#8b5cf6"/>
+<text x="571.8" y="348" font-size="11" fill="#1f2328">113.6</text>
+<rect x="172" y="354" width="394.2" height="14" rx="3" fill="#14b8a6"/>
+<text x="572.2" y="365" font-size="11" fill="#1f2328">113.7</text>
+<text x="30" y="404" font-size="12" fill="#1f2328">JSON</text>
+<rect x="172" y="374" width="357.4" height="14" rx="3" fill="#9aa4af"/>
+<text x="535.4" y="385" font-size="11" fill="#1f2328">103.1</text>
+<rect x="172" y="391" width="479.1" height="14" rx="3" fill="#8b5cf6"/>
+<text x="657.1" y="402" font-size="11" fill="#1f2328">138.2</text>
+<rect x="172" y="408" width="480.8" height="14" rx="3" fill="#14b8a6"/>
+<text x="658.8" y="419" font-size="11" fill="#1f2328">138.7</text>
+<text x="30" y="458" font-size="12" fill="#1f2328">Explanation</text>
+<rect x="172" y="428" width="259.7" height="14" rx="3" fill="#9aa4af"/>
+<text x="437.7" y="439" font-size="11" fill="#1f2328">74.9</text>
+<rect x="172" y="445" width="263.8" height="14" rx="3" fill="#8b5cf6"/>
+<text x="441.8" y="456" font-size="11" fill="#1f2328">76.1</text>
+<rect x="172" y="462" width="269.0" height="14" rx="3" fill="#14b8a6"/>
+<text x="447.0" y="473" font-size="11" fill="#1f2328">77.6</text>
+<text x="30" y="512" font-size="12" fill="#1f2328">Prose</text>
+<rect x="172" y="482" width="214.6" height="14" rx="3" fill="#9aa4af"/>
+<text x="392.6" y="493" font-size="11" fill="#1f2328">61.9</text>
+<rect x="172" y="499" width="158.4" height="14" rx="3" fill="#8b5cf6"/>
+<text x="336.4" y="510" font-size="11" fill="#1f2328">45.7</text>
+<rect x="172" y="516" width="193.4" height="14" rx="3" fill="#14b8a6"/>
+<text x="371.4" y="527" font-size="11" fill="#1f2328">55.8</text>
+<text x="30" y="588" font-size="14" font-weight="600" fill="#1f2328">Mixed answers, 800 tokens</text>
+<line x1="172.0" y1="600" x2="172.0" y2="814" stroke="#d8dee4" stroke-width="1"/>
+<text x="172.0" y="828" font-size="11" text-anchor="middle" fill="#656d76">0</text>
+<line x1="345.3" y1="600" x2="345.3" y2="814" stroke="#d8dee4" stroke-width="1"/>
+<text x="345.3" y="828" font-size="11" text-anchor="middle" fill="#656d76">50</text>
+<line x1="518.7" y1="600" x2="518.7" y2="814" stroke="#d8dee4" stroke-width="1"/>
+<text x="518.7" y="828" font-size="11" text-anchor="middle" fill="#656d76">100</text>
+<line x1="692.0" y1="600" x2="692.0" y2="814" stroke="#d8dee4" stroke-width="1"/>
+<text x="692.0" y="828" font-size="11" text-anchor="middle" fill="#656d76">150</text>
+<text x="30" y="634" font-size="12" fill="#1f2328">Code → prose</text>
+<rect x="172" y="604" width="238.2" height="14" rx="3" fill="#9aa4af"/>
+<text x="416.2" y="615" font-size="11" fill="#1f2328">68.7</text>
+<rect x="172" y="621" width="220.8" height="14" rx="3" fill="#8b5cf6"/>
+<text x="398.8" y="632" font-size="11" fill="#1f2328">63.7</text>
+<rect x="172" y="638" width="249.3" height="14" rx="3" fill="#14b8a6"/>
+<text x="427.3" y="649" font-size="11" fill="#1f2328">71.9</text>
+<text x="30" y="688" font-size="12" fill="#1f2328">JSON → prose</text>
+<rect x="172" y="658" width="305.1" height="14" rx="3" fill="#9aa4af"/>
+<text x="483.1" y="669" font-size="11" fill="#1f2328">88.0</text>
+<rect x="172" y="675" width="321.0" height="14" rx="3" fill="#8b5cf6"/>
+<text x="499.0" y="686" font-size="11" fill="#1f2328">92.6</text>
+<rect x="172" y="692" width="361.6" height="14" rx="3" fill="#14b8a6"/>
+<text x="539.6" y="703" font-size="11" fill="#1f2328">104.3</text>
+<text x="30" y="742" font-size="12" fill="#1f2328">Prose → code</text>
+<rect x="172" y="712" width="228.5" height="14" rx="3" fill="#9aa4af"/>
+<text x="406.5" y="723" font-size="11" fill="#1f2328">65.9</text>
+<rect x="172" y="729" width="169.9" height="14" rx="3" fill="#8b5cf6"/>
+<text x="347.9" y="740" font-size="11" fill="#1f2328">49.0</text>
+<rect x="172" y="746" width="199.3" height="14" rx="3" fill="#14b8a6"/>
+<text x="377.3" y="757" font-size="11" fill="#1f2328">57.5</text>
+<text x="30" y="796" font-size="12" fill="#1f2328">Code → prose → code</text>
+<rect x="172" y="766" width="236.4" height="14" rx="3" fill="#9aa4af"/>
+<text x="414.4" y="777" font-size="11" fill="#1f2328">68.2</text>
+<rect x="172" y="783" width="207.7" height="14" rx="3" fill="#8b5cf6"/>
+<text x="385.7" y="794" font-size="11" fill="#1f2328">59.9</text>
+<rect x="172" y="800" width="316.9" height="14" rx="3" fill="#14b8a6"/>
+<text x="494.9" y="811" font-size="11" fill="#1f2328">91.4</text>
+<text x="30" y="861" font-size="13" fill="#1f2328">Perplexity, wikitext-2, 8 x 2048: <tspan font-weight="700">quartz 5.16</tspan>, llama.cpp 5.18 +/- 0.14</text>
+<text x="30" y="881" font-size="11" fill="#656d76">2026-11-22. llama.cpp build 557a6068f, same day. Decode: T 1.0, top-k 20, top-p 0.95, seed 7, thinking off.</text>
+</svg>
