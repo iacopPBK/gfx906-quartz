@@ -4,7 +4,7 @@
 
 #include <vector>
 
-#include "devices.h"
+#include "core/devices.h"
 
 // per-card geometry (PF_ prefix: engine.h defines D, S, G, ... as macros)
 constexpr int PF_D = 5120, PF_CCH = 5120, PF_HK = 8, PF_HV = 24, PF_S = 128, PF_G = 3072, PF_AQ = 6144,

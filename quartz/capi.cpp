@@ -1,6 +1,6 @@
 // C API: picks the architecture from the GGUF and forwards to its qz_ctx.
 #include "arch.h"
-#include "devices.h"
+#include "core/devices.h"
 #include "gguf.h"
 
 #include <cstdio>

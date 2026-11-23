@@ -2,7 +2,7 @@
 // accumulation, v_flash attention.
 #include "vision.h"
 #include "loader.h"
-#include "devices.h"
+#include "core/devices.h"
 #include "gguf.h"
 #include "mem.h"
 

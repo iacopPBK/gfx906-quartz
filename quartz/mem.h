@@ -4,7 +4,7 @@
 
 #include <hip/hip_runtime.h>
 
-#include "devices.h"
+#include "core/devices.h"
 
 #include <algorithm>
 #include <cstdio>

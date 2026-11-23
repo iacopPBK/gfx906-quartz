@@ -11,7 +11,7 @@
 #include <thread>
 #include <vector>
 
-#include "devices.h"
+#include "core/devices.h"
 
 static __global__ void qz_p2p_fill(unsigned * __restrict__ dst, size_t n, unsigned seed) {
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)

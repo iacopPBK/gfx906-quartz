@@ -8,7 +8,7 @@
 #include <cstring>
 #include <sys/stat.h>
 
-#include "devices.h"
+#include "core/devices.h"
 #include "engine.h"
 #include "loader.h"
 

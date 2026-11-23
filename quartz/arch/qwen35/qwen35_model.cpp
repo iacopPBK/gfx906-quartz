@@ -1,5 +1,5 @@
 #include "dspine_block.h"
-#include "devices.h"
+#include "core/devices.h"
 #include "engine.h"
 #include "prefill.h"
 // the verify at two widths (8: the bit-exact production rows; 12: copy-heavy
@@ -439,23 +439,6 @@ qz_ctx * qz_qwen35_create(const char * model, const qz_create_opts & o) {
     // per card: used / free, the ledger's tags, what the runtime holds beyond them
     qz_mem_report(stderr, 2);
     return c;
-}
-
-// qz_sampling_c -> the engine's spec; false if the chain is not one the engine samples exactly
-static bool qz_sampling_from_c(const qz_sampling_c * smp, qz_sampling & ms) {
-    bool ok = smp->top_k >= 1 && smp->top_k <= QZ_TOPK && smp->n_order >= 1 && smp->n_order <= 8;
-    bool seen_k = false;
-    for (int i = 0; ok && i < smp->n_order; i++) {
-        const int o = smp->order[i];
-        ok = o == 2 || o == 3 || o == 4 || o == 7;
-        if (o == 2) seen_k = true;
-        else if (!seen_k) ok = false;   // top-k must cut first
-    }
-    if (!ok) return false;
-    ms.temp = smp->temp; ms.top_k = smp->top_k; ms.top_p = smp->top_p; ms.min_p = smp->min_p;
-    ms.min_keep = smp->min_keep; ms.seed = smp->seed; ms.n_order = smp->n_order;
-    for (int i = 0; i < smp->n_order; i++) ms.order[i] = smp->order[i];
-    return true;
 }
 
 static void qz_stats_out(const q35_ctx * c, const qz_gen_stats & st, qz_stats * out) {

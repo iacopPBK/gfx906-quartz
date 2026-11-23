@@ -6,11 +6,13 @@
 #include <cmath>
 #include <random>
 #include "loader.h"
-#include "devices.h"
+#include "core/devices.h"
 #include "qwen35_spec.h"
 #include "qwen35_tp2.h"
 #include "qwen35_device.hip"
 #include "kernels/topk.h"
+#include "core/sampler.h"
+#include "core/cards.h"
 
 #include <cinttypes>
 #include <cstdio>
@@ -59,10 +61,7 @@ struct qz_card {
     qz_mtp_w mw = {};
     __half * kvk_m = nullptr, * kvv_m = nullptr;
     size_t mtp_arena_rows = 0;
-    float * xin = nullptr, * xhm = nullptr;
-    unsigned int * xflag = nullptr, * xseq = nullptr;
-    int * xerr = nullptr;
-    size_t xin_bytes = 0;
+    qz_xbufs x;                     // exchange buffers (core/cards.h)
     // shared scratch: the cycle's and the verify's attention partials and the
     // prefill's buffers, never live together
     char * scr = nullptr;
@@ -95,19 +94,6 @@ struct qz_gen_stats {
 // emit callback: n new tokens; return false to stop the request
 typedef bool (*qz_emit_fn)(void * user, const int32_t * toks, int n);
 
-// Sampled decode: llama.cpp's sampler chain (order codes 2 top-k, 3 top-p,
-// 4 min-p, 7 temperature), drafts accepted iff they equal the sample (exact).
-struct qz_sampling {
-    float temp = 1.0f;
-    int top_k = 0;
-    float top_p = 1.0f;
-    float min_p = 0.0f;
-    int min_keep = 0;
-    uint32_t seed = 0;
-    int n_order = 0;
-    int order[8] = {};
-};
-
 class qz_engine {
 public:
     qz_card C[2];
@@ -130,15 +116,9 @@ public:
     // rope position = arena position + s (images move the rope behind the arena)
     void set_rope_shift(int s) { for (auto & K : C) K.A.rope_shift = s; }
     // sampled decode for the next generate() calls (nullptr = greedy); seeds the RNG
-    void set_sampling(const qz_sampling * s) { smp_ = s; if (s) rng_.seed(s->seed); }
-    const qz_sampling * smp_ = nullptr;
-    std::mt19937 rng_;
-    std::vector<float2> tk_[2];
-    std::vector<std::pair<float, int>> cand_;
+    void set_sampling(const qz_sampling * s) { sam.set(s); }
+    qz_sampler sam;
     int sampled_verify(int T, bool verify, int pos);   // after launch_cyc(T): ctl[0..2] from samples
-    int sample_row(int t);                              // one token from row t's candidates
-    // row t's chain: n candidate ids in cand_ with unnormalized weights w
-    int row_chain(int t, std::vector<float> & w);
     // prompt forced through the cycle, then MTP decode up to max_new tokens or a stop id;
     // pos0 > 0: state up to pos0 already in place (batched prefill). 0, or -1 on error
     int generate(const std::vector<int32_t> & prompt, int max_new,
@@ -198,16 +178,7 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
     printf("engine: eps %g, %d layers, vocab %d (%d per card), steps %d\n",
            eps, n_layer, n_vocab, hrows, steps);
 
-    // peer access both ways between the two chosen cards
-    for (int c = 0; c < 2; c++) {
-        CHECK(hipSetDevice(qz_dev_of(c)));
-        hipError_t e = hipDeviceEnablePeerAccess(qz_dev_of(1 - c), 0);
-        if (e == hipErrorPeerAccessAlreadyEnabled) { (void) hipGetLastError(); e = hipSuccess; }
-        if (e != hipSuccess) {
-            fprintf(stderr, "no peer access %d -> %d: %s\n", qz_dev_of(c), qz_dev_of(1 - c), hipGetErrorString(e));
-            return 1;
-        }
-    }
+    if (!qz_peer_enable()) return 1;
 
     const int n_pages = qz_kv_pages(steps);
     const int n_pages_m = qz_kv_pages_mtp(steps);
@@ -289,15 +260,7 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
             fz((void **) &K.kvv_m, K.mtp_arena_rows * 2);
         }
         // exchange: inbox data + checksums, head-merge pairs, flag (own line)
-        K.xin_bytes = ((size_t) 2 * QZ_TMAX * D + (size_t) 2 * QZ_TMAX * (D / 32)) * 4;
-        CHECK(qz_dmalloc_uncached((void **) &K.xin, K.xin_bytes));
-        CHECK(hipMemset(K.xin, 0, K.xin_bytes));
-        CHECK(qz_dmalloc_uncached((void **) &K.xhm, (size_t) 2 * QZ_TMAX * 2 * 4));
-        CHECK(hipMemset(K.xhm, 0, (size_t) 2 * QZ_TMAX * 2 * 4));
-        CHECK(qz_dmalloc_uncached((void **) &K.xflag, 256));
-        CHECK(hipMemset(K.xflag, 0, 256));
-        fz((void **) &K.xseq, 64);
-        fz((void **) &K.xerr, 8 * sizeof(int));
+        CHECK(K.x.alloc(QZ_TMAX, D));
 
         std::vector<qz_trunk_w> wh(n_layer);
         int nr = 0, na = 0;
@@ -390,8 +353,8 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
         A.mtp = nullptr;
         A.n_layer = n_layer; A.eps = eps;
         A.tp_card = c; A.hrows = hrows;
-        A.xin_mine = K.xin; A.xhm_mine = K.xhm; A.xflag_mine = K.xflag;
-        A.xseq = K.xseq; A.xerr = K.xerr;
+        A.xin_mine = K.x.xin; A.xhm_mine = K.x.xhm; A.xflag_mine = K.x.xflag;
+        A.xseq = K.x.xseq; A.xerr = K.x.xerr;
 
         // dynamic LDS opt-in per device
         const int xs_b = QZ_XSTAGE_BYTES;   // TP2 push stage past the cycle LDS
@@ -404,27 +367,17 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
         CHECK(hipFuncSetAttribute((const void *) qz_mtp<4>, hipFuncAttributeMaxDynamicSharedMemorySize, sm4));
         // the grid barrier needs all 60 blocks resident: check every specialization
         {
-            int cu = 0;
-            CHECK(hipDeviceGetAttribute(&cu, hipDeviceAttributeMultiprocessorCount, c));
-            struct { const void * f; int sm; const char * nm; } ks[] = {
+            const qz_resident_kernel ks[] = {
                 {(const void *) qz_cycle<1>, sm1, "qz_cycle<1>"}, {(const void *) qz_cycle<2>, sm2, "qz_cycle<2>"},
                 {(const void *) qz_cycle<3>, sm3, "qz_cycle<3>"}, {(const void *) qz_cycle<4>, sm4, "qz_cycle<4>"},
                 {(const void *) qz_mtp<3>, sm3, "qz_mtp<3>"}, {(const void *) qz_mtp<4>, sm4, "qz_mtp<4>"}};
-            for (const auto & k : ks) {
-                int per_cu = 0;
-                CHECK(hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, k.f, 512, k.sm));
-                if (per_cu * cu < 60) {
-                    fprintf(stderr, "card %d: %s fits %d x %d CU blocks < 60 (LDS %d B): grid barrier would hang\n",
-                            c, k.nm, per_cu, cu, k.sm);
-                    return 1;
-                }
-            }
+            if (!qz_resident(c, ks, (int) (sizeof(ks) / sizeof(ks[0])), 60, 512)) return 1;
         }
     }
     for (int c = 0; c < 2; c++) {
-        C[c].A.xin_peer = C[1 - c].xin;
-        C[c].A.xhm_peer = C[1 - c].xhm;
-        C[c].A.xflag_peer = C[1 - c].xflag;
+        C[c].A.xin_peer = C[1 - c].x.xin;
+        C[c].A.xhm_peer = C[1 - c].x.xhm;
+        C[c].A.xflag_peer = C[1 - c].x.xflag;
     }
     {
         hipFuncAttributes fa;
@@ -485,15 +438,7 @@ inline void qz_engine::launch_mtp(int T) {
 inline void qz_engine::sync2() {
     for (int c = 0; c < 2; c++) { CHECK(hipSetDevice(qz_dev_of(c))); CHECK(hipStreamSynchronize(C[c].st)); }
     CHECK(hipSetDevice(qz_dev_of(0)));
-    for (int c = 0; c < 2; c++) {
-        int e[8];
-        CHECK(hipMemcpy(e, C[c].xerr, sizeof(e), hipMemcpyDeviceToHost));
-        if (e[0] || e[1]) {
-            fprintf(stderr, "exchange error card %d after launch %lld: chk mismatches %d (first tok %d slab %d row %d), "
-                            "abort %d code %d tok %d seen %d\n", c, n_launch, e[0], e[5], e[6], e[7], e[1], e[2], e[3], e[4]);
-            exit(1);
-        }
-    }
+    for (int c = 0; c < 2; c++) qz_xerr_check(c, C[c].x.xerr, n_launch);
 }
 
 inline void qz_engine::reset_state() {
@@ -545,7 +490,7 @@ inline int qz_engine::generate(const std::vector<int32_t> & prompt_in, int max_n
         // only need the MTP K/V catch-up
         H.mtp_t = slot_t ? 0 : (last ? -(r + 8 * adapt_slack) : 3);
         launch_cyc(r);
-        if (last && smp_) sampled_verify(r, false, pos);   // the first decode token, sampled
+        if (last && sam.smp) sampled_verify(r, false, pos);   // the first decode token, sampled
         if (!last)
             for (int c = 0; c < 2; c++) {
                 CHECK(hipSetDevice(qz_dev_of(c)));
@@ -589,7 +534,7 @@ inline int qz_engine::generate(const std::vector<int32_t> & prompt_in, int max_n
         H.pos = pos; H.cycle = st.prefill_cycles + st.decode_cycles;
         if (pos + TT + 2 * QZ_TMAX > steps) { st.stop = 0; break; }   // arena full: end like max_new
         launch_cyc(TT);
-        if (smp_) sampled_verify(TT, true, pos);
+        if (sam.smp) sampled_verify(TT, true, pos);
         launch_mtp(slot_t ? TT : 4);
         sync2();
         CHECK(hipMemcpy(ctl, C[0].ctl_d, 8 * sizeof(int), hipMemcpyDeviceToHost));
@@ -633,19 +578,19 @@ inline int qz_engine::sampled_verify(int T, bool verify, int pos) {
     for (int c = 0; c < 2; c++) {
         CHECK(hipSetDevice(qz_dev_of(c)));
         CHECK(hipStreamSynchronize(C[c].st));
-        tk_[c].resize((size_t) QZ_TMAX * QZ_TOPK_NB * QZ_TOPK);
-        CHECK(hipMemcpy(tk_[c].data(), C[c].topk_d, (size_t) T * QZ_TOPK_NB * QZ_TOPK * sizeof(float2), hipMemcpyDeviceToHost));
+        sam.tk[c].resize((size_t) QZ_TMAX * QZ_TOPK_NB * QZ_TOPK);
+        CHECK(hipMemcpy(sam.tk[c].data(), C[c].topk_d, (size_t) T * QZ_TOPK_NB * QZ_TOPK * sizeof(float2), hipMemcpyDeviceToHost));
     }
     int m = 0, x = 0;
     if (verify) {
         for (;; m++) {
-            x = sample_row(m);
+            x = sam.sample_row(m);
             if (m < T - 1 && x == H.toks[m + 1]) continue;
             break;
         }
     } else {
         m = T - 1;
-        x = sample_row(m);
+        x = sam.sample_row(m);
     }
     const int c3[3] = { m + 1, x, pos + m + 1 };   // as the greedy verify writes them
     for (int c = 0; c < 2; c++) {
@@ -654,83 +599,4 @@ inline int qz_engine::sampled_verify(int T, bool verify, int pos) {
     }
     CHECK(hipSetDevice(qz_dev_of(0)));
     return m + 1;
-}
-
-inline int qz_engine::row_chain(int t, std::vector<float> & w) {
-    const qz_sampling & sp = *smp_;
-    cand_.clear();
-    for (int c = 0; c < 2; c++) {
-        const float2 * e = tk_[c].data() + (size_t) t * QZ_TOPK_NB * QZ_TOPK;
-        for (int j = 0; j < QZ_TOPK_NB * QZ_TOPK; j++) {
-            int id;
-            memcpy(&id, &e[j].y, 4);
-            if (id >= 0) cand_.push_back({ e[j].x, id });
-        }
-    }
-    auto desc = [](const std::pair<float, int> & a, const std::pair<float, int> & b) {
-        return a.first > b.first || (a.first == b.first && a.second < b.second);
-    };
-    size_t n = std::min<size_t>(QZ_TOPK, cand_.size());
-    std::partial_sort(cand_.begin(), cand_.begin() + n, cand_.end(), desc);
-    cand_.resize(n);
-    // the chain, as llama-sampler.cpp applies it to a sorted candidate array
-    std::vector<float> & p = w;
-    for (int k = 0; k < sp.n_order && n > 0; k++) {
-        switch (sp.order[k]) {
-            case 2:   // top-k
-                if (sp.top_k > 0) n = std::min<size_t>(n, (size_t) sp.top_k);
-                break;
-            case 3:   // top-p: softmax over the current candidates, cumulative cut
-                if (sp.top_p < 1.0f) {
-                    const float max_l = cand_[0].first;
-                    float sum = 0.0f;
-                    p.resize(n);
-                    for (size_t i = 0; i < n; i++) { p[i] = expf(cand_[i].first - max_l); sum += p[i]; }
-                    float cum = 0.0f;
-                    size_t last = n;
-                    for (size_t i = 0; i < n; i++) {
-                        cum += p[i] / sum;
-                        if (cum >= sp.top_p && i + 1 >= (size_t) sp.min_keep) { last = i + 1; break; }
-                    }
-                    n = last;
-                }
-                break;
-            case 4:   // min-p: logit >= max + log(p) (sorted path)
-                if (sp.min_p > 0.0f) {
-                    const float min_logit = cand_[0].first + logf(sp.min_p);
-                    size_t i = 1;
-                    for (; i < n; i++) if (cand_[i].first < min_logit && i >= (size_t) sp.min_keep) break;
-                    n = i;
-                }
-                break;
-            case 7:   // temperature
-                if (sp.temp <= 0.0f) n = 1;
-                else for (size_t i = 0; i < n; i++) cand_[i].first /= sp.temp;
-                break;
-            default:
-                break;
-        }
-    }
-    if (n <= 1) { w.clear(); return 1; }
-    const float max_l = cand_[0].first;
-    p.resize(n);
-    for (size_t i = 0; i < n; i++) p[i] = expf(cand_[i].first - max_l);
-    return (int) n;
-}
-
-inline int qz_engine::sample_row(int t) {
-    // dist: softmax (float terms, double sum), one uniform draw, cumulative pick
-    std::vector<float> p;
-    const size_t n = (size_t) row_chain(t, p);
-    std::uniform_real_distribution<double> u01(0.0f, 1.0f);
-    if (n <= 1) { (void) u01(rng_); return cand_[0].second; }
-    double sum = 0.0;
-    for (size_t i = 0; i < n; i++) sum += p[i];
-    const double tgt = sum * u01(rng_);
-    double run = 0.0;
-    for (size_t i = 0; i < n; i++) {
-        run += p[i];
-        if (run >= tgt) return cand_[i].second;
-    }
-    return cand_[n - 1].second;
 }

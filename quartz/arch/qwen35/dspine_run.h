@@ -1,7 +1,7 @@
 #pragma once
 #include <chrono>
 
-#include "devices.h"
+#include "core/devices.h"
 #include <random>
 #include <vector>
 
@@ -183,8 +183,8 @@ struct qz_dsrun {
         for (int c = 0; c < 2; c++) {
             DS_CHECK(hipSetDevice(qz_dev_of(c)));
             DS_CHECK(hipStreamSynchronize(mv[c].st));
-            eng.tk_[c].resize((size_t) W * QZ_TOPK_NB * QZ_TOPK);
-            DS_CHECK(hipMemcpy(eng.tk_[c].data(), topk_d[c], (size_t) W * QZ_TOPK_NB * QZ_TOPK * sizeof(float2),
+            eng.sam.tk[c].resize((size_t) W * QZ_TOPK_NB * QZ_TOPK);
+            DS_CHECK(hipMemcpy(eng.sam.tk[c].data(), topk_d[c], (size_t) W * QZ_TOPK_NB * QZ_TOPK * sizeof(float2),
                                hipMemcpyDeviceToHost));
         }
         DS_CHECK(hipSetDevice(qz_dev_of(0)));
@@ -193,7 +193,7 @@ struct qz_dsrun {
         topk_rows(eng, W);
         int m = 0;
         for (;; m++) {
-            const int x = eng.sample_row(m);
+            const int x = eng.sam.sample_row(m);
             out[m] = x;
             if (m < W - 1 && x == toks[m + 1]) continue;
             break;
@@ -207,12 +207,12 @@ struct qz_dsrun {
         std::vector<float> w;
         for (int m = 0; m < W - 1; m++) {
             const int d = toks[m + 1];
-            const int n = eng.row_chain(m, w);
+            const int n = eng.sam.row_chain(m, w);
             // p over the chain's candidates (n == 1: a point mass)
             double S = 0.0;
             for (int i = 0; i < n; i++) S += n == 1 ? 1.0 : w[i];
             auto p_of = [&](int id) {
-                for (int i = 0; i < n; i++) if (eng.cand_[i].second == id) return (n == 1 ? 1.0 : w[i]) / S;
+                for (int i = 0; i < n; i++) if (eng.sam.cand[i].second == id) return (n == 1 ? 1.0 : w[i]) / S;
                 return 0.0;
             };
             const float * qr = qd_h + m * DS_TOPK;
@@ -222,26 +222,26 @@ struct qz_dsrun {
                 return 0.0;
             };
             const double pd = p_of(d), qd = q_of(d);
-            if (u01(eng.rng_) * qd < pd) { out[m] = d; continue; }
+            if (u01(eng.sam.rng) * qd < pd) { out[m] = d; continue; }
             // reject: the residual max(0, p - q) over p's support (q-only ids have p = 0)
             std::vector<double> r(n);
             double R = 0.0;
             for (int i = 0; i < n; i++) {
                 const double pi = (n == 1 ? 1.0 : w[i]) / S;
-                r[i] = std::max(0.0, pi - q_of(eng.cand_[i].second));
+                r[i] = std::max(0.0, pi - q_of(eng.sam.cand[i].second));
                 R += r[i];
             }
-            int x = eng.cand_[0].second;
-            const double tgt = R * u01(eng.rng_);
+            int x = eng.sam.cand[0].second;
+            const double tgt = R * u01(eng.sam.rng);
             if (R > 0.0) {
                 double run = 0.0;
-                x = eng.cand_[n - 1].second;
-                for (int i = 0; i < n; i++) { run += r[i]; if (run >= tgt && r[i] > 0.0) { x = eng.cand_[i].second; break; } }
+                x = eng.sam.cand[n - 1].second;
+                for (int i = 0; i < n; i++) { run += r[i]; if (run >= tgt && r[i] > 0.0) { x = eng.sam.cand[i].second; break; } }
             }
             out[m] = x;
             return m + 1;
         }
-        out[W - 1] = eng.sample_row(W - 1);
+        out[W - 1] = eng.sam.sample_row(W - 1);
         return W;
     }
 
@@ -270,11 +270,11 @@ struct qz_dsrun {
             st.n_gen += k;
             return st.stop != 0 || st.n_gen >= max_new;
         };
-        const bool qmode = eng.smp_ && eng.smp_->temp > 0.f;
+        const bool qmode = eng.sam.smp && eng.sam.smp->temp > 0.f;
 
         constexpr float qscale = 0.0025f;
-        const float invT = qmode ? qscale / eng.smp_->temp : 0.f;
-        if (qmode) qrng.seed(eng.smp_->seed ^ 0x5bd1e995u);
+        const float invT = qmode ? qscale / eng.sam.smp->temp : 0.f;
+        if (qmode) qrng.seed(eng.sam.smp->seed ^ 0x5bd1e995u);
         int pos = pos0, n_rep = 0, cyc = 0;
         int32_t toks[MVW > DS_T ? MVW : DS_T];
         int ctl[2][8], out_tok[MVW];
@@ -313,10 +313,10 @@ struct qz_dsrun {
             if (n_acc < 1 || n_acc > W || ctl[0][2] != pos + n_acc || memcmp(ctl[0], ctl[1], 8 * 4)) { st.stop = -1; break; }
             if (nf) {   // forced rows stand; acceptance from the last one (sampled: drafts kept iff they equal the sample)
                 int n = nf - 1;
-                if (eng.smp_) {
+                if (eng.sam.smp) {
                     topk_rows(eng, W);
                     for (;; n++) {
-                        out_tok[n] = eng.sample_row(n);
+                        out_tok[n] = eng.sam.sample_row(n);
                         if (n < W - 1 && out_tok[n] == toks[n + 1]) continue;
                         break;
                     }
@@ -329,7 +329,7 @@ struct qz_dsrun {
                 st.decode_tok += n_acc - nf + 1;
                 done = push(out_tok + nf - 1, n_acc - nf + 1);
             } else if (qmode) n_acc = sampled_q(eng, toks, out_tok, W);    // out_tok[0 .. n_acc-1] = the emitted tokens
-            else if (eng.smp_) n_acc = sampled(eng, toks, out_tok, W);
+            else if (eng.sam.smp) n_acc = sampled(eng, toks, out_tok, W);
             if (fin) n_acc = std::min(n_acc, 2);
             if (!nf) {
                 st.decode_cycles++;
