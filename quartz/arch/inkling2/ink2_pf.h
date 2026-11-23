@@ -1165,10 +1165,11 @@ struct ink2_pf {
         for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(E.C[c].st)); }
     }
 
-    // ---- the batched prefill: false if aborted
-    bool prefill(const int32_t * prompt, int n, bool logits) {
+    // ---- the batched prefill of prompt rows a .. n-1 (rows below a already in
+    // the KV and conv history); logits: the head on row n-1. false if aborted
+    bool prefill(const int32_t * prompt, int a, int n, bool logits) {
         ink2_engine & E = *this->E;
-        for (int p0 = 0; p0 < n; p0 += PF_M) {
+        for (int p0 = a; p0 < n; p0 += PF_M) {
             if (abort && abort->load()) return false;
             const int m = std::min(PF_M, n - p0);
             for (int c = 0; c < 2; c++) {

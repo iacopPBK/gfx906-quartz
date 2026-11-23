@@ -15,9 +15,11 @@
 constexpr int HQL = HQ / 2, HKVL = HKV / 2;            // local heads per card
 constexpr int QL = HQL * HD, KVL = HKVL * HD;          // 1536, 512
 constexpr int FFL = FFE / 2;                           // local expert FF: 576
-// prefill chunk rows (batched prefill) and the SWA ring size it needs: a
-// window of WIN plus the in-flight chunk, indexed pos % PF_RING everywhere
-constexpr int PF_M = 2048, PF_RING = WIN + PF_M;
+// prefill chunk rows (batched prefill) and the SWA ring, indexed pos % PF_RING
+// everywhere: at least a window of WIN plus the in-flight chunk; the slack keeps
+// a prefix-cache snapshot at s restorable while writes stay below s - WIN + 1 + PF_RING
+constexpr int PF_M = 2048, PF_RING = 8192;
+static_assert(PF_RING >= WIN + PF_M, "the SWA ring holds a window plus a chunk");
 constexpr int CHL = 2 * KVL + 2 * D;                   // local conv history channels: K | V | attn post | ffn post
 constexpr int H_K = 0, H_V = KVL, H_A = 2 * KVL, H_F = 2 * KVL + D;
 constexpr int TBW = REL_EXT + 1;                       // bias table width (the zero column past the extent)

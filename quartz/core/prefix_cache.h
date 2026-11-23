@@ -46,14 +46,15 @@ public:
     size_t slot_bytes() const { size_t t = 0; for (const auto & b : blobs) t += b.bytes; return t * ncard; }
 
     // the deepest slot whose keys 0 .. pos match `k` (pos <= n - 1); slots past
-    // the matching prefix are dropped
-    slot * match(const std::vector<uint64_t> & k, int n) {
+    // the matching prefix, or that `valid` rejects, are dropped
+    slot * match(const std::vector<uint64_t> & k, int n, const std::function<bool(int)> & valid = {}) {
         int L = 0;
         while (L < (int) keys.size() && L < n && keys[L] == k[L]) L++;
         slot * use = nullptr;
         for (auto & sn : slots) {
             if (sn.pos < 0) continue;
             if (sn.pos + 1 > L) { sn.pos = -1; continue; }   // its tokens differ from this prompt's
+            if (valid && !valid(sn.pos)) { sn.pos = -1; continue; }
             if (sn.pos <= n - 1 && (!use || sn.pos > use->pos)) use = &sn;
         }
         return use;
@@ -114,6 +115,9 @@ public:
         // row a + mid - 1 into the blobs' stage buffers. nonzero: failed
         std::function<int(int a, int b, int mid)> chunk;
         std::function<void()> sync;       // both cards idle (progress timing)
+        // optional: whether a snapshot at pos still fits the positional state
+        // (a ring-buffered window may have been overwritten since)
+        std::function<bool(int pos)> valid;
     };
     // prefill prompt rows up to P - 2 from the deepest matching snapshot, in chunks,
     // with a snapshot at each chunk end, at the first message's end (the second
@@ -123,7 +127,7 @@ public:
                 int chunk, int tail, const hooks & h) {
         using clk = std::chrono::steady_clock;
         const auto t0 = clk::now();
-        slot * use = match(k, P);
+        slot * use = match(k, P, h.valid);
         int start = 0;
         if (use) { restore(*use); h.restored(); start = use->pos; }
         else { h.reset(); forget_all(); }
