@@ -79,6 +79,11 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 |:---|---:|---:|
 | wikitext-2, 8 × 2048 | 5.16 | 5.18 ± 0.14 |
 
+| VRAM per card, `--max-ctx 262144` | card 0 | card 1 |
+|:---|---:|---:|
+| MTP | 25.6 GB | 25.6 GB |
+| DSpine | 29.7 GB | 29.5 GB |
+
 <sub>llama.cpp: build 557a6068f, tensor split, flash attention, f16 KV, ubatch 2048, run on the same day. Prefill is the median of three runs. Decode is sampled (T 1.0, top-k 20, top-p 0.95, seed 7), thinking off, prompts of about 30 tokens, one run each. Perplexity scores the second half of each 2048-token window, as llama-perplexity does.</sub>
 
 </details>
@@ -103,6 +108,40 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 | **Megakernel execution** | Persistent decode loop over the 48 layer applications (24 layers, 12 of them looped 3 times) |
 | **Batched prefill** | 2048-token chunks, grouped expert GEMMs |
 | **Prefix cache** | Conv histories and sliding-window rings in the snapshots |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/inkling-2-mini-bench-dark.svg">
+  <img src="docs/images/inkling-2-mini-bench-light.svg" alt="Inkling-2-Mini Q8_0 on 2x MI50: decode by text type in the three modes, and VRAM per card at full context" width="880">
+</picture>
+
+<details>
+<summary>Numbers</summary>
+
+<br>
+
+| Decode, 400 tokens | Plain | DSpark | SWITCH |
+|:---|---:|---:|---:|
+| C code | 105.7 tok/s | 101.2 tok/s | 101.0 tok/s |
+| Python code | 105.8 tok/s | 161.7 tok/s | 111.6 tok/s |
+| Prose | 105.7 tok/s | 74.6 tok/s | 105.7 tok/s |
+| Explanation | 105.8 tok/s | 68.4 tok/s | 97.3 tok/s |
+| JSON | 105.6 tok/s | 143.2 tok/s | 115.6 tok/s |
+
+| Mixed answers, 800 tokens | Plain | DSpark | SWITCH |
+|:---|---:|---:|---:|
+| Code → prose | 104.3 tok/s | 67.5 tok/s | 106.3 tok/s |
+| JSON → prose | 104.5 tok/s | 98.2 tok/s | 134.9 tok/s |
+| Prose → code | 104.5 tok/s | 75.0 tok/s | 98.3 tok/s |
+| Code → prose → code | 104.6 tok/s | 101.4 tok/s | 135.3 tok/s |
+
+| VRAM per card, `--max-ctx 262144` | card 0 | card 1 |
+|:---|---:|---:|
+| Plain | 20.6 GB | 20.6 GB |
+| DSpark | 24.3 GB | 20.6 GB |
+
+<sub>Greedy (DSpark drafts for greedy requests only; sampled requests decode plain), thinking off, the same prompts as Qwen3.8-27B's, one run each (greedy: the three modes give the same tokens). Measured 2026-11-23 at a 178 W power limit.</sub>
+
+</details>
 
 Image input is not supported for Inkling yet. The forward pass quartz implements is in
 [docs/inkling2.md](docs/inkling2.md).
