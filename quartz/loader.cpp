@@ -30,7 +30,7 @@ bool qz_loader::plan(const qz_gguf & g, int card) {
         raw_off[t] = data_off + gguf_get_tensor_offset(g.ctx, t);
         ts[t].src_ne0 = ts[t].ne0;
         ts[t].src_ne1 = ts[t].ne1;
-        if (card >= 0 && qz_tp2_spec(ts[t].name.c_str(), card, ts[t].ne1, ts[t].slice)) {
+        if (card >= 0 && slice && slice(ts[t].name.c_str(), card, ts[t].ne1, ts[t].slice)) {
             if (ts[t].type != GGML_TYPE_Q8_0 && ts[t].type != GGML_TYPE_F32) {
                 fprintf(stderr, "qz_loader: cannot slice %s (type)\n", ts[t].name.c_str()); return false;
             }

@@ -37,6 +37,12 @@ class QzSampling(ctypes.Structure):
                 ("n_order", ctypes.c_int), ("order", ctypes.c_int * 8)]
 
 
+class QzInfo(ctypes.Structure):
+    _fields_ = [("arch", ctypes.c_char * 32), ("name", ctypes.c_char * 128), ("n_vocab", ctypes.c_int),
+                ("max_ctx", ctypes.c_int), ("img_pad", ctypes.c_int), ("vision", ctypes.c_int),
+                ("dspine", ctypes.c_int)]
+
+
 EMIT_CB = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_int)
 
 
@@ -61,6 +67,7 @@ class Engine:
         L.qz_generate_s.argtypes = L.qz_generate.argtypes + [ctypes.POINTER(QzSampling)]
         L.qz_abort.argtypes = [ctypes.c_void_p]
         L.qz_max_ctx.argtypes = [ctypes.c_void_p]
+        L.qz_model_info_get.argtypes = [ctypes.c_void_p, ctypes.POINTER(QzInfo)]
         L.qz_vision_attach.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         L.qz_image_add.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
                                    ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
@@ -70,7 +77,6 @@ class Engine:
                                      ctypes.POINTER(ctypes.c_int), ctypes.c_int] + L.qz_generate_s.argtypes[3:]
         self.L = L
         self.vision = False
-        self.img_pad = L.qz_image_pad_token()
         self.tok = L.qz_tok_open(model.encode())
         if not self.tok:
             raise RuntimeError("tokenizer load failed")
@@ -81,6 +87,10 @@ class Engine:
         if not self.ctx:
             raise RuntimeError("engine load failed")
         self.max_ctx = L.qz_max_ctx(self.ctx)
+        self.info = QzInfo()
+        L.qz_model_info_get(self.ctx, ctypes.byref(self.info))
+        self.arch = self.info.arch.decode()
+        self.img_pad = self.info.img_pad
         self.lock = threading.Lock()
         self._pb = ctypes.create_string_buffer(512)
         self.template = self._load_template()
@@ -443,6 +453,14 @@ def split_reasoning(text, think_open):
         r, c = text.split("</think>", 1)
         return r.replace("<think>", "").strip(), c.lstrip("\n")
     return text.replace("<think>", "").strip(), ""
+
+
+def model_id(eng):
+    """The /v1/models id: quartz for qwen35, else quartz-<general.name>."""
+    if eng.arch == "qwen35":
+        return "quartz"
+    name = eng.info.name.decode(errors="replace") or eng.arch
+    return "quartz-" + re.sub(r"[^a-z0-9.]+", "-", name.lower()).strip("-")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -900,6 +918,7 @@ def main():
     if args.mmproj:
         Handler.eng.attach_vision(args.mmproj)
     Handler.args = args
+    Handler.model_id = model_id(Handler.eng)
     log("ready in %.1f s | ctx %d | %s%s | %s:%d%s" % (
         time.time() - t0, Handler.eng.max_ctx, "dspine" if args.dspine else "mtp", " + vision" if args.mmproj else "",
         args.host, args.port, " | trace " + TRACE if TRACE else ""))

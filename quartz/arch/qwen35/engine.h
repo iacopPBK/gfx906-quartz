@@ -7,6 +7,8 @@
 #include <random>
 #include "loader.h"
 #include "devices.h"
+#include "qwen35_spec.h"
+#include "qwen35_tp2.h"
 #include "qwen35_device.hip"
 
 #include <cinttypes>
@@ -273,6 +275,7 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
         qz_card & K = C[c];
         K.dev = qz_dev_of(c);
         qz_mem_scope mem_target("target");
+        K.ld.slice = qz_tp2_spec;
         if (!K.ld.load(path, g, qz_dev_of(c), c)) { fprintf(stderr, "card %d load failed\n", c); return 1; }
         printf("card %d: weights %.2f GB in %.1f s, %.2f GB free\n", c, K.ld.need_bytes / 1e9, K.ld.load_seconds, K.ld.free_after / 1e9);
         CHECK(hipSetDevice(qz_dev_of(c)));

@@ -7,9 +7,9 @@ UNI       := third_party/llama-unicode
 ARCH    := --offload-arch=gfx906
 CXXFLAGS := -O2 -std=c++17 $(ARCH)
 INC     := -I quartz -I $(UNI) -I third_party
-ENGINE  := quartz/loader.cpp quartz/qwen35_spec.cpp quartz/vision.cpp
+ENGINE  := quartz/loader.cpp quartz/vision.cpp $(wildcard quartz/arch/*/*.cpp)
 UNICODE := $(UNI)/unicode.cpp $(UNI)/unicode-data.cpp
-HEADERS := $(wildcard quartz/*.h quartz/*.hip) $(UNI)/unicode.h third_party/stb/stb_image.h
+HEADERS := $(wildcard quartz/*.h quartz/*.hip quartz/arch/*/*.h quartz/arch/*/*.hip) $(UNI)/unicode.h third_party/stb/stb_image.h
 
 .PHONY: all lib clean
 all: lib

@@ -2,8 +2,6 @@
 // quartz/repack.h (raw_off lets callers re-read the file).
 #pragma once
 
-#include "qwen35_spec.h"
-
 #include <hip/hip_runtime.h>
 
 #include "mem.h"
@@ -13,8 +11,13 @@
 #include <string>
 #include <vector>
 
-#include "gguf_lite.h"
-#include "tp2.h"
+#include "gguf.h"
+
+// rows: source rows in local order; cols: source q8 blocks (Q8_0) or
+// elements (F32) in local order. Empty = all.
+struct qz_slice {
+    std::vector<int32_t> rows, cols;
+};
 
 
 struct qz_dev_tensor {
@@ -45,8 +48,10 @@ public:
 
     // skip(name) leaves a tensor unallocated (shared = true)
     std::function<bool(const char *)> skip;
+    // slice(name, card, rows, s): the arch's TP split of a tensor for `card`; false = replicated
+    std::function<bool(const char *, int, int64_t, qz_slice &)> slice;
 
-    // card >= 0: load only TP2 card `card`'s slices (tp2.h), else the whole model
+    // card >= 0: load only card `card`'s slices (per `slice`), else the whole model
     bool load(const char * path, const qz_gguf & g, int dev, int card = -1);
     // the tensor table and need_bytes only, nothing allocated (load() runs it first)
     bool plan(const qz_gguf & g, int card = -1);

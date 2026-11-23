@@ -40,14 +40,25 @@ int      qz_generate_s(qz_ctx * c, const int32_t * prompt, int n_prompt, int max
                        const int32_t * stop, int n_stop, qz_emit_cb cb, void * user, qz_stats * out,
                        const qz_sampling_c * smp);
 
-// images (qwen3vl_merger projector, mmproj GGUF). The projector runs on card 0.
+// what the loaded model is and what it supports
+typedef struct qz_model_info {
+    char arch[32];          // GGUF general.architecture
+    char name[128];         // GGUF general.name ("" if absent)
+    int n_vocab;
+    int max_ctx;            // as qz_max_ctx
+    int img_pad;            // image placeholder token, -1: the arch takes no images
+    int vision;             // 1: a projector is attached (qz_vision_attach)
+    int dspine;             // 1: decodes on the DSpine block drafter
+} qz_model_info;
+int      qz_model_info_get(const qz_ctx * c, qz_model_info * out);   // 0 ok
+
+// images (projector GGUF, e.g. qwen3vl_merger for qwen35)
 int      qz_vision_attach(qz_ctx * c, const char * mmproj);   // 0 ok
-int      qz_image_pad_token(void);                            // <|image_pad|>
 // encodes an image (jpg / png / bmp / gif) into the 8-entry LRU cache; returns
 // its id or -1; nx * ny = the <|image_pad|> tokens the prompt holds for it
 int      qz_image_add(qz_ctx * c, const void * bytes, size_t n, int * nx, int * ny);
 double   qz_image_last_ms(const qz_ctx * c);                  // last encode (0: cache hit before)
-// qz_generate_s with images: the k-th <|image_pad|> run takes images[k]
+// qz_generate_s with images: the k-th run of img_pad tokens takes images[k]
 int      qz_generate_mm(qz_ctx * c, const int32_t * prompt, int n_prompt, const int * images, int n_images,
                         int max_new, const int32_t * stop, int n_stop, qz_emit_cb cb, void * user, qz_stats * out,
                         const qz_sampling_c * smp);

@@ -6,11 +6,8 @@
 #include <cstring>
 #include <vector>
 
-// rows: source rows in local order; cols: source q8 blocks (Q8_0) or
-// elements (F32) in local order. Empty = all.
-struct qz_slice {
-    std::vector<int32_t> rows, cols;
-};
+#include "loader.h"   // qz_slice
+
 
 static inline int qz_tp2_vhead(int card, int j) { return (j / 8) * 16 + 8 * card + j % 8; }
 
