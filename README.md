@@ -28,7 +28,7 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 ## Models
 
 <details open>
-<summary><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/models/qwen3.8-27b-dark.svg"><img src="docs/images/models/qwen3.8-27b-light.svg" alt="Qwen3.8-27B · any version · Q8_0" height="25" align="middle"></picture></summary>
+<summary><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/models/qwen3.8-27b-dark.svg"><img src="docs/images/models/qwen3.8-27b-light.svg" alt="Qwen3.8-27B · Q8_0" height="25" align="middle"></picture></summary>
 
 <br>
 
@@ -56,7 +56,7 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 <br>
 
 <details>
-<summary><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/models/inkling-2-mini-dark.svg"><img src="docs/images/models/inkling-2-mini-light.svg" alt="Inkling 2 Mini" height="25" align="middle"></picture></summary>
+<summary><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/models/inkling-2-mini-dark.svg"><img src="docs/images/models/inkling-2-mini-light.svg" alt="Inkling-2-Mini · Q8_0" height="25" align="middle"></picture></summary>
 
 <br>
 
