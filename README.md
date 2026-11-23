@@ -113,7 +113,7 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/inkling-2-mini-bench-dark.svg">
-  <img src="docs/images/inkling-2-mini-bench-light.svg" alt="Inkling-2-Mini Q8_0 on 2x MI50: decode by text type in the three modes, and VRAM per card at full context" width="880">
+  <img src="docs/images/inkling-2-mini-bench-light.svg" alt="Inkling-2-Mini Q8_0 on 2x MI50: prefill, decode by text type in the three modes, and VRAM per card at full context" width="880">
 </picture>
 
 <details>
@@ -121,27 +121,31 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 
 <br>
 
+| Prefill | 0 ctx | 16384 ctx |
+|:---|---:|---:|
+| **quartz** pp2048 | 2034 tok/s | 1427 tok/s |
+
 | Decode, 400 tokens | Plain | DSpark | SWITCH |
 |:---|---:|---:|---:|
-| C code | 105.2 tok/s | 78.0 tok/s | 101.4 tok/s |
-| Python code | 105.1 tok/s | 158.2 tok/s | 146.2 tok/s |
-| Prose | 105.4 tok/s | 52.6 tok/s | 91.5 tok/s |
-| Explanation | 105.4 tok/s | 73.1 tok/s | 99.5 tok/s |
-| JSON | 105.1 tok/s | 152.4 tok/s | 138.5 tok/s |
+| C code | 104.9 tok/s | 78.8 tok/s | 101.4 tok/s |
+| Python code | 104.7 tok/s | 160.6 tok/s | 146.6 tok/s |
+| JSON | 105.0 tok/s | 154.0 tok/s | 139.5 tok/s |
+| Explanation | 105.0 tok/s | 74.0 tok/s | 99.6 tok/s |
+| Prose | 104.9 tok/s | 53.3 tok/s | 91.5 tok/s |
 
 | Mixed answers, 800 tokens | Plain | DSpark | SWITCH |
 |:---|---:|---:|---:|
-| Code → prose | 103.9 tok/s | 80.2 tok/s | 113.6 tok/s |
-| JSON → prose | 104.1 tok/s | 91.9 tok/s | 129.5 tok/s |
-| Prose → code | 104.0 tok/s | 71.4 tok/s | 109.8 tok/s |
-| Code → prose → code | 104.1 tok/s | 98.4 tok/s | 110.3 tok/s |
+| Code → prose | 104.0 tok/s | 81.5 tok/s | 114.8 tok/s |
+| JSON → prose | 103.1 tok/s | 93.5 tok/s | 130.3 tok/s |
+| Prose → code | 103.9 tok/s | 72.3 tok/s | 110.4 tok/s |
+| Code → prose → code | 103.9 tok/s | 99.7 tok/s | 110.9 tok/s |
 
 | VRAM per card, `--max-ctx 262144` | card 0 | card 1 |
 |:---|---:|---:|
 | Plain | 20.6 GB | 20.6 GB |
 | DSpark | 22.4 GB | 22.2 GB |
 
-<sub>Decode is sampled (T 1.0, top-k 20, top-p 0.95, seed 7), thinking off, the same prompts as Qwen3.8-27B's, one run each; the three modes give the same tokens. Measured 2026-11-23 at a 178 W power limit.</sub>
+<sub>Prefill is the median of three runs. Decode is sampled (T 1.0, top-k 20, top-p 0.95, seed 7), thinking off, the same prompts as Qwen3.8-27B's, one run each; the three modes give the same tokens. Measured 2026-11-23 at a 178 W power limit.</sub>
 
 </details>
 
