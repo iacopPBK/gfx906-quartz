@@ -1,13 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 1000" width="880" height="1000" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
-<text x="30" y="36" font-size="20" font-weight="700" fill="#e6edf3">Inkling-2-Mini Q8_0 on 2x MI50 @ 178W</text>
+<text x="30" y="36" font-size="20" font-weight="700" fill="#e6edf3">Inkling-2-Mini Q8_0 on 2x MI50 @ 135W</text>
 <text x="30" y="58" font-size="12" fill="#8b949e">tok/s, higher is better; the three modes give the same tokens</text>
 <text x="30" y="96" font-size="14" font-weight="600" fill="#e6edf3">Prefill, pp2048</text>
 <text x="30" y="125" font-size="12" fill="#e6edf3">0 ctx</text>
-<rect x="150" y="112" width="474.6" height="18" rx="3" fill="#3b82f6"/>
-<text x="632.6" y="125" font-size="12" fill="#e6edf3">2034  <tspan fill="#8b949e">quartz</tspan></text>
+<rect x="150" y="112" width="433.1" height="18" rx="3" fill="#3b82f6"/>
+<text x="591.1" y="125" font-size="12" fill="#e6edf3">1856  <tspan fill="#8b949e">quartz</tspan></text>
 <text x="30" y="161" font-size="12" fill="#e6edf3">16k ctx</text>
-<rect x="150" y="148" width="333.0" height="18" rx="3" fill="#3b82f6"/>
-<text x="491.0" y="161" font-size="12" fill="#e6edf3">1427  <tspan fill="#8b949e">quartz</tspan></text>
+<rect x="150" y="148" width="303.1" height="18" rx="3" fill="#3b82f6"/>
+<text x="461.1" y="161" font-size="12" fill="#e6edf3">1299  <tspan fill="#8b949e">quartz</tspan></text>
 <text x="30" y="206" font-size="14" font-weight="600" fill="#e6edf3">Decode, 400 tokens, sampled</text>
 <rect x="520" y="194" width="12" height="12" rx="2" fill="#6e7681"/><text x="538" y="205" font-size="12" fill="#e6edf3">Plain</text>
 <rect x="610" y="194" width="12" height="12" rx="2" fill="#8b5cf6"/><text x="628" y="205" font-size="12" fill="#e6edf3">DSpark</text>
@@ -21,40 +21,40 @@
 <line x1="617.7" y1="218" x2="617.7" y2="486" stroke="#30363d" stroke-width="1"/>
 <text x="617.7" y="500" font-size="11" text-anchor="middle" fill="#8b949e">150</text>
 <text x="30" y="252" font-size="12" fill="#e6edf3">C code</text>
-<rect x="172" y="222" width="311.7" height="14" rx="3" fill="#6e7681"/>
-<text x="489.7" y="233" font-size="11" fill="#e6edf3">104.9</text>
-<rect x="172" y="239" width="234.1" height="14" rx="3" fill="#8b5cf6"/>
-<text x="412.1" y="250" font-size="11" fill="#e6edf3">78.8</text>
-<rect x="172" y="256" width="301.3" height="14" rx="3" fill="#14b8a6"/>
-<text x="479.3" y="267" font-size="11" fill="#e6edf3">101.4</text>
+<rect x="172" y="222" width="297.1" height="14" rx="3" fill="#6e7681"/>
+<text x="475.1" y="233" font-size="11" fill="#e6edf3">100.0</text>
+<rect x="172" y="239" width="215.4" height="14" rx="3" fill="#8b5cf6"/>
+<text x="393.4" y="250" font-size="11" fill="#e6edf3">72.5</text>
+<rect x="172" y="256" width="293.0" height="14" rx="3" fill="#14b8a6"/>
+<text x="471.0" y="267" font-size="11" fill="#e6edf3">98.6</text>
 <text x="30" y="306" font-size="12" fill="#e6edf3">Python code</text>
-<rect x="172" y="276" width="311.1" height="14" rx="3" fill="#6e7681"/>
-<text x="489.1" y="287" font-size="11" fill="#e6edf3">104.7</text>
-<rect x="172" y="293" width="477.2" height="14" rx="3" fill="#8b5cf6"/>
-<text x="655.2" y="304" font-size="11" fill="#e6edf3">160.6</text>
-<rect x="172" y="310" width="435.6" height="14" rx="3" fill="#14b8a6"/>
-<text x="613.6" y="321" font-size="11" fill="#e6edf3">146.6</text>
+<rect x="172" y="276" width="306.4" height="14" rx="3" fill="#6e7681"/>
+<text x="484.4" y="287" font-size="11" fill="#e6edf3">103.1</text>
+<rect x="172" y="293" width="438.6" height="14" rx="3" fill="#8b5cf6"/>
+<text x="616.6" y="304" font-size="11" fill="#e6edf3">147.6</text>
+<rect x="172" y="310" width="391.6" height="14" rx="3" fill="#14b8a6"/>
+<text x="569.6" y="321" font-size="11" fill="#e6edf3">131.8</text>
 <text x="30" y="360" font-size="12" fill="#e6edf3">JSON</text>
-<rect x="172" y="330" width="312.0" height="14" rx="3" fill="#6e7681"/>
-<text x="490.0" y="341" font-size="11" fill="#e6edf3">105.0</text>
-<rect x="172" y="347" width="457.6" height="14" rx="3" fill="#8b5cf6"/>
-<text x="635.6" y="358" font-size="11" fill="#e6edf3">154.0</text>
-<rect x="172" y="364" width="414.5" height="14" rx="3" fill="#14b8a6"/>
-<text x="592.5" y="375" font-size="11" fill="#e6edf3">139.5</text>
+<rect x="172" y="330" width="305.5" height="14" rx="3" fill="#6e7681"/>
+<text x="483.5" y="341" font-size="11" fill="#e6edf3">102.8</text>
+<rect x="172" y="347" width="420.2" height="14" rx="3" fill="#8b5cf6"/>
+<text x="598.2" y="358" font-size="11" fill="#e6edf3">141.4</text>
+<rect x="172" y="364" width="409.5" height="14" rx="3" fill="#14b8a6"/>
+<text x="587.5" y="375" font-size="11" fill="#e6edf3">137.8</text>
 <text x="30" y="414" font-size="12" fill="#e6edf3">Explanation</text>
-<rect x="172" y="384" width="312.0" height="14" rx="3" fill="#6e7681"/>
-<text x="490.0" y="395" font-size="11" fill="#e6edf3">105.0</text>
-<rect x="172" y="401" width="219.9" height="14" rx="3" fill="#8b5cf6"/>
-<text x="397.9" y="412" font-size="11" fill="#e6edf3">74.0</text>
-<rect x="172" y="418" width="296.0" height="14" rx="3" fill="#14b8a6"/>
-<text x="474.0" y="429" font-size="11" fill="#e6edf3">99.6</text>
+<rect x="172" y="384" width="305.8" height="14" rx="3" fill="#6e7681"/>
+<text x="483.8" y="395" font-size="11" fill="#e6edf3">102.9</text>
+<rect x="172" y="401" width="202.4" height="14" rx="3" fill="#8b5cf6"/>
+<text x="380.4" y="412" font-size="11" fill="#e6edf3">68.1</text>
+<rect x="172" y="418" width="287.6" height="14" rx="3" fill="#14b8a6"/>
+<text x="465.6" y="429" font-size="11" fill="#e6edf3">96.8</text>
 <text x="30" y="468" font-size="12" fill="#e6edf3">Prose</text>
-<rect x="172" y="438" width="311.7" height="14" rx="3" fill="#6e7681"/>
-<text x="489.7" y="449" font-size="11" fill="#e6edf3">104.9</text>
-<rect x="172" y="455" width="158.4" height="14" rx="3" fill="#8b5cf6"/>
-<text x="336.4" y="466" font-size="11" fill="#e6edf3">53.3</text>
-<rect x="172" y="472" width="271.9" height="14" rx="3" fill="#14b8a6"/>
-<text x="449.9" y="483" font-size="11" fill="#e6edf3">91.5</text>
+<rect x="172" y="438" width="306.9" height="14" rx="3" fill="#6e7681"/>
+<text x="484.9" y="449" font-size="11" fill="#e6edf3">103.3</text>
+<rect x="172" y="455" width="145.9" height="14" rx="3" fill="#8b5cf6"/>
+<text x="323.9" y="466" font-size="11" fill="#e6edf3">49.1</text>
+<rect x="172" y="472" width="262.1" height="14" rx="3" fill="#14b8a6"/>
+<text x="440.1" y="483" font-size="11" fill="#e6edf3">88.2</text>
 <text x="30" y="544" font-size="14" font-weight="600" fill="#e6edf3">Mixed answers, 800 tokens</text>
 <line x1="172.0" y1="556" x2="172.0" y2="770" stroke="#30363d" stroke-width="1"/>
 <text x="172.0" y="784" font-size="11" text-anchor="middle" fill="#8b949e">0</text>
@@ -65,33 +65,33 @@
 <line x1="617.7" y1="556" x2="617.7" y2="770" stroke="#30363d" stroke-width="1"/>
 <text x="617.7" y="784" font-size="11" text-anchor="middle" fill="#8b949e">150</text>
 <text x="30" y="590" font-size="12" fill="#e6edf3">Code → prose</text>
-<rect x="172" y="560" width="309.0" height="14" rx="3" fill="#6e7681"/>
-<text x="487.0" y="571" font-size="11" fill="#e6edf3">104.0</text>
-<rect x="172" y="577" width="242.2" height="14" rx="3" fill="#8b5cf6"/>
-<text x="420.2" y="588" font-size="11" fill="#e6edf3">81.5</text>
-<rect x="172" y="594" width="341.1" height="14" rx="3" fill="#14b8a6"/>
-<text x="519.1" y="605" font-size="11" fill="#e6edf3">114.8</text>
+<rect x="172" y="560" width="302.8" height="14" rx="3" fill="#6e7681"/>
+<text x="480.8" y="571" font-size="11" fill="#e6edf3">101.9</text>
+<rect x="172" y="577" width="221.7" height="14" rx="3" fill="#8b5cf6"/>
+<text x="399.7" y="588" font-size="11" fill="#e6edf3">74.6</text>
+<rect x="172" y="594" width="326.9" height="14" rx="3" fill="#14b8a6"/>
+<text x="504.9" y="605" font-size="11" fill="#e6edf3">110.0</text>
 <text x="30" y="644" font-size="12" fill="#e6edf3">JSON → prose</text>
-<rect x="172" y="614" width="306.4" height="14" rx="3" fill="#6e7681"/>
-<text x="484.4" y="625" font-size="11" fill="#e6edf3">103.1</text>
-<rect x="172" y="631" width="277.8" height="14" rx="3" fill="#8b5cf6"/>
-<text x="455.8" y="642" font-size="11" fill="#e6edf3">93.5</text>
-<rect x="172" y="648" width="387.2" height="14" rx="3" fill="#14b8a6"/>
-<text x="565.2" y="659" font-size="11" fill="#e6edf3">130.3</text>
+<rect x="172" y="614" width="302.8" height="14" rx="3" fill="#6e7681"/>
+<text x="480.8" y="625" font-size="11" fill="#e6edf3">101.9</text>
+<rect x="172" y="631" width="254.9" height="14" rx="3" fill="#8b5cf6"/>
+<text x="432.9" y="642" font-size="11" fill="#e6edf3">85.8</text>
+<rect x="172" y="648" width="363.1" height="14" rx="3" fill="#14b8a6"/>
+<text x="541.1" y="659" font-size="11" fill="#e6edf3">122.2</text>
 <text x="30" y="698" font-size="12" fill="#e6edf3">Prose → code</text>
-<rect x="172" y="668" width="308.7" height="14" rx="3" fill="#6e7681"/>
-<text x="486.7" y="679" font-size="11" fill="#e6edf3">103.9</text>
-<rect x="172" y="685" width="214.8" height="14" rx="3" fill="#8b5cf6"/>
-<text x="392.8" y="696" font-size="11" fill="#e6edf3">72.3</text>
-<rect x="172" y="702" width="328.0" height="14" rx="3" fill="#14b8a6"/>
-<text x="506.0" y="713" font-size="11" fill="#e6edf3">110.4</text>
+<rect x="172" y="668" width="302.2" height="14" rx="3" fill="#6e7681"/>
+<text x="480.2" y="679" font-size="11" fill="#e6edf3">101.7</text>
+<rect x="172" y="685" width="197.0" height="14" rx="3" fill="#8b5cf6"/>
+<text x="375.0" y="696" font-size="11" fill="#e6edf3">66.3</text>
+<rect x="172" y="702" width="312.6" height="14" rx="3" fill="#14b8a6"/>
+<text x="490.6" y="713" font-size="11" fill="#e6edf3">105.2</text>
 <text x="30" y="752" font-size="12" fill="#e6edf3">Code → prose → code</text>
-<rect x="172" y="722" width="308.7" height="14" rx="3" fill="#6e7681"/>
-<text x="486.7" y="733" font-size="11" fill="#e6edf3">103.9</text>
-<rect x="172" y="739" width="296.3" height="14" rx="3" fill="#8b5cf6"/>
-<text x="474.3" y="750" font-size="11" fill="#e6edf3">99.7</text>
-<rect x="172" y="756" width="329.5" height="14" rx="3" fill="#14b8a6"/>
-<text x="507.5" y="767" font-size="11" fill="#e6edf3">110.9</text>
+<rect x="172" y="722" width="302.2" height="14" rx="3" fill="#6e7681"/>
+<text x="480.2" y="733" font-size="11" fill="#e6edf3">101.7</text>
+<rect x="172" y="739" width="271.9" height="14" rx="3" fill="#8b5cf6"/>
+<text x="449.9" y="750" font-size="11" fill="#e6edf3">91.5</text>
+<rect x="172" y="756" width="312.3" height="14" rx="3" fill="#14b8a6"/>
+<text x="490.3" y="767" font-size="11" fill="#e6edf3">105.1</text>
 <text x="30" y="828" font-size="14" font-weight="600" fill="#e6edf3">VRAM per card at full context (262144)</text>
 <rect x="30" y="842" width="12" height="12" rx="2" fill="#3b82f6"/><text x="48" y="853" font-size="12" fill="#e6edf3">Weights</text>
 <rect x="134" y="842" width="12" height="12" rx="2" fill="#1e40af"/><text x="152" y="853" font-size="12" fill="#e6edf3">KV cache + state</text>
