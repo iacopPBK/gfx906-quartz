@@ -53,3 +53,25 @@ static inline bool ink2_tp2_spec(const char * name, int card, int64_t ne1, qz_sl
     }
     return true;
 }
+
+// the DSpark drafter's TP2 slices (ink2_dspark.h): card c owns q heads 12c.., kv heads
+// 4c.. (attention and context K / V), FFN rows 4608c.. and the matching contraction
+// halves of attn_output (48 of 96 blocks) and ffn_down (144 of 288); the rest is replicated
+static inline bool ink2_ds_tp2_spec(const char * name, int card, int64_t, qz_slice & s) {
+    s.rows.clear();
+    s.cols.clear();
+    const int c = card;
+    if (strncmp(name, "blk.", 4) != 0) return false;
+    const char * suf = strchr(name + 4, '.');
+    if (!suf) return false;
+    suf++;
+    auto is = [&](const char * x) { return strcmp(suf, x) == 0; };
+    if (is("attn_q.weight")) ink2_range(s.rows, 1536 * c, 1536);
+    else if (is("attn_k.weight") || is("attn_v.weight") || is("attn_k_ctx.weight") || is("attn_v_ctx.weight"))
+        ink2_range(s.rows, 512 * c, 512);
+    else if (is("attn_output.weight")) ink2_range(s.cols, 48 * c, 48);
+    else if (is("ffn_gate.weight") || is("ffn_up.weight")) ink2_range(s.rows, 4608 * c, 4608);
+    else if (is("ffn_down.weight")) ink2_range(s.cols, 144 * c, 144);
+    else return false;
+    return true;
+}

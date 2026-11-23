@@ -33,10 +33,11 @@ defaults and environment variables are in
 - **Memory, Inkling-2-Mini.** The weights take about half of the 28 GB file
   per card. What grows with the context is small: the 8 full-attention
   slots' K/V take 16 KB per token per card (4.3 GB at 262144), and the 40
-  sliding-window rings take a fixed 0.7 GB. The DSpark drafter's context
-  cache adds 12 KB per token on card 0 (3.2 GB at 262144). At the default
-  context the cards hold 20.6 GB each, and with DSpark 24.3 GB on card 0 and
-  20.6 GB on card 1. The start-up check is in `arch/inkling2/ink2_preflight.h`.
+  sliding-window rings take a fixed 0.7 GB. The DSpark drafter is split over
+  both cards like the target; its context cache adds 6 KB per token per card
+  (1.6 GB at 262144). At the default context the cards hold 20.6 GB each, and
+  about 2 GB more each with DSpark. The start-up check is in
+  `arch/inkling2/ink2_preflight.h`.
 - **gfx906 only** (MI50, MI60). The kernels use gfx906 instructions and assume
   its 60 CUs and 64 KB of LDS; load aborts on a card where they do not fit.
 - **P2P setup.** The server sets `HSA_FORCE_FINE_GRAIN_PCIE=1` and

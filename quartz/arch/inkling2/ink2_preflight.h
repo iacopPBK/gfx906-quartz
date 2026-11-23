@@ -4,19 +4,29 @@
 
 // what grows with the context, per card: the 8 full-attention slots' f16 K / V
 // (ctx rows), the 40 SWA slots' rings (PF_RING rows) and the conv histories;
-// on card 0 with the drafter, its 3 layers' f16 context K / V
+// with the drafter, its 3 layers' f16 context K / V of the card's 4 kv heads
 inline double ink2_ctx_bytes(int ctx, int card, bool ds) {
     double b = 0;
     for (int s = 0; s < NAPP; s++) b += 2.0 * (is_full(slot_phys(s)) ? ctx : PF_RING) * KVL * 2;
     b += (double) NAPP * 3 * CHL * 4;
-    if (ds && card == 0) b += 2.0 * DS_NL * ctx * DS_KV * 2;
+    if (ds) b += 2.0 * DS_NL * ctx * DS_KVL * 2;
     return b;
 }
 // the rest: the activations (VR rows), the batched prefill's buffers, the HIP runtime's
-// share; the drafter's weights and work buffers (card 0; card 1 holds its head fold
-// buffers); 256 MB left free on top. Measured 2026-11-23 at 262144: 20.6 GB per card,
-// with DSpark 24.3 / 20.6 (this estimate: 20.9, with DSpark 24.8 / 21.0)
-constexpr double INK_PF_FIXED = 1.5e9, INK_PF_DS0 = 0.6e9, INK_PF_DS1 = 0.1e9, INK_PF_HEADROOM = 0.25e9;
+// share; the drafter's weight slices (planned from its GGUF) and work buffers (the head
+// fold on both cards, the Markov chain on card 0); 256 MB left free on top. Measured
+// 2026-11-23 at 262144: 20.6 GB per card (this estimate: 20.9)
+constexpr double INK_PF_FIXED = 1.5e9, INK_PF_DS0 = 0.25e9, INK_PF_DS1 = 0.2e9, INK_PF_HEADROOM = 0.25e9;
+
+// the drafter's weights on card c (its TP2 slices; the Markov chain's tensors on card 0), 0 if unreadable
+inline double ink2_ds_weight_bytes(const char * path, int c) {
+    qz_gguf g;
+    if (!path || !g.open(path)) return 0;
+    qz_loader L;
+    L.slice = ink2_ds_tp2_spec;
+    if (c == 1) L.skip = ink2_dspark::chain_only;
+    return L.plan(g, c) ? (double) L.need_bytes : 0;
+}
 
 // 0: fits (or cannot be sized here: the load reports the model problem); 1: refused
 inline int ink2_vram_check(const qz_gguf & g, int ctx, const char * dspark) {
@@ -29,7 +39,8 @@ inline int ink2_vram_check(const qz_gguf & g, int ctx, const char * dspark) {
         size_t fr = 0, tot = 0;
         if (hipSetDevice(qz_dev_of(c)) != hipSuccess || hipMemGetInfo(&fr, &tot) != hipSuccess) return 0;
         w[c] = (double) L.need_bytes; free_b[c] = (double) fr; total_b[c] = (double) tot;
-        need[c] = w[c] + ink2_ctx_bytes(ctx, c, ds) + INK_PF_FIXED + INK_PF_HEADROOM + (ds ? (c == 0 ? INK_PF_DS0 : INK_PF_DS1) : 0.0);
+        need[c] = w[c] + ink2_ctx_bytes(ctx, c, ds) + INK_PF_FIXED + INK_PF_HEADROOM +
+                  (ds ? ink2_ds_weight_bytes(dspark, c) + (c == 0 ? INK_PF_DS0 : INK_PF_DS1) : 0.0);
     }
     (void) hipSetDevice(qz_dev_of(0));
     fprintf(stderr, "inkling2: memory per card: weights %.1f + context %.1f (ctx %d)%s + buffers %.1f = %.1f / %.1f GB; free %.1f and %.1f GB\n",

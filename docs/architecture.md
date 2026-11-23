@@ -75,7 +75,9 @@ own engine; its forward pass is written down in [inkling2.md](inkling2.md).
   and checks that the sliding-window rings still cover the resumed position.
 - **Decode** is one persistent kernel per card per token (`ink2_cycle.h`).
   With a DSpark draft, decode runs rounds of 7 drafts checked as 8 rows by a
-  second persistent kernel (`ink2_dspark.h`, `ink2_verify.h`); each row's
+  second persistent kernel (`ink2_verify.h`). The drafter (`ink2_dspark.h`)
+  is split over the two cards like the target (half the heads and FFN each,
+  partials summed on both); each row's
   token is picked (greedy or sampled) as one plain step would pick it.
   The switch falls back to one token per step while that is faster.
 - **Memory** is checked at start by `ink2_preflight.h`.

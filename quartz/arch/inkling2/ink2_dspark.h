@@ -9,13 +9,17 @@
 // latent; the draft logits are the target head on hidden_i + hidden_out(latent),
 // computed as head . hidden_i (one 7-row GEMV) + fold . [latent; 1] with
 // fold = head . [hidden_out | bias] built at load (per card, its vocab half).
-// The layers run on card 0; the head GEMVs / folds on both cards.
+// The layers run split over the two cards as the target's (ink2_ds_tp2_spec): card c
+// owns 12 q heads, 4 kv heads (and their context K / V cache) and half the FFN; the
+// attn_output / ffn_down partials are exchanged and summed on both cards (card 0's
+// first), so the residual stays replicated. The head GEMVs / folds run per card.
 // The 7 Markov steps run as one device-side chain (no host round trip): card 0's
 // joint kernel waits for the peer's argmax through peer memory flags, card 1's
 // fold waits for card 0's lat1 the same way; only the 7 tokens come back.
 // Included after ink2_engine.h / ink2_pf.h (same TU).
 
 constexpr int DS_BS = 8, DS_NL = 3, DS_R = 256, DS_FF = 9216, DS_Q = 3072, DS_KV = 1024, DS_NQ = 24, DS_NKV = 8;
+constexpr int DS_NQL = DS_NQ / 2, DS_NKVL = DS_NKV / 2, DS_QL = DS_Q / 2, DS_KVL = DS_KV / 2, DS_FFL = DS_FF / 2;   // per card
 constexpr int DS_SPL = 16;                     // attention key splits (x 4 waves)
 constexpr int DS_NT = 256;                     // the drafter GEMV's block (4 waves, S = 4 rows per wave)
 constexpr float DS_EPS = 1e-6f, DS_THETA = 1e6f;
@@ -58,6 +62,26 @@ static __global__ __launch_bounds__(256) void k_ds_mixnorm(const float * taps, s
         out[(size_t) blockIdx.x * ostride + i] = v[k] * r * w[i];
     }
 }
+// the same rows straight to int8 + per-32 scales (row stride D)
+static __global__ __launch_bounds__(256) void k_ds_mixq(const float * taps, size_t tstride, float4 a, const float * w,
+                                                        unsigned char * q, float * qs, float eps) {
+    __shared__ float red[16];
+    const float * t = taps + (size_t) blockIdx.x * tstride;
+    float v[D / 256], ss[1] = {0.f};
+    #pragma unroll
+    for (int k = 0; k < D / 256; k++) {
+        const int i = threadIdx.x + k * 256;
+        v[k] = a.x * t[i] + a.y * t[D + i] + a.z * t[2 * D + i] + a.w * t[3 * D + i];
+        ss[0] += v[k] * v[k];
+    }
+    bsum<1, false>(ss, red, 4);
+    const float r = rsqrtf(ss[0] / D + eps);
+    #pragma unroll
+    for (int k = 0; k < D / 256; k++) {
+        const int i = threadIdx.x + k * 256;
+        quant32(v[k] * r * w[i], q + (size_t) blockIdx.x * D, qs + (size_t) blockIdx.x * (D / 32), i);
+    }
+}
 // rows (stride K) -> int8 + per-32 scales; w: RMSNorm with weight first (null: quantize as is);
 // y: also the normed f32 rows
 static __global__ __launch_bounds__(256) void k_ds_quant(const float * x, const float * w, int K, unsigned char * q, float * qs,
@@ -77,16 +101,16 @@ static __global__ __launch_bounds__(256) void k_ds_quant(const float * x, const 
         quant32(v, q + (size_t) blockIdx.x * K, qs + (size_t) blockIdx.x * (K / 32), i);
     }
 }
-// x += y, then the row's int8 planes from RMSNorm(x) * w (one kernel: the residual and its
-// quantization, as k_ds_add + k_ds_quant did)
-static __global__ __launch_bounds__(256) void k_ds_add_quant(float * x, const float * y, const float * w, int K,
+// x += a + b (the two cards' partials, card 0's first on both cards), then the row's int8
+// planes from RMSNorm(x) * w (one kernel: the residual and its quantization)
+static __global__ __launch_bounds__(256) void k_ds_add_quant(float * x, const float * a, const float * b, const float * w, int K,
                                                              unsigned char * q, float * qs, float eps) {
     __shared__ float red[16];
     float * xr = x + (size_t) blockIdx.x * K;
-    const float * yr = y + (size_t) blockIdx.x * K;
+    const float * ar = a + (size_t) blockIdx.x * K, * br = b + (size_t) blockIdx.x * K;
     float ss[1] = {0.f};
     for (int i = threadIdx.x; i < K; i += 256) {
-        const float v = xr[i] + yr[i];
+        const float v = xr[i] + (ar[i] + br[i]);
         xr[i] = v;
         ss[0] += v * v;
     }
@@ -187,38 +211,38 @@ static __global__ __launch_bounds__(128) void k_ds_hnorm_rope(float * xq, const 
         xr[e + HD / 2] = x0 * sn + x1 * cs;
     }
 }
-// f32 rows [m][DS_KV] -> the f16 cache at rows pos0 ..
+// f32 rows [m][DS_KVL] (this card's kv heads) -> the f16 cache at rows pos0 ..
 static __global__ void k_ds_store(const float * k, const float * v, __half * ck, __half * cv, int pos0, int m) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= m * DS_KV) return;
-    ck[(size_t) pos0 * DS_KV + i] = __float2half(k[i]);
-    cv[(size_t) pos0 * DS_KV + i] = __float2half(v[i]);
+    if (i >= m * DS_KVL) return;
+    ck[(size_t) pos0 * DS_KVL + i] = __float2half(k[i]);
+    cv[(size_t) pos0 * DS_KVL + i] = __float2half(v[i]);
 }
-// attention of the block's BS query rows (head blockIdx.x) over context keys [lo, a)
+// attention of the block's BS query rows (this card's head blockIdx.x) over context keys [lo, a)
 // (f16 cache) and the BS block keys (f32), no mask; split sp of DS_SPL x 4 waves ->
 // partials (m, l, o[128]) per (head, split-wave, row)
 constexpr int DS_PW = HD + 2, DS_NP = DS_SPL * 4;
 static __global__ __launch_bounds__(256) void k_ds_attn(const float * q, const __half * ck, const __half * cv,
                                                         const float * kb, const float * vb, int lo, int a, float * part) {
-    const int h = blockIdx.x, kh = h / (DS_NQ / DS_NKV), wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
+    const int h = blockIdx.x, kh = h / (DS_NQL / DS_NKVL), wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
     const int vw = blockIdx.y * 4 + wave;
     const float scale = 1.f / sqrtf((float) HD);
     float q0[DS_BS], q1[DS_BS], m[DS_BS], l[DS_BS], o0[DS_BS], o1[DS_BS];
     #pragma unroll
     for (int r = 0; r < DS_BS; r++) {
-        q0[r] = q[((size_t) r * DS_NQ + h) * HD + 2 * lane] * scale;
-        q1[r] = q[((size_t) r * DS_NQ + h) * HD + 2 * lane + 1] * scale;
+        q0[r] = q[((size_t) r * DS_NQL + h) * HD + 2 * lane] * scale;
+        q1[r] = q[((size_t) r * DS_NQL + h) * HD + 2 * lane + 1] * scale;
         m[r] = -INFINITY; l[r] = 0.f; o0[r] = o1[r] = 0.f;
     }
     const int nk = a - lo + DS_BS;
     for (int j = vw; j < nk; j += DS_NP) {
         float k0, k1, v0, v1;
         if (j < a - lo) {
-            const size_t o = (size_t) (lo + j) * DS_KV + kh * HD + 2 * lane;
+            const size_t o = (size_t) (lo + j) * DS_KVL + kh * HD + 2 * lane;
             const __half2 kk = *(const __half2 *) (ck + o), vv = *(const __half2 *) (cv + o);
             k0 = __low2float(kk); k1 = __high2float(kk); v0 = __low2float(vv); v1 = __high2float(vv);
         } else {
-            const size_t o = (size_t) (j - (a - lo)) * DS_KV + kh * HD + 2 * lane;
+            const size_t o = (size_t) (j - (a - lo)) * DS_KVL + kh * HD + 2 * lane;
             k0 = kb[o]; k1 = kb[o + 1]; v0 = vb[o]; v1 = vb[o + 1];
         }
         #pragma unroll
@@ -237,7 +261,7 @@ static __global__ __launch_bounds__(256) void k_ds_attn(const float * q, const _
         P[2 + 2 * lane] = o0[r]; P[3 + 2 * lane] = o1[r];
     }
 }
-// merge the DS_NP partials of (head blockIdx.x, row blockIdx.y) -> o [row][DS_Q]
+// merge the DS_NP partials of (head blockIdx.x, row blockIdx.y) -> o [row][DS_QL]
 static __global__ __launch_bounds__(128) void k_ds_attn_merge(const float * part, float * o) {
     const int h = blockIdx.x, r = blockIdx.y, d = threadIdx.x;
     float M = -INFINITY;
@@ -258,7 +282,7 @@ static __global__ __launch_bounds__(128) void k_ds_attn_merge(const float * part
             L += pl[k] * e; O += po[k] * e;
         }
     }
-    o[(size_t) r * DS_Q + h * HD + d] = O / L;
+    o[(size_t) r * DS_QL + h * HD + d] = O / L;
 }
 static __global__ __launch_bounds__(256) void k_ds_embed(const char * ev, const __half * es, int tok, const float * w, float eps,
                                                          float * x, const float * mask) {
@@ -395,15 +419,16 @@ static __global__ void k_ds_tohalf(const float * y, __half * o, int n, int strid
     const int r = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c < n) o[(size_t) r * stride + c] = __float2half(y[(size_t) r * n + c]);
 }
-// the block's hidden rows 1 .. 7: X += Y, then the Markov input (f32, hid) and its int8 planes
-static __global__ __launch_bounds__(256) void k_ds_hidden(float * x, const float * y, const float * w, int K,
+// the block's hidden rows 1 .. 7: X += a + b (as k_ds_add_quant), then the Markov input
+// (f32, hid) and its int8 planes
+static __global__ __launch_bounds__(256) void k_ds_hidden(float * x, const float * a, const float * b, const float * w, int K,
                                                           unsigned char * q, float * qs, float * hf, float eps) {
     __shared__ float red[16];
     float * xr = x + (size_t) (blockIdx.x + 1) * K;
-    const float * yr = y + (size_t) (blockIdx.x + 1) * K;
+    const float * ar = a + (size_t) (blockIdx.x + 1) * K, * br = b + (size_t) (blockIdx.x + 1) * K;
     float ss[1] = {0.f};
     for (int i = threadIdx.x; i < K; i += 256) {
-        const float v = xr[i] + yr[i];
+        const float v = xr[i] + (ar[i] + br[i]);
         xr[i] = v;
         ss[0] += v * v;
     }
@@ -425,22 +450,33 @@ static __global__ void k_ds_fold_rows(const uint16_t * how, const float * hob, i
 
 struct ink2_dspark {
     struct layer { qw q, k, v, kc, vc, o, gate, up, down; const float * an, * fn, * qn, * kn, * kcn, * dn; };
+    // one card's share: its weight slices, its kv heads' context cache, the block buffers
+    struct card {
+        qz_loader ld;
+        layer L[DS_NL];
+        const float * mask = nullptr, * onorm = nullptr, * hob = nullptr;
+        const uint16_t * how = nullptr;
+        __half * ck[DS_NL] = {}, * cv[DS_NL] = {};   // [ctx][DS_KVL]
+        unsigned char * fq = nullptr; float * fs = nullptr;   // context fill: the 3 layers' mixed rows, int8 [3][m][D]
+        float * ckf = nullptr, * cvf = nullptr;      // context fill: k / v [8][DS_KVL]
+        float * X = nullptr, * Y = nullptr, * Yp[2] = {};   // residual [8][D], this card's partial, the peer's (2 slots)
+        float * Q = nullptr, * Kb = nullptr, * Vb = nullptr, * O = nullptr, * G = nullptr, * U = nullptr;
+        float * hid = nullptr, * part = nullptr;
+        unsigned char * aq = nullptr; float * as = nullptr;
+        hipEvent_t ev = nullptr;
+    };
     ink2_engine * E = nullptr;
-    qz_loader ld;
-    layer L[DS_NL];
+    card K[2];
     float4 alpha[DS_NL + 1];
-    const float * mask = nullptr, * dsn = nullptr, * onorm = nullptr, * jb = nullptr, * hob = nullptr;
-    const uint16_t * jw = nullptr, * w1 = nullptr, * how = nullptr;
+    const float * dsn = nullptr, * jb = nullptr;      // card 0
+    const uint16_t * jw = nullptr, * w1 = nullptr;    // card 0
     int ctx = 0;
-    // card 0: context cache, block buffers
-    __half * ck[DS_NL] = {}, * cv[DS_NL] = {};           // [ctx][DS_KV] (+ the nhp padding? no: plain)
+    int xk = 0;                                // the partials' slot parity
+    // card 0: the Markov chain
     float * g = nullptr;                       // the Markov context of the last committed row
     float * tap = nullptr;                     // decode features [4][D] (the cycle writes them)
     float * vtap = nullptr;                    // verify features [VR][4][D] (the verify kernel writes them)
-    float * cx = nullptr, * ckf = nullptr, * cvf = nullptr;   // context fill: mixed rows [8][D], k / v [8][DS_KV]
-    float * X = nullptr, * Y = nullptr, * Q = nullptr, * Kb = nullptr, * Vb = nullptr, * O = nullptr, * G = nullptr, * U = nullptr;
-    float * hid = nullptr, * part = nullptr, * joint = nullptr, * state = nullptr;
-    unsigned char * aq = nullptr; float * as = nullptr;
+    float * joint = nullptr, * state = nullptr;
     // per card: the draft rows' quantized hidden, base logits [8][nvalid], fold [(R+1)][nhp], lat1
     unsigned char * hq[2] = {}; float * hs[2] = {}, * base[2] = {}, * lat1[2] = {};
     __half * fold[2] = {};
@@ -450,14 +486,14 @@ struct ink2_dspark {
     unsigned int * fl[2] = {};                 // the peer's handshake flag (uncached)
     int * out_d = nullptr, * out_h = nullptr;  // the 7 tokens + the chain's error word
     unsigned int seq = 0;                      // the chain's step counter (monotone)
-    hipEvent_t ev = nullptr;
     // stats
     long rounds = 0, accepted = 0;
 
-    static qw Q8(const qz_loader & l, const char * n) {
+    static qw Q8(const qz_loader & l, const char * n, int K, int N) {
         const qz_dev_tensor * t = l.get(n);
         if (!t || t->type != GGML_TYPE_Q8_0) { fprintf(stderr, "dspark: missing Q8_0 %s\n", n); exit(1); }
         qw r; r.v = (const char *) t->vals; r.s = (const __half *) t->scal; r.K = (int) t->ne0; r.N = (int) t->ne1;
+        if (r.K != K || r.N != N) { fprintf(stderr, "dspark: %s is %d x %d per card, expected %d x %d\n", n, r.K, r.N, K, N); exit(1); }
         return r;
     }
     static const void * Raw(const qz_loader & l, const char * n, ggml_type ty) {
@@ -466,6 +502,11 @@ struct ink2_dspark {
         return t->vals;
     }
     template <class T> static void al(T ** p, size_t n) { ICHECK(qz_dmalloc((void **) p, n * sizeof(T), "dspark")); }
+    // the Markov chain's own tensors: card 0 only
+    static bool chain_only(const char * n) {
+        return strcmp(n, "markov_w1.weight") == 0 || strcmp(n, "joint_proj.weight") == 0 || strcmp(n, "joint_proj.bias") == 0 ||
+               strcmp(n, "dspark_norm.weight") == 0;
+    }
 
     bool load(const char * path, int ctx_) {
         ctx = ctx_;
@@ -476,33 +517,41 @@ struct ink2_dspark {
         if (g_.u32("dflash.block_count") != DS_NL || g_.u32("dflash.block_size") != DS_BS || g_.u32("dflash.embedding_length") != D) {
             fprintf(stderr, "dspark: unsupported drafter shape\n"); return false;
         }
-        ICHECK(hipSetDevice(qz_dev_of(0)));
-        {
-            qz_mem_scope mem("dspark weights");
-            if (!ld.load(path, g_, 0)) { fprintf(stderr, "dspark: load failed\n"); return false; }
-        }
         char n[96];
-        for (int l = 0; l < DS_NL; l++) {
-            auto nm = [&](const char * s) { snprintf(n, sizeof(n), "blk.%d.%s.weight", l, s); return n; };
-            layer & y = L[l];
-            y.q = Q8(ld, nm("attn_q")); y.k = Q8(ld, nm("attn_k")); y.v = Q8(ld, nm("attn_v"));
-            y.kc = Q8(ld, nm("attn_k_ctx")); y.vc = Q8(ld, nm("attn_v_ctx")); y.o = Q8(ld, nm("attn_output"));
-            y.gate = Q8(ld, nm("ffn_gate")); y.up = Q8(ld, nm("ffn_up")); y.down = Q8(ld, nm("ffn_down"));
-            y.an = (const float *) Raw(ld, nm("attn_norm"), GGML_TYPE_F32); y.fn = (const float *) Raw(ld, nm("ffn_norm"), GGML_TYPE_F32);
-            y.qn = (const float *) Raw(ld, nm("attn_q_norm"), GGML_TYPE_F32); y.kn = (const float *) Raw(ld, nm("attn_k_norm"), GGML_TYPE_F32);
-            y.kcn = (const float *) Raw(ld, nm("attn_k_ctx_norm"), GGML_TYPE_F32); y.dn = (const float *) Raw(ld, nm("dflare_norm"), GGML_TYPE_F32);
+        for (int c = 0; c < 2; c++) {
+            card & k = K[c];
+            ICHECK(hipSetDevice(qz_dev_of(c)));
+            {
+                qz_mem_scope mem("dspark weights");
+                k.ld.slice = ink2_ds_tp2_spec;
+                if (c == 1) k.ld.skip = chain_only;
+                if (!k.ld.load(path, g_, qz_dev_of(c), c)) { fprintf(stderr, "dspark: card %d load failed\n", c); return false; }
+            }
+            for (int l = 0; l < DS_NL; l++) {
+                auto nm = [&](const char * s) { snprintf(n, sizeof(n), "blk.%d.%s.weight", l, s); return n; };
+                layer & y = k.L[l];
+                y.q = Q8(k.ld, nm("attn_q"), D, DS_QL); y.k = Q8(k.ld, nm("attn_k"), D, DS_KVL); y.v = Q8(k.ld, nm("attn_v"), D, DS_KVL);
+                y.kc = Q8(k.ld, nm("attn_k_ctx"), D, DS_KVL); y.vc = Q8(k.ld, nm("attn_v_ctx"), D, DS_KVL);
+                y.o = Q8(k.ld, nm("attn_output"), DS_QL, D);
+                y.gate = Q8(k.ld, nm("ffn_gate"), D, DS_FFL); y.up = Q8(k.ld, nm("ffn_up"), D, DS_FFL); y.down = Q8(k.ld, nm("ffn_down"), DS_FFL, D);
+                y.an = (const float *) Raw(k.ld, nm("attn_norm"), GGML_TYPE_F32); y.fn = (const float *) Raw(k.ld, nm("ffn_norm"), GGML_TYPE_F32);
+                y.qn = (const float *) Raw(k.ld, nm("attn_q_norm"), GGML_TYPE_F32); y.kn = (const float *) Raw(k.ld, nm("attn_k_norm"), GGML_TYPE_F32);
+                y.kcn = (const float *) Raw(k.ld, nm("attn_k_ctx_norm"), GGML_TYPE_F32); y.dn = (const float *) Raw(k.ld, nm("dflare_norm"), GGML_TYPE_F32);
+            }
+            k.mask = (const float *) Raw(k.ld, "mask_embd.weight", GGML_TYPE_F32);
+            k.onorm = (const float *) Raw(k.ld, "output_norm.weight", GGML_TYPE_F32);
+            k.hob = (const float *) Raw(k.ld, "dspark_hidden_out.bias", GGML_TYPE_F32);
+            k.how = (const uint16_t *) Raw(k.ld, "dspark_hidden_out.weight", GGML_TYPE_BF16);
         }
-        mask = (const float *) Raw(ld, "mask_embd.weight", GGML_TYPE_F32);
-        dsn = (const float *) Raw(ld, "dspark_norm.weight", GGML_TYPE_F32);
-        onorm = (const float *) Raw(ld, "output_norm.weight", GGML_TYPE_F32);
-        jb = (const float *) Raw(ld, "joint_proj.bias", GGML_TYPE_F32);
-        hob = (const float *) Raw(ld, "dspark_hidden_out.bias", GGML_TYPE_F32);
-        jw = (const uint16_t *) Raw(ld, "joint_proj.weight", GGML_TYPE_BF16);
-        w1 = (const uint16_t *) Raw(ld, "markov_w1.weight", GGML_TYPE_BF16);
-        how = (const uint16_t *) Raw(ld, "dspark_hidden_out.weight", GGML_TYPE_BF16);
+        ICHECK(hipSetDevice(qz_dev_of(0)));
+        const qz_loader & L0 = K[0].ld;
+        dsn = (const float *) Raw(L0, "dspark_norm.weight", GGML_TYPE_F32);
+        jb = (const float *) Raw(L0, "joint_proj.bias", GGML_TYPE_F32);
+        jw = (const uint16_t *) Raw(L0, "joint_proj.weight", GGML_TYPE_BF16);
+        w1 = (const uint16_t *) Raw(L0, "markov_w1.weight", GGML_TYPE_BF16);
         {   // the 4 feature mixes: softmax of each dspark_fuse row
             float f[16];
-            ICHECK(hipMemcpy(f, Raw(ld, "dspark_fuse.weight", GGML_TYPE_F32), sizeof(f), hipMemcpyDeviceToHost));
+            ICHECK(hipMemcpy(f, Raw(L0, "dspark_fuse.weight", GGML_TYPE_F32), sizeof(f), hipMemcpyDeviceToHost));
             for (int r = 0; r <= DS_NL; r++) {
                 float mx = f[4 * r], e[4], s = 0;
                 for (int k = 1; k < 4; k++) mx = fmaxf(mx, f[4 * r + k]);
@@ -511,17 +560,22 @@ struct ink2_dspark {
             }
         }
         qz_mem_scope mem("dspark state");
-        for (int l = 0; l < DS_NL; l++) { al(&ck[l], (size_t) ctx * DS_KV); al(&cv[l], (size_t) ctx * DS_KV); }
-        al(&g, D); al(&tap, 4 * D); al(&vtap, (size_t) VR * 4 * D); al(&cx, 8 * D); al(&ckf, 8 * DS_KV); al(&cvf, 8 * DS_KV);
-        al(&X, DS_BS * D); al(&Y, DS_BS * D); al(&Q, DS_BS * DS_Q); al(&Kb, DS_BS * DS_KV); al(&Vb, DS_BS * DS_KV);
-        al(&O, DS_BS * DS_Q); al(&G, DS_BS * DS_FF); al(&U, DS_BS * DS_FF); al(&hid, DS_BS * D);
-        al(&part, (size_t) DS_NQ * DS_NP * DS_BS * DS_PW); al(&joint, 3 * DS_R); al(&state, DS_R);
-        al(&aq, DS_BS * DS_FF); al(&as, DS_BS * DS_FF / 32);
+        al(&g, D); al(&tap, 4 * D); al(&vtap, (size_t) VR * 4 * D); al(&joint, 3 * DS_R); al(&state, DS_R);
         ICHECK(qz_dmalloc((void **) &out_d, 8 * sizeof(int), "dspark"));
         ICHECK(hipHostMalloc((void **) &out_h, 8 * sizeof(int), 0));
         ICHECK(hipMemset(out_d, 0, 8 * sizeof(int)));
         for (int c = 0; c < 2; c++) {
+            card & k = K[c];
             ICHECK(hipSetDevice(qz_dev_of(c)));
+            for (int l = 0; l < DS_NL; l++) { al(&k.ck[l], (size_t) ctx * DS_KVL); al(&k.cv[l], (size_t) ctx * DS_KVL); }
+            al(&k.fq, (size_t) DS_NL * PF_M * D); al(&k.fs, (size_t) DS_NL * PF_M * D / 32);
+            al(&k.ckf, 8 * DS_KVL); al(&k.cvf, 8 * DS_KVL);
+            al(&k.X, DS_BS * D); al(&k.Y, DS_BS * D); al(&k.Yp[0], DS_BS * D); al(&k.Yp[1], DS_BS * D);
+            al(&k.Q, DS_BS * DS_QL); al(&k.Kb, DS_BS * DS_KVL); al(&k.Vb, DS_BS * DS_KVL);
+            al(&k.O, DS_BS * DS_QL); al(&k.G, DS_BS * DS_FFL); al(&k.U, DS_BS * DS_FFL); al(&k.hid, DS_BS * D);
+            al(&k.part, (size_t) DS_NQL * DS_NP * DS_BS * DS_PW);
+            al(&k.aq, DS_BS * DS_FFL); al(&k.as, DS_BS * DS_FFL / 32);
+            ICHECK(hipEventCreateWithFlags(&k.ev, hipEventDisableTiming));
             const qw & H = E->C[c].head;
             nhp[c] = (H.N + 63) & ~63;             // 128-byte aligned fold rows
             al(&hq[c], DS_BS * D); al(&hs[c], DS_BS * D / 32); al(&base[c], (size_t) DS_BS * H.N);
@@ -538,15 +592,8 @@ struct ink2_dspark {
             // fold rows: head . hidden_out column j (and . bias), 8 columns per GEMV
             float * rows = nullptr, * y = nullptr;
             ICHECK(hipMalloc(&rows, 8 * D * 4)); ICHECK(hipMalloc(&y, (size_t) 8 * H.N * 4));
-            const uint16_t * how_c = how; const float * hob_c = hob;
-            if (c == 1) {   // the drafter lives on card 0: its two small tensors over P2P once
-                uint16_t * h1 = nullptr; float * b1 = nullptr;
-                ICHECK(hipMalloc(&h1, (size_t) D * DS_R * 2)); ICHECK(hipMalloc(&b1, D * 4));
-                ICHECK(hipMemcpyPeer(h1, qz_dev_of(1), how, qz_dev_of(0), (size_t) D * DS_R * 2)); ICHECK(hipMemcpyPeer(b1, qz_dev_of(1), hob, qz_dev_of(0), D * 4));
-                how_c = h1; hob_c = b1;
-            }
             for (int j0 = 0; j0 <= DS_R; j0 += 8) {
-                k_ds_fold_rows<<<(8 * D + 255) / 256, 256>>>(how_c, hob_c, j0, rows);
+                k_ds_fold_rows<<<(8 * D + 255) / 256, 256>>>(k.how, k.hob, j0, rows);
                 k_ds_quant<<<8, 256>>>(rows, nullptr, D, hq[c], hs[c], nullptr, DS_EPS);
                 k_ds_gemv<8><<<240, DS_NT, 8 * D + 8 * (D / 32) * 4>>>(hq[c], hs[c], D, H.v, H.s, H.N, y);
                 const int nj = std::min(8, DS_R + 1 - j0);
@@ -554,10 +601,8 @@ struct ink2_dspark {
             }
             ICHECK(hipDeviceSynchronize());
             (void) hipFree(rows); (void) hipFree(y);
-            if (c == 1) { (void) hipFree((void *) how_c); (void) hipFree((void *) hob_c); }
         }
         ICHECK(hipSetDevice(qz_dev_of(0)));
-        ICHECK(hipEventCreateWithFlags(&ev, hipEventDisableTiming));
         E->dtap = tap; E->dtap_head = tap + 3 * D;
         E->vtap = vtap;
         return true;
@@ -578,60 +623,101 @@ struct ink2_dspark {
             else k_ds_gemv_wide<1><<<nb, 256, 0, st>>>(q, s, W.K, W.v, W.s, W.N, y);
         }
     }
-    // context rows p0 .. p0 + m - 1 from their features (row stride tstride floats); g = the last row's
+    // fn(c, card, stream) on card 0, then card 1 (each with its device current)
+    template <class F> void each(F && fn) {
+        for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); fn(c, K[c], E->C[c].st); }
+    }
+    // the partials in Y -> the peer's Yp slot; returns the slot (the caller sums Y + Yp in card order)
+    int exchange() {
+        const int s = xk;
+        xk ^= 1;
+        each([&](int c, card & k, hipStream_t st) {
+            ICHECK(hipMemcpyPeerAsync(K[1 - c].Yp[s], qz_dev_of(1 - c), k.Y, qz_dev_of(c), (size_t) DS_BS * D * 4, st));
+            ICHECK(hipEventRecord(k.ev, st));
+        });
+        each([&](int c, card &, hipStream_t st) { ICHECK(hipStreamWaitEvent(st, K[1 - c].ev, 0)); });
+        return s;
+    }
+    // card 0's partial first on both cards
+    const float * pa(int c, int s) const { return c == 0 ? K[0].Y : K[1].Yp[s]; }
+    const float * pb(int c, int s) const { return c == 0 ? K[0].Yp[s] : K[1].Y; }
+
+    // context rows p0 .. p0 + m - 1 from their features (row stride tstride floats, card 0);
+    // g = the last row's. Card 0 mixes + quantizes the rows for the 3 layers and sends the
+    // int8 planes to card 1; each card fills its own kv heads
     void fill(const float * taps, size_t tstride, int p0, int m) {
-        ICHECK(hipSetDevice(qz_dev_of(0)));
-        hipStream_t st = E->C[0].st;
-        for (int r0 = 0; r0 < m; r0 += 8) {
-            const int n = std::min(8, m - r0);
-            for (int l = 0; l < DS_NL; l++) {
-                k_ds_mixnorm<<<n, 256, 0, st>>>(taps + (size_t) r0 * tstride, tstride, alpha[l], L[l].dn, cx, D, DS_EPS);
-                k_ds_quant<<<n, 256, 0, st>>>(cx, nullptr, D, aq, as, nullptr, DS_EPS);
-                gemv(st, aq, as, L[l].kc, ckf, n == 1 ? 1 : 8);
-                gemv(st, aq, as, L[l].vc, cvf, n == 1 ? 1 : 8);
-                k_ds_hnorm_rope<<<dim3(DS_NKV, n), 128, 0, st>>>(ckf, L[l].kcn, DS_NKV, ckf, L[l].kcn, 0, p0 + r0, DS_EPS);
-                k_ds_store<<<(n * DS_KV + 255) / 256, 256, 0, st>>>(ckf, cvf, ck[l], cv[l], p0 + r0, n);
-            }
+        if (m > PF_M) { fprintf(stderr, "dspark: fill of %d rows (max %d)\n", m, PF_M); exit(1); }
+        {
+            ICHECK(hipSetDevice(qz_dev_of(0)));
+            hipStream_t st = E->C[0].st;
+            card & k = K[0];
+            ICHECK(hipStreamWaitEvent(st, K[1].ev, 0));   // card 1 done with the planes of the last fill
+            for (int l = 0; l < DS_NL; l++)
+                k_ds_mixq<<<m, 256, 0, st>>>(taps, tstride, alpha[l], k.L[l].dn, k.fq + (size_t) l * m * D, k.fs + (size_t) l * m * (D / 32), DS_EPS);
+            k_ds_mixnorm<<<1, 256, 0, st>>>(taps + (size_t) (m - 1) * tstride, tstride, alpha[DS_NL], dsn, g, D, DS_EPS);
+            ICHECK(hipMemcpyPeerAsync(K[1].fq, qz_dev_of(1), k.fq, qz_dev_of(0), (size_t) DS_NL * m * D, st));
+            ICHECK(hipMemcpyPeerAsync(K[1].fs, qz_dev_of(1), k.fs, qz_dev_of(0), (size_t) DS_NL * m * (D / 32) * 4, st));
+            ICHECK(hipEventRecord(k.ev, st));
         }
-        k_ds_mixnorm<<<1, 256, 0, st>>>(taps + (size_t) (m - 1) * tstride, tstride, alpha[DS_NL], dsn, g, D, DS_EPS);
+        each([&](int c, card & k, hipStream_t st) {
+            if (c == 1) ICHECK(hipStreamWaitEvent(st, K[0].ev, 0));
+            for (int r0 = 0; r0 < m; r0 += 8) {
+                const int n = std::min(8, m - r0);
+                for (int l = 0; l < DS_NL; l++) {
+                    const unsigned char * q = k.fq + ((size_t) l * m + r0) * D;
+                    const float * s = k.fs + ((size_t) l * m + r0) * (D / 32);
+                    gemv(st, q, s, k.L[l].kc, k.ckf, n == 1 ? 1 : 8);
+                    gemv(st, q, s, k.L[l].vc, k.cvf, n == 1 ? 1 : 8);
+                    k_ds_hnorm_rope<<<dim3(DS_NKVL, n), 128, 0, st>>>(k.ckf, k.L[l].kcn, DS_NKVL, k.ckf, k.L[l].kcn, 0, p0 + r0, DS_EPS);
+                    k_ds_store<<<(n * DS_KVL + 255) / 256, 256, 0, st>>>(k.ckf, k.cvf, k.ck[l], k.cv[l], p0 + r0, n);
+                }
+            }
+            if (c == 1) ICHECK(hipEventRecord(k.ev, st));
+        });
+        ICHECK(hipSetDevice(qz_dev_of(0)));
     }
     // the 7 greedy drafts after anchor tok at position a (context rows 0 .. a - 1 filled)
     void draft(int tok, int a, int * out) {
+        each([&](int c, card & k, hipStream_t st) {
+            const ink2_card & T = E->C[c];
+            k_ds_embed<<<DS_BS, 256, 0, st>>>(T.embd.v, T.embd.s, tok, T.embd_norm, E->hp.eps, k.X, k.mask);
+            k_ds_quant<<<DS_BS, 256, 0, st>>>(k.X, k.L[0].an, D, k.aq, k.as, nullptr, DS_EPS);
+        });
+        static_assert(DS_FFL % 256 == 0, "whole chunks");
+        for (int l = 0; l < DS_NL; l++) {
+            const int lo = l == 1 ? 0 : std::max(0, a - WIN);      // layers 0 / 2: sliding window
+            each([&](int, card & k, hipStream_t st) {
+                const layer & y = k.L[l];
+                gemv(st, k.aq, k.as, y.q, k.Q, 8); gemv(st, k.aq, k.as, y.k, k.Kb, 8); gemv(st, k.aq, k.as, y.v, k.Vb, 8);
+                k_ds_hnorm_rope<<<dim3(DS_NQL + DS_NKVL, DS_BS), 128, 0, st>>>(k.Q, y.qn, DS_NQL, k.Kb, y.kn, DS_NKVL, a, DS_EPS);
+                k_ds_attn<<<dim3(DS_NQL, DS_SPL), 256, 0, st>>>(k.Q, k.ck[l], k.cv[l], k.Kb, k.Vb, lo, a, k.part);
+                k_ds_attn_merge<<<dim3(DS_NQL, DS_BS), 128, 0, st>>>(k.part, k.O);
+                k_ds_quant<<<DS_BS, 256, 0, st>>>(k.O, nullptr, DS_QL, k.aq, k.as, nullptr, DS_EPS);
+                gemv(st, k.aq, k.as, y.o, k.Y, 8);
+            });
+            int s = exchange();
+            each([&](int c, card & k, hipStream_t st) {
+                const layer & y = k.L[l];
+                k_ds_add_quant<<<DS_BS, 256, 0, st>>>(k.X, pa(c, s), pb(c, s), y.fn, D, k.aq, k.as, DS_EPS);
+                gemv(st, k.aq, k.as, y.gate, k.G, 8); gemv(st, k.aq, k.as, y.up, k.U, 8);
+                k_ds_swiglu_quant<<<dim3(DS_FFL / 256, DS_BS), 256, 0, st>>>(k.G, k.U, DS_FFL, k.aq, k.as);
+                gemv(st, k.aq, k.as, y.down, k.Y, 8);
+            });
+            s = exchange();
+            // the residual add of the two partials is fused into the next quantization (the next
+            // layer's attention norm; after the last layer the hidden rows 1 .. 7: f32 for the
+            // Markov input on card 0, quantized for the base logits on both cards)
+            each([&](int c, card & k, hipStream_t st) {
+                if (l + 1 < DS_NL) k_ds_add_quant<<<DS_BS, 256, 0, st>>>(k.X, pa(c, s), pb(c, s), k.L[l + 1].an, D, k.aq, k.as, DS_EPS);
+                else {
+                    k_ds_hidden<<<DS_BS - 1, 256, 0, st>>>(k.X, pa(c, s), pb(c, s), k.onorm, D, hq[c], hs[c], k.hid, DS_EPS);
+                    gemv(st, hq[c], hs[c], E->C[c].head, base[c], 7);
+                }
+            });
+        }
         ICHECK(hipSetDevice(qz_dev_of(0)));
         hipStream_t st = E->C[0].st;
-        const ink2_card & K0 = E->C[0];
-        k_ds_embed<<<DS_BS, 256, 0, st>>>(K0.embd.v, K0.embd.s, tok, K0.embd_norm, E->hp.eps, X, mask);
-        k_ds_quant<<<DS_BS, 256, 0, st>>>(X, L[0].an, D, aq, as, nullptr, DS_EPS);
-        for (int l = 0; l < DS_NL; l++) {
-            const layer & y = L[l];
-            gemv(st, aq, as, y.q, Q, 8); gemv(st, aq, as, y.k, Kb, 8); gemv(st, aq, as, y.v, Vb, 8);
-            k_ds_hnorm_rope<<<dim3(DS_NQ + DS_NKV, DS_BS), 128, 0, st>>>(Q, y.qn, DS_NQ, Kb, y.kn, DS_NKV, a, DS_EPS);
-            const int lo = l == 1 ? 0 : std::max(0, a - WIN);      // layers 0 / 2: sliding window
-            k_ds_attn<<<dim3(DS_NQ, DS_SPL), 256, 0, st>>>(Q, ck[l], cv[l], Kb, Vb, lo, a, part);
-            k_ds_attn_merge<<<dim3(DS_NQ, DS_BS), 128, 0, st>>>(part, O);
-            k_ds_quant<<<DS_BS, 256, 0, st>>>(O, nullptr, DS_Q, aq, as, nullptr, DS_EPS);
-            gemv(st, aq, as, y.o, Y, 8);
-            k_ds_add_quant<<<DS_BS, 256, 0, st>>>(X, Y, y.fn, D, aq, as, DS_EPS);
-            gemv(st, aq, as, y.gate, G, 8); gemv(st, aq, as, y.up, U, 8);
-            static_assert(DS_FF % 256 == 0, "whole chunks");
-            k_ds_swiglu_quant<<<dim3(DS_FF / 256, DS_BS), 256, 0, st>>>(G, U, DS_FF, aq, as);
-            gemv(st, aq, as, y.down, Y, 8);
-            // the residual add of X + Y is fused into the next quantization (the FFN norm here,
-            // the next layer's attention norm there; the last layer's hidden rows)
-            if (l + 1 < DS_NL) k_ds_add_quant<<<DS_BS, 256, 0, st>>>(X, Y, L[l + 1].an, D, aq, as, DS_EPS);
-            else k_ds_hidden<<<DS_BS - 1, 256, 0, st>>>(X, Y, onorm, D, hq[0], hs[0], hid, DS_EPS);
-        }
-        // hidden rows 1 .. 7: f32 (the Markov input) + quantized (the base logits) on both cards
-        ICHECK(hipMemcpyPeerAsync(hq[1], qz_dev_of(1), hq[0], qz_dev_of(0), (DS_BS - 1) * D, st));
-        ICHECK(hipMemcpyPeerAsync(hs[1], qz_dev_of(1), hs[0], qz_dev_of(0), (DS_BS - 1) * D / 32 * 4, st));
-        ICHECK(hipEventRecord(ev, st));
-        for (int c = 0; c < 2; c++) {
-            ICHECK(hipSetDevice(qz_dev_of(c)));
-            hipStream_t s = E->C[c].st;
-            if (c == 1) ICHECK(hipStreamWaitEvent(s, ev, 0));
-            gemv(s, hq[c], hs[c], E->C[c].head, base[c], 7);
-        }
-        ICHECK(hipSetDevice(qz_dev_of(0)));
+        const float * hid = K[0].hid;
         ICHECK(hipMemsetAsync(state, 0, DS_R * 4, st));
         // the 7 Markov steps: card 0 joint -> markov (push lat1) -> fold; card 1 fold (wait) -> push
         for (int i = 1; i < DS_BS; i++) {
