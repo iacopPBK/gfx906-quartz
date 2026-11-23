@@ -12,7 +12,8 @@ struct qz_arch_entry {
     qz_ctx * (*create)(const char * path, const qz_create_opts & o);
 };
 static const qz_arch_entry qz_archs[] = {
-    { "qwen35", qz_qwen35_create },
+    { "qwen35",        qz_qwen35_create },
+    { "inkling2_loop", qz_inkling2_create },
 };
 
 extern "C" {

@@ -48,9 +48,9 @@ architectures alone.
    to `qz_archs[]` in `quartz/capi.cpp`. The Makefile picks up
    `quartz/arch/*/*.cpp` and `quartz/arch/*/*.h` on its own.
 4. **Weights.** Load with `qz_loader`, using a `slice` callback for the
-   arch's TP split (see `qwen35_tp2.h`). Check every tensor's file shape with
-   `qz_loader::shape(name, {ne0, ne1, ...})` (ggml order) before trusting
-   the hparams.
+   arch's TP split (see `qwen35_tp2.h`). Before loading, check every
+   tensor's file shape and type with `qz_gguf::shape(name, {ne0, ne1, ...}, type)`
+   (ggml order), and read the hparams with `qz_gguf::u32 / f32 / flag / ints`.
 5. **Prefix cache.** Name the arch's fixed-size recurrent state as
    `qz_blob`s: a live buffer and a mid-chunk staging buffer per card. Call
    `qz_pcache::prefill` with the arch's message-boundary token and hooks:

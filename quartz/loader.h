@@ -8,7 +8,6 @@
 
 #include <cstdint>
 #include <functional>
-#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -59,7 +58,4 @@ public:
     bool plan(const qz_gguf & g, int card = -1);
     int64_t find(const char * name) const;   // index into ts, -1 if absent
     const qz_dev_tensor * get(const char * name) const { const int64_t i = find(name); return i < 0 ? nullptr : &ts[i]; }
-    // the file dims of `name` are exactly `dims` (ggml order, trailing 1s implied);
-    // false (with a message) when it is absent or shaped otherwise
-    bool shape(const char * name, std::initializer_list<int64_t> dims) const;
 };

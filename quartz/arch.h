@@ -29,3 +29,4 @@ struct qz_ctx {
 
 // arch entry points (nullptr on failure, message printed)
 qz_ctx * qz_qwen35_create(const char * path, const qz_create_opts & o);
+qz_ctx * qz_inkling2_create(const char * path, const qz_create_opts & o);

@@ -58,6 +58,19 @@ bool qz_loader::load(const char * path, const qz_gguf & g, int dev, int card) {
 
     FILE * f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "qz_loader: cannot open %s\n", path); return false; }
+    {   // every tensor's data inside the file (a truncated download fails here, not in the map)
+        fseek(f, 0, SEEK_END);
+        const uint64_t flen = (uint64_t) ftell(f);
+        for (int64_t t = 0; t < nt; t++) {
+            const double bs = (double) ggml_type_size(ts[t].type) / ggml_blck_size(ts[t].type);
+            const uint64_t end = raw_off[t] + (uint64_t) ((double) ts[t].src_ne0 * ts[t].src_ne1 * bs);
+            if (end > flen) {
+                fprintf(stderr, "qz_loader: %s ends at byte %" PRIu64 ", past the end of %s (%" PRIu64 " bytes): truncated file?\n",
+                        ts[t].name.c_str(), end, path, flen);
+                fclose(f); return false;
+            }
+        }
+    }
     // sliced tensors gather rows/blocks straight from a read-only map
     const uint8_t * map = nullptr;
     size_t map_len = 0;
@@ -219,20 +232,4 @@ int64_t qz_loader::find(const char * name) const {
     for (size_t i = 0; i < ts.size(); i++)
         if (ts[i].name == name) return (int64_t) i;
     return -1;
-}
-
-bool qz_loader::shape(const char * name, std::initializer_list<int64_t> dims) const {
-    const qz_dev_tensor * t = get(name);
-    if (!t) { fprintf(stderr, "qz_loader: missing tensor %s\n", name); return false; }
-    int d = 0;
-    bool ok = dims.size() <= GGML_MAX_DIMS;
-    for (int64_t n : dims) if (d < GGML_MAX_DIMS && t->ne[d++] != n) ok = false;
-    for (; d < GGML_MAX_DIMS; d++) if (t->ne[d] != 1) ok = false;
-    if (!ok) {
-        fprintf(stderr, "qz_loader: %s is [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "], expected [", name, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
-        d = 0;
-        for (int64_t n : dims) fprintf(stderr, "%s%" PRId64, d++ ? ", " : "", n);
-        fprintf(stderr, "]\n");
-    }
-    return ok;
 }
