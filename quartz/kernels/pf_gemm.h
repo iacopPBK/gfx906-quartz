@@ -1,3 +1,4 @@
+// Non-template kernels in kernels/ are static: every arch TU gets its own copy.
 // Prefill GEMM over int8 row tiles (W . A with per-32 scales), and the
 // row norm / quant kernels that feed it. Rows are padded to PF_MT tokens;
 // pf_addnorm_quant<DM> needs DM % 256 == 0.
@@ -220,7 +221,7 @@ __device__ __forceinline__ void pf_quant_unit(float v, int k, int m, int Mp, int
 
 // one block per row: y = x * rsqrt(mean(x^2) + eps) * w, quantized (and
 // optionally kept in f32 for the MTP hidden input)
-__global__ void __launch_bounds__(256) pf_norm_quant(
+static __global__ void __launch_bounds__(256) pf_norm_quant(
         const float * __restrict__ x, int ldx, const float * __restrict__ w, float eps, int K,
         int8_t * Ag, float * sag, int Mp, float * outf, int m0 = 0) {
     __shared__ float red[8];
@@ -281,7 +282,7 @@ __global__ void __launch_bounds__(256) pf_addnorm_quant(
 }
 
 // quantize rows of y (row stride ldy) as they are
-__global__ void __launch_bounds__(256) pf_quant(const float * __restrict__ y, int ldy, int K, int8_t * Ag, float * sag, int Mp, int m0 = 0) {
+static __global__ void __launch_bounds__(256) pf_quant(const float * __restrict__ y, int ldy, int K, int8_t * Ag, float * sag, int Mp, int m0 = 0) {
     const int m = m0 + blockIdx.x;
     for (int k = threadIdx.x; k < K; k += 256) pf_quant_unit(y[(size_t) m * ldy + k], k, m, Mp, Ag, sag, threadIdx.x & 31);
 }

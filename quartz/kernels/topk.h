@@ -14,7 +14,7 @@ __device__ __forceinline__ unsigned qz_fkey(float v) {   // float order as unsig
 }
 // block (b, t): the exact top QZ_TOPK of chunk b of row t as (logit, id) by
 // radix select (id -1 pads a short chunk)
-__global__ void qz_topk_rows(const float * y, int n, int id0, float2 * out) {
+static __global__ void qz_topk_rows(const float * y, int n, int id0, float2 * out) {
     __shared__ unsigned hist[256];
     __shared__ unsigned s_prefix, s_need;
     __shared__ int s_gt, s_eq;

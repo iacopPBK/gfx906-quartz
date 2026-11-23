@@ -1,3 +1,8 @@
+// qwen35: the C API model (q35_ctx) over the engine, prefill, DSpine and vision.
+#include "q35_prelude.h"
+
+namespace q35 {
+
 #include "dspine_block.h"
 #include "core/devices.h"
 #include "engine.h"
@@ -34,10 +39,7 @@ namespace mv12 {
 #undef MV_TR
 }
 #include "dspine_run.h"
-#include "arch.h"
-#include "preflight.h"
 #include "qwen35_preflight.h"
-#include "vision.h"
 
 #include <algorithm>
 #include <cstring>
@@ -393,53 +395,6 @@ static int qz_run(q35_ctx * c, const std::vector<int32_t> & p, int max_new, cons
     return rc;
 }
 
-qz_ctx * qz_qwen35_create(const char * model, const qz_create_opts & o) {
-    const int max_ctx = o.max_ctx, slot_t = o.slot_t, adapt_slack = o.adapt_slack;
-    if ( max_ctx < 1024 || (slot_t != 0 && slot_t != 3 && slot_t != 4) || adapt_slack < 0) return nullptr;
-    qz_mem_scope mem("engine");
-    qz_mem_baseline(2);
-    // steps = arena positions: prompt + generated + the cycle / MTP overhang
-    const int steps = max_ctx + 2 * QZ_TMAX;
-    // the scratch the cycle's partials share with the batched prefill and the DSpine verify's partials
-    const size_t scratch = std::max(qz_prefill::bytes(2048), mv12::mv_partial_bytes());
-    // before the weights: memory for this context on both cards, then the peer link
-    if (qz_vram_check(model, max_ctx, steps, scratch, getenv("QZ_DSPINE"), getenv("QZ_MMPROJ")) || qz_p2p_check())
-        return nullptr;
-    q35_ctx * c = new q35_ctx();
-    c->eng.scratch_min = scratch;
-    if (c->eng.init(model, steps, slot_t, adapt_slack)) {
-        delete c;      // device buffers of a failed init are not released (one engine per process)
-        return nullptr;
-    }
-    {
-        qz_gguf g;
-        if (g.open(model)) c->name = g.str("general.name");
-    }
-    qz_pf_setup(c);
-    if (const char * dsp = getenv("QZ_DSPINE")) {
-        if (!c->pf_ok) fprintf(stderr, "quartz: DSpine off: it needs the batched prefill\n");
-        else if (c->pf.feat_init() || c->ds.init(c->eng, dsp)) {
-            fprintf(stderr, "quartz: DSpine init failed (%s)\n", dsp);
-            delete c;
-            return nullptr;
-        }
-    }
-    const char * no_sw = getenv("QZ_NO_SWITCH");
-    if (c->ds.on && !(no_sw && *no_sw && strcmp(no_sw, "0") != 0)) {
-        auto & w = c->sw;
-        if (const char * v = getenv("QZ_SW_LO")) w.lo = (float) atof(v);
-        if (const char * v = getenv("QZ_SW_HI")) w.hi = (float) atof(v);
-        if (const char * v = getenv("QZ_SW_WIN")) w.win = atoi(v);
-        qz_mem_scope mem("drafter switch");
-        for (int i = 0; i < 2; i++) { CHECK(hipSetDevice(qz_dev_of(i))); CHECK(qz_dmalloc(&w.hn[i], (size_t) (w.cap + 12) * QZ_D * 4)); }
-        CHECK(hipSetDevice(qz_dev_of(0)));
-        w.on = true;
-        fprintf(stderr, "quartz: drafter switch on: leave DSpine < %.2f, MTP >= %.2f tok/round, window %d\n", w.lo, w.hi, w.win);
-    }
-    // per card: used / free, the ledger's tags, what the runtime holds beyond them
-    qz_mem_report(stderr, 2);
-    return c;
-}
 
 static void qz_stats_out(const q35_ctx * c, const qz_gen_stats & st, qz_stats * out) {
     if (!out) return;
@@ -605,3 +560,55 @@ void q35_ctx::info(qz_model_info * out) const {
     out->vision = vis != nullptr;
     out->dspine = ds.on;
 }
+
+static qz_ctx * create(const char * model, const qz_create_opts & o) {
+    const int max_ctx = o.max_ctx, slot_t = o.slot_t, adapt_slack = o.adapt_slack;
+    if ( max_ctx < 1024 || (slot_t != 0 && slot_t != 3 && slot_t != 4) || adapt_slack < 0) return nullptr;
+    qz_mem_scope mem("engine");
+    qz_mem_baseline(2);
+    // steps = arena positions: prompt + generated + the cycle / MTP overhang
+    const int steps = max_ctx + 2 * QZ_TMAX;
+    // the scratch the cycle's partials share with the batched prefill and the DSpine verify's partials
+    const size_t scratch = std::max(qz_prefill::bytes(2048), mv12::mv_partial_bytes());
+    // before the weights: memory for this context on both cards, then the peer link
+    if (qz_vram_check(model, max_ctx, steps, scratch, getenv("QZ_DSPINE"), getenv("QZ_MMPROJ")) || qz_p2p_check())
+        return nullptr;
+    q35_ctx * c = new q35_ctx();
+    c->eng.scratch_min = scratch;
+    if (c->eng.init(model, steps, slot_t, adapt_slack)) {
+        delete c;      // device buffers of a failed init are not released (one engine per process)
+        return nullptr;
+    }
+    {
+        qz_gguf g;
+        if (g.open(model)) c->name = g.str("general.name");
+    }
+    qz_pf_setup(c);
+    if (const char * dsp = getenv("QZ_DSPINE")) {
+        if (!c->pf_ok) fprintf(stderr, "quartz: DSpine off: it needs the batched prefill\n");
+        else if (c->pf.feat_init() || c->ds.init(c->eng, dsp)) {
+            fprintf(stderr, "quartz: DSpine init failed (%s)\n", dsp);
+            delete c;
+            return nullptr;
+        }
+    }
+    const char * no_sw = getenv("QZ_NO_SWITCH");
+    if (c->ds.on && !(no_sw && *no_sw && strcmp(no_sw, "0") != 0)) {
+        auto & w = c->sw;
+        if (const char * v = getenv("QZ_SW_LO")) w.lo = (float) atof(v);
+        if (const char * v = getenv("QZ_SW_HI")) w.hi = (float) atof(v);
+        if (const char * v = getenv("QZ_SW_WIN")) w.win = atoi(v);
+        qz_mem_scope mem("drafter switch");
+        for (int i = 0; i < 2; i++) { CHECK(hipSetDevice(qz_dev_of(i))); CHECK(qz_dmalloc(&w.hn[i], (size_t) (w.cap + 12) * QZ_D * 4)); }
+        CHECK(hipSetDevice(qz_dev_of(0)));
+        w.on = true;
+        fprintf(stderr, "quartz: drafter switch on: leave DSpine < %.2f, MTP >= %.2f tok/round, window %d\n", w.lo, w.hi, w.win);
+    }
+    // per card: used / free, the ledger's tags, what the runtime holds beyond them
+    qz_mem_report(stderr, 2);
+    return c;
+}
+
+}   // namespace q35
+
+qz_ctx * qz_qwen35_create(const char * model, const qz_create_opts & o) { return q35::create(model, o); }

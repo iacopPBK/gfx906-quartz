@@ -1,3 +1,14 @@
+// host only: hparams from the GGUF (shared headers first, then the arch in namespace q35)
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "gguf.h"
+
+namespace q35 {
+
 #include "qwen35_spec.h"
 
 #include <cstdio>
@@ -78,3 +89,5 @@ bool qz_hparams::load(const qz_gguf & g) {
     }
     return n_vocab > 0;
 }
+
+}   // namespace q35
