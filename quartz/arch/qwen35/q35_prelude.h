@@ -37,4 +37,4 @@
 #include "loader.h"
 #include "gguf.h"
 #include "preflight.h"
-#include "vision.h"
+#include "vision/qwen3vl.h"

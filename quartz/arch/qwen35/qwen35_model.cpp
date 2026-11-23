@@ -59,7 +59,7 @@ struct q35_ctx : qz_ctx {
     float * sdn[2] = {}, * scs[2] = {};   // mid-chunk staging of dn / cs
     int last_cached = 0;
     struct img { uint64_t hash = 0; int id = 0, nx = 0, ny = 0; unsigned long use = 0; std::vector<float> rows; };
-    qz_vision * vis = nullptr;
+    qwen3vl::qz_vision * vis = nullptr;
     std::vector<img> imgs;
     unsigned long img_clock = 0;
     int img_next = 0;
@@ -314,11 +314,11 @@ int q35_ctx::vision_attach(const char * mmproj) {
     if (c->vis) return -1;
     if (!c->pf_ok) { fprintf(stderr, "quartz: images need the batched prefill\n"); return -1; }
     // both cards, half the encoder each
-    c->vis = qz_vision_load(mmproj);
+    c->vis = qwen3vl::qz_vision_load(mmproj);
     if (!c->vis) return -1;
-    if (qz_vision_n_embd(c->vis) != QZ_D) {
-        fprintf(stderr, "quartz: projector width %d != model width %d\n", qz_vision_n_embd(c->vis), QZ_D);
-        qz_vision_free(c->vis); c->vis = nullptr; return -1;
+    if (qwen3vl::qz_vision_n_embd(c->vis) != QZ_D) {
+        fprintf(stderr, "quartz: projector width %d != model width %d\n", qwen3vl::qz_vision_n_embd(c->vis), QZ_D);
+        qwen3vl::qz_vision_free(c->vis); c->vis = nullptr; return -1;
     }
     return 0;
 }
@@ -341,7 +341,7 @@ int q35_ctx::image_add(const void * bytes, size_t n, int * nx, int * ny) {
             return im.id;
         }
     int gx = 0, gy = 0;
-    const int nt = qz_vision_encode(c->vis, bytes, n, &gx, &gy);
+    const int nt = qwen3vl::qz_vision_encode(c->vis, bytes, n, &gx, &gy);
     if (nt <= 0) return -1;
     const int cap = 8;
     if ((int) c->imgs.size() >= cap) {
@@ -352,14 +352,14 @@ int q35_ctx::image_add(const void * bytes, size_t n, int * nx, int * ny) {
     q35_ctx::img im;
     im.hash = h; im.id = c->img_next++; im.nx = gx; im.ny = gy; im.use = ++c->img_clock;
     im.rows.resize((size_t) nt * QZ_D);
-    if (qz_vision_copy_rows(c->vis, im.rows.data()) != nt) return -1;
+    if (qwen3vl::qz_vision_copy_rows(c->vis, im.rows.data()) != nt) return -1;
     c->imgs.push_back(std::move(im));
     if (nx) *nx = gx;
     if (ny) *ny = gy;
     return c->imgs.back().id;
 }
 
-double q35_ctx::image_last_ms() const { return vis ? qz_vision_last_ms(vis) : 0.0; }
+double q35_ctx::image_last_ms() const { return vis ? qwen3vl::qz_vision_last_ms(vis) : 0.0; }
 
 int q35_ctx::generate(const int32_t * prompt, int n_prompt, const int * images, int n_images,
                       int max_new, const int32_t * stop, int n_stop, qz_emit_cb cb, void * user, qz_stats * out,
@@ -447,7 +447,7 @@ int q35_ctx::generate(const int32_t * prompt, int n_prompt, const int * images, 
     return rc;
 }
 
-q35_ctx::~q35_ctx() { if (vis) qz_vision_free(vis); }   // device memory is released at process exit
+q35_ctx::~q35_ctx() { if (vis) qwen3vl::qz_vision_free(vis); }   // device memory is released at process exit
 
 void q35_ctx::info(qz_model_info * out) const {
     snprintf(out->arch, sizeof(out->arch), "qwen35");

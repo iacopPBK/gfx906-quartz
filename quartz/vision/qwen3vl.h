@@ -1,13 +1,12 @@
-// Image encoder: the qwen3vl_merger projector split over the two cards; an
-// image becomes nx * ny rows of 5120 (row-major over the token grid).
+// Image encoder for the qwen3vl_merger projector, split over the two cards; an
+// image becomes nx * ny rows of the projector width (row-major over the token grid).
+// One encoder per projector type in quartz/vision/, each in its own namespace.
 #pragma once
 #include <stddef.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+namespace qwen3vl {
 
-typedef struct qz_vision qz_vision;
+struct qz_vision;
 
 // loads the projector (rows come out on device 0); nullptr on failure; token
 // limits: QZ_IMG_MIN_TOKENS (8), QZ_IMG_MAX_TOKENS (4096)
@@ -22,6 +21,4 @@ int         qz_vision_copy_rows(const qz_vision * v, float * host);
 double      qz_vision_last_ms(const qz_vision * v);            // last encode, upload to rows ready
 void        qz_vision_free(qz_vision * v);
 
-#ifdef __cplusplus
-}
-#endif
+}   // namespace qwen3vl

@@ -1,6 +1,6 @@
-// qwen3vl_merger image encoder (see vision.h): rocBLAS f16 GEMMs with f32
+// qwen3vl_merger image encoder (see qwen3vl.h): rocBLAS f16 GEMMs with f32
 // accumulation, v_flash attention.
-#include "vision.h"
+#include "qwen3vl.h"
 #include "loader.h"
 #include "core/devices.h"
 #include "gguf.h"
@@ -27,6 +27,8 @@
     fprintf(stderr, "quartz_vision: HIP error %s at %s:%d\n", hipGetErrorString(e_), __FILE__, __LINE__); return -1; } } while (0)
 #define VBLAS(x) do { rocblas_status s_ = (x); if (s_ != rocblas_status_success) { \
     fprintf(stderr, "quartz_vision: rocBLAS error %s at %s:%d\n", rocblas_status_to_string(s_), __FILE__, __LINE__); return -1; } } while (0)
+
+namespace qwen3vl {
 
 static constexpr int V_D = 1152, V_H = 16, V_HD = 72, V_PATCH = 16, V_GRID = 48, V_K = 3 * V_PATCH * V_PATCH;
 
@@ -481,7 +483,6 @@ static void grid_of(const qz_vision * v, int w, int h, int * nx, int * ny) {
     *nx = wb / f; *ny = hb / f;
 }
 
-extern "C" {
 
 qz_vision * qz_vision_load(const char * path) {
     if (qz_dev_select()) return nullptr;
@@ -768,4 +769,5 @@ void qz_vision_free(qz_vision * v) {
     delete v;
 }
 
-} // extern "C"
+
+}   // namespace qwen3vl
