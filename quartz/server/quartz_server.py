@@ -98,6 +98,12 @@ class Engine:
         self._pb = ctypes.create_string_buffer(512)
         self.template = self._load_template()
 
+    def drafter_name(self, drafted):
+        """The log's decode mode: qwen35 drafts with DSpine or MTP, Inkling with DSpark or not at all."""
+        if self.arch == "qwen35":
+            return "dspine" if drafted else "mtp"
+        return "dspark" if drafted else "plain"
+
     def _load_template(self):
         import jinja2
         from jinja2.sandbox import ImmutableSandboxedEnvironment
@@ -479,14 +485,16 @@ class Handler(BaseHTTPRequestHandler):
             s.order[i] = o
         return s, None, notes
 
-    # reasoning_effort (xhigh / medium / low): chat_template_kwargs, then the
-    # request's reasoning_effort, then --reasoning-effort
+    # reasoning_effort (qwen35: xhigh / medium / low; other models: the request's value as
+    # is): chat_template_kwargs, then the request's reasoning_effort, then --reasoning-effort
     _EFFORT = {"minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh"}
 
     def _template_kwargs(self, req):
         kw = dict(req.get("chat_template_kwargs") or {})
         if "reasoning_effort" not in kw:
             eff = self._EFFORT.get(str(req.get("reasoning_effort") or "").lower()) or self.args.reasoning_effort
+            if self.eng.arch != "qwen35" and req.get("reasoning_effort"):
+                eff = req["reasoning_effort"]      # other templates take their own levels (Inkling: none .. max)
             if eff:
                 kw["reasoning_effort"] = eff
         return kw
@@ -614,7 +622,7 @@ class Handler(BaseHTTPRequestHandler):
     def _summary(self, st, finish):
         t = self._timings(st)
         log("%d tok %.1f t/s %.2f/rnd %s | prompt %d, %d cached, %.1f s%s" % (
-            t["predicted_n"], t["predicted_per_second"], t["tokens_per_cycle"], "dspine" if st.dspine else "mtp",
+            t["predicted_n"], t["predicted_per_second"], t["tokens_per_cycle"], self.eng.drafter_name(st.dspine),
             st.n_prompt, t["cache_n"], t["prompt_ms"] / 1000, "" if finish == "stop" else " | " + finish))
 
     def _timings(self, st):
@@ -811,7 +819,7 @@ def main():
     Handler.args = args
     Handler.model_id = model_id(Handler.eng)
     log("ready in %.1f s | ctx %d | %s%s | %s:%d%s" % (
-        time.time() - t0, Handler.eng.max_ctx, "dspine" if args.dspine else "mtp", " + vision" if args.mmproj else "",
+        time.time() - t0, Handler.eng.max_ctx, Handler.eng.drafter_name(bool(args.dspine)), " + vision" if args.mmproj else "",
         args.host, args.port, " | trace " + TRACE if TRACE else ""))
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     fd = os.environ.get("QZ_CHILD_READY_FD")

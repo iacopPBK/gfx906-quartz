@@ -168,7 +168,7 @@ struct ink2_ctx : qz_ctx {
                 hi = std::max(hi, pos);
                 E.step(anc, pos++, true);
                 if (ds_on) DS.fill(DS.tap, 4 * D, pos - 1, 1);
-                st.decode_cycles++;
+                st.decode_cycles++; st.decode_tok++;
                 if (dsr && !spec) {
                     last_kind = 1; ntok_plain++;
                     if (--plain_left <= 0) {                    // back to the rounds (after a timing: the same window)
@@ -189,7 +189,8 @@ struct ink2_ctx : qz_ctx {
             DS.rounds++;
             DS.accepted += n;
             hi = std::max(hi, pos + VR - 1);          // the SWA ring rows the verify wrote
-            st.decode_cycles++;
+            st.decode_cycles++; st.decode_tok += n + 1;
+            st.dspine = 1;
             bool end = false;
             for (int i = 0; i < n && !end; i++) end = emit(dr[i]) != 0;
             if (end) break;
@@ -205,7 +206,6 @@ struct ink2_ctx : qz_ctx {
                     (double) (DS.accepted - a0 + DS.rounds - r0) / (DS.rounds - r0), (double) (DS.accepted - a0) / (DS.rounds - r0), DS_BS - 1);
         if (dsr && sw_on && ntok_plain)
             fprintf(stderr, "switch: %d, %d tokens plain (%.2f ms/step)\n", nsw, ntok_plain, step_ms);
-        st.decode_tok = st.decode_cycles;
         st.decode_ms = std::chrono::duration<double, std::milli>(clk::now() - t1).count();
         return fin(0);
     }
@@ -233,7 +233,7 @@ static qz_ctx * create(const char * path, const qz_create_opts & o) {
             K.ld.slice = ink2_tp2_spec;
             if (!K.ld.load(path, g, qz_dev_of(i), i)) { fprintf(stderr, "inkling2: card %d load failed\n", i); delete c; return nullptr; }
         }
-        printf("inkling2: card %d weights %.2f GB in %.1f s, %.2f GB free\n", i, K.ld.need_bytes / 1e9, K.ld.load_seconds, K.ld.free_after / 1e9);
+        fprintf(stderr, "inkling2: card %d weights %.2f GB in %.1f s, %.2f GB free\n", i, K.ld.need_bytes / 1e9, K.ld.load_seconds, K.ld.free_after / 1e9);
         ICHECK(hipSetDevice(qz_dev_of(i)));
         ICHECK(hipStreamCreateWithFlags(&K.st, hipStreamNonBlocking));
         c->E.bind(i);
@@ -257,10 +257,10 @@ static qz_ctx * create(const char * path, const qz_create_opts & o) {
         ICHECK(qz_dmalloc((void **) &c->EPF.dtaps, (size_t) PF_M * 4 * D * 4, "dspark"));
         c->EPF.on_chunk = [c](int p0, int m) { c->DS.fill(c->EPF.dtaps, 4 * D, p0, m); };
         c->ds_on = true;
-        printf("inkling2: DSpark drafter %s\n", dp);
+        fprintf(stderr, "inkling2: DSpark drafter %s\n", dp);
     }
     ICHECK(hipSetDevice(qz_dev_of(0)));
-    qz_mem_report(stdout, 2);
+    qz_mem_report(stderr, 2);
     return c;
 }
 

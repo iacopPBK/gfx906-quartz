@@ -12,9 +12,11 @@ inline double ink2_ctx_bytes(int ctx, int card, bool ds) {
     if (ds && card == 0) b += 2.0 * DS_NL * ctx * DS_KV * 2;
     return b;
 }
-// the rest: the activations (VR rows), the batched prefill's buffers, the drafter's
-// weights and work buffers, the HIP runtime's share; 256 MB left free on top
-constexpr double INK_PF_FIXED = 1.5e9, INK_PF_DS = 0.6e9, INK_PF_HEADROOM = 0.25e9;
+// the rest: the activations (VR rows), the batched prefill's buffers, the HIP runtime's
+// share; the drafter's weights and work buffers (card 0; card 1 holds its head fold
+// buffers); 256 MB left free on top. Measured 2026-11-23 at 262144: 20.6 GB per card,
+// with DSpark 24.3 / 20.6 (this estimate: 20.9, with DSpark 24.8 / 21.0)
+constexpr double INK_PF_FIXED = 1.5e9, INK_PF_DS0 = 0.6e9, INK_PF_DS1 = 0.1e9, INK_PF_HEADROOM = 0.25e9;
 
 // 0: fits (or cannot be sized here: the load reports the model problem); 1: refused
 inline int ink2_vram_check(const qz_gguf & g, int ctx, const char * dspark) {
@@ -27,7 +29,7 @@ inline int ink2_vram_check(const qz_gguf & g, int ctx, const char * dspark) {
         size_t fr = 0, tot = 0;
         if (hipSetDevice(qz_dev_of(c)) != hipSuccess || hipMemGetInfo(&fr, &tot) != hipSuccess) return 0;
         w[c] = (double) L.need_bytes; free_b[c] = (double) fr; total_b[c] = (double) tot;
-        need[c] = w[c] + ink2_ctx_bytes(ctx, c, ds) + INK_PF_FIXED + INK_PF_HEADROOM + (ds ? INK_PF_DS : 0.0);
+        need[c] = w[c] + ink2_ctx_bytes(ctx, c, ds) + INK_PF_FIXED + INK_PF_HEADROOM + (ds ? (c == 0 ? INK_PF_DS0 : INK_PF_DS1) : 0.0);
     }
     (void) hipSetDevice(qz_dev_of(0));
     fprintf(stderr, "inkling2: memory per card: weights %.1f + context %.1f (ctx %d)%s + buffers %.1f = %.1f / %.1f GB; free %.1f and %.1f GB\n",
