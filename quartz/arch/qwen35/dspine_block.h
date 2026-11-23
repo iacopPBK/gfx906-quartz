@@ -654,7 +654,7 @@ struct qz_ds_block {
     int ids[DS_T] = {};
     int * ids_d = nullptr;
     float * x = nullptr;                               // emb rows / resid stream [T][H]
-    float * t1 = nullptr, * t2 = nullptr, * t3 = nullptr;  // [T][H] scratch
+    float * t1 = nullptr, * t2 = nullptr;  // [T][H] scratch
     unsigned char * q1 = nullptr;                     // [T][H] values
     float * s1 = nullptr;                             // [T][H/32] scales
     float * xa = nullptr;                              // [T][4096] q after gemv, roped

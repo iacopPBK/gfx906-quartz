@@ -737,7 +737,7 @@ template <int NJ> VR_NI void v_ctrl_down(CK cjob * cj, int rsf, int tid) {
     __syncthreads();
 }
 // c_ctrl_up_all over the VR rows: each weight chunk loaded once, the VR rows' sums in
-// d_ctrl_up's k order (g and the forget sums of all rows in the dynamic LDS)
+// c_ctrl_up_all's k order (g and the forget sums of all rows in the dynamic LDS)
 template <int NJ> VR_NI void v_ctrl_up(CK cjob * cj, int rsf, int tid) {
     asm volatile ("" : "+v"(tid));
     float * g = cyc_lds;                                   // [VR][NJ][GRANK]
@@ -955,7 +955,6 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
     const bool chain = cr < VR;
     const int tr = chain ? cr : 0;
     unsigned int xs = *Vp->A.xseq;
-    int vai = 0;
     // VTS(j): block 0's own clock as phase j (no barrier: the in-phase marks pick / distinct / up)
     // the embedding: chain group r's leader block, then the group's sync
     if (chain && cw == 0)
@@ -969,7 +968,6 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         // the args and the table reloaded per application (no pointers held live)
         CK vargs * Vq = (CK vargs *) Vg;
         asm volatile ("" : "+s"(Vq));
-        vai = ai;
         CK cyc_args & Av = Vq->A;
         CK appk * e0 = (CK appk *) Av.tab + ai;                      // the application's flags
         CK appk * er = (CK appk *) Av.tab + (size_t) tr * napp + ai;  // this block's row
@@ -1101,7 +1099,6 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
             hn.qs = gp((float *) ((char *) Vp->A.as3 + (size_t) r * rs));
             d_norm_quant(hn, Vp->A.eps, tid_k, tid_k < 256);
         }
-        vai = napp;
         cyc_barrier(vbst, ++kb);
         {   // the VR-row head GEMV: c_head_gemv's rows and values, the softcap on rows < nvalid
             const int N = Vp->A.hg.N, NV = Vp->A.nvalid;

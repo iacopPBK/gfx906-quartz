@@ -480,7 +480,6 @@ struct qz_mm_view {
 struct qz_prefill {
     int Mmax = 0, Mp = 0;
     std::vector<int> mm_irow, mm_rpos;   // host staging of a chunk's qz_mm_view rows
-    int pset = 0, pn = 0;   // the pending cross-card sum: partial set, rows (pn 0: none)
     // DSpine feature capture [5][Mmax][PF_D] on card 0 (null: off)
     float * feat = nullptr;
     struct card {
@@ -498,7 +497,6 @@ struct qz_prefill {
         hipEvent_t ev = nullptr, ev_aux = nullptr, evp[4] = {};
         hipStream_t aux = nullptr;
     } c[2];
-    double ms_total = 0;
 
     // the per-card buffers of init(max_rows): (pointer, bytes) for M rows
     static std::vector<std::pair<void **, size_t>> bufs(card & k, size_t M) {

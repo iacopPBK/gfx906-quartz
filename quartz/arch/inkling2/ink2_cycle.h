@@ -112,13 +112,6 @@ template <int MQ> CYC_NI void c_mix(CK sptrs * S, const float * q, float * o, in
     d_mix_lds<MQ>(L, gp(q), gp(o), tid, tid < 256, cyc_lds);
 }
 CYC_NI void c_mix1(CK sptrs * S, const float * q, float * o, int tid) { c_mix<1>(S, q, o, tid); }
-CYC_NI void c_mix3(CK sptrs * S, const float * q, float * o, int tid) { c_mix<3>(S, q, o, tid); }
-CYC_NI void c_mix4(CK sptrs * S, const float * q, float * o, int tid) { c_mix<4>(S, q, o, tid); }
-CYC_NI cjob gcj(CK cjob * c) {
-    cjob j;
-    j.cur = gp(c->cur); j.msg = gp(c->msg); j.wd = gp(c->wd); j.wg = gp(c->wg); j.wf = gp(c->wf); j.g = gp(c->g); j.out = gp(c->out); j.wgt = c->wgt; j.wft = c->wft;
-    return j;
-}
 // bsum<N>(v, red, 4) for each 256-thread half of the block on its own (red: 2 * 4 * N)
 template <int N> CYC_NI void hsum(float (&v)[N], float * red) {
     #pragma unroll
@@ -137,8 +130,8 @@ template <int N> CYC_NI void hsum(float (&v)[N], float * red) {
     }
 }
 // the control-down rows in one pass per block: the blocks split into NJ groups
-// (one job each: its rms once), each half block takes 2 rows; d_ctrl_down's
-// per-thread sums in its order and the same 4-wave reductions, so bit-identical
+// (one job each: its rms once), each half block takes 2 rows: 256-thread
+// strided sums, then 4-wave reductions
 template <int NJ> CYC_NI void c_ctrl_down_all(CK cjob * cj, int tid) {
     asm volatile ("" : "+v"(tid));
     __shared__ float red[2 * 4 * 2];
@@ -181,9 +174,9 @@ template <int NJ> CYC_NI void c_ctrl_down_all(CK cjob * cj, int tid) {
     }
     __syncthreads();
 }
-// d_ctrl_up for the NJ jobs' D rows each, over all blocks, from the transposed
+// the control-up rows for the NJ jobs' D rows each, over all blocks, from the transposed
 // weights (wgt / wft [GRANK][D]: lanes on consecutive rows, coalesced): item =
-// (row, sum), each sum in d_ctrl_up's sequential k order; the forget sums via LDS
+// (row, sum), each sum in sequential k order; the forget sums via LDS
 template <int NJ> CYC_NI void c_ctrl_up_all(CK cjob * cj, int tid) {
     asm volatile ("" : "+v"(tid));
     __shared__ float g[NJ][GRANK], sf[256];
@@ -509,9 +502,9 @@ CYC_NI void c_xconv_b0(const float * own, const float * peer, const float * w, f
     d_xconv_blk<512>(gp(own), gp(peer), gp(w), gp(hs), gp(x), blk ? gp(blk) : nullptr, tid);
 }
 CYC_NI void c_router(const float * f, const float * wr, const float * bias, float * ps, int e, int lane) { d_router(gp(f), gp(wr), gp(bias), gp(ps), e, lane); }
-// d_router_pick by rank: candidate i's place = #{j : s_j > s_i or (s_j == s_i and j < i)}
-// (its selection order: max first, ties to the lower id); the weights with the
-// sum in that order, so the same ids and bits. The whole block calls it.
+// the router's top NE_USED by rank: candidate i's place = #{j : s_j > s_i or (s_j == s_i and j < i)}
+// (selection order: max first, ties to the lower id); the weights p / sum(p) * scale
+// with the sum in that order. The whole block calls it.
 CYC_NI void c_pick_rank(const float * ps, float scale, int * sids, float * swts, int tid) {
     __shared__ float lv[NE], lp[NE_USED];
     asm volatile ("" : "+v"(tid));
@@ -537,10 +530,10 @@ CYC_NI void c_pick_rank(const float * ps, float scale, int * sids, float * swts,
     __syncthreads();
 }
 // the experts' gate | up GEMV, SITU and quant: task = 2 activations (their 2
-// gate rows and the 2 up rows 32 later, gu_row) in one 4-row GEMV (each row
-// d_moe_up's value), dealt round-robin over all the grid's waves; the SITU
+// gate rows and the 2 up rows 32 later, gu_row) in one 4-row GEMV (qz_gemv_rows_t's
+// value per row), dealt round-robin over all the grid's waves; the SITU
 // values go to sv (f32) and the wave finishing a 32-activation group (gcnt)
-// quantizes it (d_situ's quant32) and resets the count
+// quantizes it (quant32) and resets the count
 constexpr int UP_A = 2, UP_TG = 32 / UP_A;       // activations per task, tasks per quant group
 CYC_NI void c_up_situ_w(const char * wv, const __half * ws, const int * sids, const unsigned char * av, const float * as,
                         float beta, float lb, float * sv, int * gcnt, unsigned char * hq, float * hs, int tid) {
@@ -577,7 +570,7 @@ CYC_NI void c_up_situ_w(const char * wv, const __half * ws, const int * sids, co
 }
 // the experts' down rows, the grid's row quads split evenly over the blocks;
 // task (quad, expert pair): lanes 0..31 expert 2p, 32..63 expert 2p+1. With
-// K = FFL (18 units) a lane holds at most one unit, so d_moe_down's per-row
+// K = FFL (18 units) a lane holds at most one unit, so qz_gemv_rows_t's per-row
 // value is this tree: the unit products, the shfl_down levels 16..1 (its
 // level 32 adds zeros); then the same k-order fold of wk * acc (from LDS)
 constexpr int MD_Q = 16;                         // quads per LDS chunk

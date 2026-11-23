@@ -43,7 +43,6 @@ public:
         slots.resize(n);
         for (auto & sn : slots) alloc(sn);
     }
-    size_t slot_bytes() const { size_t t = 0; for (const auto & b : blobs) t += b.bytes; return t * ncard; }
 
     // the deepest slot whose keys 0 .. pos match `k` (pos <= n - 1); slots past
     // the matching prefix, or that `valid` rejects, are dropped

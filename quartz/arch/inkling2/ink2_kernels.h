@@ -227,49 +227,6 @@ static __global__ void k_ctrl_t(const float * s, float * d) {
     for (int k = 0; k < GRANK; k++) d[(size_t) k * D + i] = s[(size_t) i * GRANK + k];
 }
 struct cjobs { cjob j[3]; };
-// virtual block (r, y): r < GRANK, y the job (NT 256)
-__device__ __forceinline__ void d_ctrl_down(const cjob & c, int r, int tid, bool act) {
-    __shared__ float red[4 * 2];
-    float ss[2] = {0.f, 0.f};
-    if (act) for (int i = tid; i < D; i += 256) { ss[0] += c.cur[i] * c.cur[i]; ss[1] += c.msg[i] * c.msg[i]; }
-    bsum<2>(ss, red, 4);
-    const float rc = rsqrtf(ss[0] / D + 1e-6f), rm = rsqrtf(ss[1] / D + 1e-6f);
-    const float * w = c.wd + (size_t) r * 2 * D;
-    float a[1] = {0.f};
-    if (act) for (int i = tid; i < D; i += 256) a[0] += w[i] * (c.cur[i] * rc) + w[D + i] * (c.msg[i] * rm);
-    bsum<1>(a, red, 4);
-    if (tid == 0) c.g[r] = a[0];
-    __syncthreads();
-}
-// virtual block (bx, y): bx < D / 256 (NT 256)
-__device__ __forceinline__ void d_ctrl_up(const cjob & c, int bx, int tid, bool act) {
-    __shared__ float g[GRANK];
-    __syncthreads();
-    if (tid < GRANK) g[tid] = c.g[tid];
-    __syncthreads();
-    const int i = bx * 256 + tid;
-    if (act && i < D) {
-        float ga = 0.f, fo = 0.f;
-        // the rows as float4, 4 + 4 in flight per chunk, the same k order
-        const float4 * wg4 = (const float4 *) (c.wg + (size_t) i * GRANK), * wf4 = (const float4 *) (c.wf + (size_t) i * GRANK);
-        #pragma unroll 1
-        for (int c0 = 0; c0 < GRANK / 4; c0 += 4) {
-            float4 vg[4], vf[4];
-            #pragma unroll
-            for (int q = 0; q < 4; q++) { vg[q] = wg4[c0 + q]; vf[q] = wf4[c0 + q]; }
-            #pragma unroll
-            for (int q = 0; q < 4; q++) {
-                const int k = 4 * (c0 + q);
-                ga += g[k] * vg[q].x; fo += g[k] * vf[q].x;
-                ga += g[k + 1] * vg[q].y; fo += g[k + 1] * vf[q].y;
-                ga += g[k + 2] * vg[q].z; fo += g[k + 2] * vf[q].z;
-                ga += g[k + 3] * vg[q].w; fo += g[k + 3] * vf[q].w;
-            }
-        }
-        const float x = c.cur[i];
-        c.out[i] = (x - tanhf(fo) * x) + tanhf(ga) * c.msg[i];
-    }
-}
 
 // ---- rmsnorm(x) * w -> optional f32 y and the int8 planes (NT 256)
 struct njob { const float * x, * w; float * y; unsigned char * q; float * qs; };
@@ -554,20 +511,8 @@ __device__ __forceinline__ void d_attn(const attn_args & a, int kvh, int sp, int
 // grid HKVL * ATT_SPL
 
 // ---- the TP2 sum of the two cards' partials, then a short conv (no dynamic taps) with its history;
-// blk null: x += a; else blk = x, x = a (a new residual block). Element i = bx * 256 + t.
-__device__ __forceinline__ void d_xconv(const float * own, const float * peer, const float * w, float * hs,
-                                        float * x, float * blk, int i) {
-    if (i >= D) return;
-    const float u = own[i] + __builtin_nontemporal_load(peer + i);
-    const float h0 = hs[i], h1 = hs[CHL + i], h2 = hs[2 * CHL + i];
-    const float * wi = w + (size_t) i * NCONV;
-    const float o = wi[0] * h0 + wi[1] * h1 + wi[2] * h2 + wi[3] * u;
-    hs[i] = h1; hs[CHL + i] = h2; hs[2 * CHL + i] = u;
-    const float y = (u + o) * (1.f / sqrtf((float) NCONV + 1.f));
-    if (blk) { blk[i] = x[i]; x[i] = y; }
-    else x[i] = x[i] + y;
-}
-// d_xconv over elements t, t + NT, ... of one block, all loads first (latency bound)
+// blk null: x += a; else blk = x, x = a (a new residual block). One block, elements t, t + NT, ...,
+// all loads first (latency bound)
 template <int NT>
 __device__ __forceinline__ void d_xconv_blk(const float * own, const float * peer, const float * w, float * hs,
                                             float * x, float * blk, int t) {
@@ -613,32 +558,6 @@ __device__ __forceinline__ void d_router(const float * f, const float * wr, cons
     for (int off = 32; off > 0; off >>= 1) s += __shfl_xor(s, off, 64);
     if (lane == 0) { const float p = sigm(s); ps[e] = p; ps[NE + e] = p + bias[e]; }
 }
-// top NE_USED by p + bias (first max wins: ties to the lower id), weights
-// p / sum(p) * scale with the sum in selection order; one wave, 2 experts per lane
-__device__ __forceinline__ void d_router_pick(const float * ps, float scale, int * ids, float * wts, int lane) {
-    const float pa = ps[lane], pb = ps[lane + 64];
-    float sa = ps[NE + lane], sb = ps[NE + lane + 64];
-    float sum = 0.f, pk = 0.f;
-    int idk = 0;
-    for (int k = 0; k < NE_USED; k++) {
-        float bv = sa; int bi = lane;
-        if (sb > bv) { bv = sb; bi = lane + 64; }
-        #pragma unroll
-        for (int off = 32; off > 0; off >>= 1) {
-            const float ov = __shfl_xor(bv, off, 64);
-            const int oi = __shfl_xor(bi, off, 64);
-            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-        }
-        const float pw = __shfl(bi < 64 ? pa : pb, bi & 63, 64);
-        sum += pw;
-        if (lane == k) { idk = bi; pk = pw; }
-        if (bi == lane) sa = -INFINITY;
-        if (bi == lane + 64) sb = -INFINITY;
-    }
-    sum += 1e-20f;
-    if (lane < NE_USED) { ids[lane] = idk; wts[lane] = pk / sum * scale; }
-}
-
 // gate_up rows are interleaved per 32 at load (gu_interleave): tile T of 64 rows holds
 // gate rows 32T..32T+31 then the matching up rows; gate row j sits at gu_row(j), its up row 32 later
 __device__ __host__ __forceinline__ int gu_row(int j) { return (j / 32) * 64 + j % 32; }
@@ -651,52 +570,9 @@ static __global__ __launch_bounds__(256) void k_gu_interleave(const char * sv, c
     for (int i = threadIdx.x; i < D / 16; i += 256) b[i] = a[i];
     for (int i = threadIdx.x; i < D / 32; i += 256) ds[dof * (D / 32) + i] = ss[so * (D / 32) + i];
 }
-// ---- the selected experts' local gate | up rows: h[k][FFE] (interleaved per 32, see gu_row);
-// 512-thread block bx of expert slot k
-__device__ __forceinline__ void d_moe_up(const char * wv, const __half * ws, const int * ids,
-                                         const unsigned char * av, const float * as, float * h, int bx, int k) {
-    const int wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
-    const int e = __builtin_amdgcn_readfirstlane(ids[k]);
-    const size_t base = (size_t) e * FFE;
-    const int r0 = bx * 32 + wave * 4;
-    float acc[1][4];
-    qz_gemv_rows_t<1, 4>(av, as, D, wv + base * D, ws + base * (D / 32), FFE, r0, lane, acc);
-    if (lane == 0)
-        #pragma unroll
-        for (int s = 0; s < 4; s++) if (r0 + s < FFE) h[k * FFE + r0 + s] = acc[0][s];
-}
-// ---- SITU on the local halves -> int8 planes per expert: [k][FFL]; element j of slot k
-// (32-lane halves of a wave must hold 32 consecutive j: quant32)
+// ---- SITU: the expert activation of a gate value g and its up value u
 __device__ __forceinline__ float situ_v(float g, float u, float beta, float lb) {
     return beta * tanhf(g / beta) * sigm(g) * (lb * tanhf(u / lb));
-}
-__device__ __forceinline__ void d_situ(const float * h, float beta, float lb, unsigned char * q, float * qs, int k, int j) {
-    const int gi = gu_row(j);
-    const float g = h[k * FFE + gi], u = h[k * FFE + gi + 32];
-    quant32(situ_v(g, u, beta, lb), q + k * FFL, qs + k * (FFL / 32), j);
-}
-// ---- sum over the selected experts of w_k * down_e . act_k, local contraction half (yp: peer inbox copy)
-__device__ __forceinline__ void d_moe_down(const char * wv, const __half * ws, const int * ids, const float * wts,
-                                           const unsigned char * aq, const float * as, float * y, float * yp, int bx) {
-    const int wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
-    const int r0 = bx * 32 + wave * 4;
-    float tot[4] = {0.f, 0.f, 0.f, 0.f};
-    for (int k = 0; k < NE_USED; k++) {
-        const int e = __builtin_amdgcn_readfirstlane(ids[k]);
-        const size_t base = (size_t) e * D;
-        float acc[1][4];
-        qz_gemv_rows_t<1, 4>(aq + k * FFL, as + k * (FFL / 32), FFL, wv + base * FFL, ws + base * (FFL / 32), D, r0, lane, acc);
-        const float wk = wts[k];
-        #pragma unroll
-        for (int s = 0; s < 4; s++) tot[s] += wk * acc[0][s];
-    }
-    if (lane == 0)
-        #pragma unroll
-        for (int s = 0; s < 4; s++) if (r0 + s < D) { y[r0 + s] = tot[s]; if (yp) yp[r0 + s] = tot[s]; }
-}
-static __global__ __launch_bounds__(512) void k_moe_down(const char * wv, const __half * ws, const int * ids, const float * wts,
-                                                         const unsigned char * aq, const float * as, float * y) {
-    d_moe_down(wv, ws, ids, wts, aq, as, y, nullptr, blockIdx.x);
 }
 
 static __global__ void k_softcap(float * y, int n, float cap) {

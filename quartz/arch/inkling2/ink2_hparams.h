@@ -9,7 +9,6 @@ constexpr int NAPP = NL + (NPASS - 1) * (LOOP1 - LOOP0);   // layer applications
 constexpr int VOCAB = 201024, VOCAB_REAL = 200058;
 constexpr int32_t END_MESSAGE = 200010;                     // <|end_message|>: closes every chat message
 constexpr int32_t IMG_PAD = 200054;                         // <|unused_200054|>: the template's image placeholder (after <|content_image|>)
-constexpr int CONV_CH = 2 * HKV * HD + 2 * D;               // conv history channels per slot: K | V | attn post | ffn post
 
 inline bool is_full(int il) { return il % 6 == 5; }         // layers 5, 11, 17, 23
 inline bool is_loop(int il) { return il >= LOOP0 && il < LOOP1; }

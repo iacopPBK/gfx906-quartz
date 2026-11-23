@@ -25,14 +25,6 @@ enum qz_layer_kind {
     QZ_LAYER_MTP  = 2,   // nextn block, dense attention
 };
 
-// TP2 split of a phase: COL halves the output rows (no exchange), ROW halves
-// the contraction dim (one exchange after the phase).
-enum qz_split {
-    QZ_SPLIT_NONE = 0,
-    QZ_SPLIT_COL  = 1,
-    QZ_SPLIT_ROW  = 2,
-};
-
 struct qz_hparams {
     int n_vocab    = 0;   // 248320
     int d_model    = 0;   // 5120
