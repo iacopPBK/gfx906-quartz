@@ -20,6 +20,8 @@ import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import dialects
+
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -90,6 +92,7 @@ class Engine:
         self.info = QzInfo()
         L.qz_model_info_get(self.ctx, ctypes.byref(self.info))
         self.arch = self.info.arch.decode()
+        self.dialect = dialects.for_arch(self.arch)
         self.img_pad = self.info.img_pad
         self.lock = threading.Lock()
         self._pb = ctypes.create_string_buffer(512)
@@ -111,8 +114,8 @@ class Engine:
 
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
                                             extensions=["jinja2.ext.loopcontrols"])
-        env.filters["tojson"] = lambda x, indent=None, ensure_ascii=False: json.dumps(
-            x, indent=indent, ensure_ascii=ensure_ascii)
+        env.filters["tojson"] = lambda x, indent=None, ensure_ascii=False, sort_keys=False, separators=None: json.dumps(
+            x, indent=indent, ensure_ascii=ensure_ascii, sort_keys=sort_keys, separators=separators)
         env.globals["raise_exception"] = raise_exception
         return env.from_string(src)
 
@@ -190,8 +193,9 @@ class Engine:
         return b"".join(self.piece(t, special) for t in ids).decode("utf-8", "replace")
 
     def generate(self, prompt, max_new, on_text, stop_strings=(), want_ids=False, ignore_eos=False, sampling=None,
-                 images=()):
-        """Blocking; on_text(str) gets text deltas (False stops). Returns (text, ids, stats, finish_reason)."""
+                 images=(), special=False):
+        """Blocking; on_text(str) gets text deltas (False stops); special: control tokens as text.
+        Returns (text, ids, stats, finish_reason)."""
         dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
         hold = max((len(s) for s in stop_strings), default=1) - 1
         state = {"text": "", "sent": 0, "ids": [], "stopped": None, "gone": False}
@@ -225,7 +229,7 @@ class Engine:
                 t = toks[i]
                 if want_ids:
                     state["ids"].append(t)
-                state["text"] += dec.decode(self.piece(t))
+                state["text"] += dec.decode(self.piece(t, special))
                 if stop_strings:
                     cut = min((state["text"].find(s) for s in stop_strings if s in state["text"]), default=-1)
                     if cut >= 0:
@@ -258,7 +262,6 @@ class Engine:
         return state["text"], state["ids"], st, finish
 
 
-TOOL_OPEN = "<tool_call>"
 # QZ_TRACE=<dir>: one JSON file per request plus flags for answers that look
 # cut short (read with quartz/server/quartz_trace.py)
 TRACE = os.environ.get("QZ_TRACE")
@@ -388,73 +391,6 @@ def extract_images(messages):
     return blobs
 
 
-def _param_types(tools):
-    """{function name: {parameter: JSON schema type}} from the request's tools."""
-    types = {}
-    for t in tools or []:
-        f = t.get("function", t) if isinstance(t, dict) else {}
-        props = ((f.get("parameters") or {}).get("properties") or {}) if isinstance(f, dict) else {}
-        types[f.get("name")] = {k: (v or {}).get("type") for k, v in props.items() if isinstance(v, dict)}
-    return types
-
-
-def parse_tool_calls(text, tools):
-    """Qwen's XML (or JSON) tool calls -> (content before the first call, OpenAI tool_calls);
-    values parse as JSON unless the schema says string."""
-    i = text.find(TOOL_OPEN)
-    if i < 0:
-        return text, []
-    content = text[:i].rstrip()
-    types = _param_types(tools)
-    calls = []
-    # a closing tag ends its element only where the next tag of the structure (or the
-    # end) follows it, so values that contain the tags themselves (code, docs) survive
-    for blk in re.finditer(r"<tool_call>(.*?)(?:</tool_call>\s*(?=<tool_call>|$)|$)", text[i:], re.S):
-        body = blk.group(1)
-        name, args = None, {}
-        fm = (re.search(r"<function=([^>\n]+)>(.*)</function>\s*$", body, re.S)
-              or re.search(r"<function=([^>\n]+)>(.*?)(?:</function>|$)", body, re.S))
-        if fm:
-            name = fm.group(1).strip()
-            pt = types.get(name, {})
-            for pm in re.finditer(r"<parameter=([^>\n]+)>(.*?)</parameter>\s*(?=<parameter=[^>\n]+>|$)",
-                                  fm.group(2), re.S):
-                k, v = pm.group(1).strip(), pm.group(2)
-                if v.startswith("\n"):
-                    v = v[1:]
-                if v.endswith("\n"):
-                    v = v[:-1]
-                if pt.get(k) != "string":
-                    try:
-                        v = json.loads(v)
-                    except ValueError:
-                        pass
-                args[k] = v
-        elif body.strip().startswith("{"):
-            try:
-                j = json.loads(body.strip())
-                name, args = j.get("name"), j.get("arguments") or {}
-                if isinstance(args, str):
-                    args = json.loads(args)
-            except ValueError:
-                name = None
-        if name:
-            calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
-                          "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
-    return content, calls
-
-
-def split_reasoning(text, think_open):
-    """With thinking open, text up to </think> (all of it if it never comes) is reasoning.
-    Returns (reasoning or None, content)."""
-    if not think_open:
-        return None, text
-    if "</think>" in text:
-        r, c = text.split("</think>", 1)
-        return r.replace("<think>", "").strip(), c.lstrip("\n")
-    return text.replace("<think>", "").strip(), ""
-
-
 def model_id(eng):
     """The /v1/models id: quartz for qwen35, else quartz-<general.name>."""
     if eng.arch == "qwen35":
@@ -571,7 +507,7 @@ class Handler(BaseHTTPRequestHandler):
                 text = self.eng.render(escape_specials(normalize_messages(req.get("messages", []))),
                                        escape_specials(req.get("tools")),
                                        self._template_kwargs(req))
-                think_open = text.rstrip(" ").endswith("<think>\n")
+                think_open = self.eng.dialect.think_open(text)
                 prompt = self.eng.tokenize_chat(text)
                 text = text.replace(_ESC, "<|")
                 if blobs:
@@ -617,14 +553,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._stream(rid, created, chat, prompt, max_new, stop, want_ids, think_open, ign, sampling,
                                 req.get("tools") if chat else None, tr, imgs)
         text, ids, st, finish = self.eng.generate(prompt, max_new, lambda s: True, stop, want_ids or tr is not None, ign,
-                                                  sampling, imgs)
+                                                  sampling, imgs, chat and self.eng.dialect.special_pieces)
         usage = {"prompt_tokens": len(prompt), "completion_tokens": st.n_gen,
                  "total_tokens": len(prompt) + st.n_gen}
         if chat:
-            reasoning, content = split_reasoning(text, think_open)
-            calls = []
-            if req.get("tools"):
-                content, calls = parse_tool_calls(content, req.get("tools"))
+            reasoning, content, calls = self.eng.dialect.parse(text, think_open, req.get("tools"))
             msg = {"role": "assistant", "content": content if (content or not calls) else None}
             if reasoning is not None:
                 msg["reasoning_content"] = reasoning
@@ -653,22 +586,18 @@ class Handler(BaseHTTPRequestHandler):
         try:
             reasoning, content, calls = None, text, []
             if chat:
-                reasoning, content = split_reasoning(text, think_open)
-                if tools:
-                    content, calls = parse_tool_calls(content, tools)
+                reasoning, content, calls = self.eng.dialect.parse(text, think_open, tools)
             flags = []
             if st.stop != 1:
                 flags.append("engine stop: " + ENGINE_STOP.get(st.stop, str(st.stop)))
-            if chat and think_open and "</think>" not in text:
-                flags.append("think never closed")
             if not calls:
                 c = (content or "").rstrip()
                 if not c:
                     flags.append("empty content, no tool call")
                 elif c.endswith(":"):
                     flags.append("ends with ':' and no tool call")
-                if "<tool_call" in (content or "") or "<function=" in (content or ""):
-                    flags.append("unparsed tool call text")
+            if chat:
+                flags += self.eng.dialect.flags(text, think_open, content, calls)
             tr.update({"finish": finish, "engine_stop": st.stop, "max_new": max_new, "n_gen": st.n_gen,
                        "n_cached": st.n_cached, "raw": self.eng.detok(ids), "ids": ids,
                        "reasoning": reasoning, "content": content, "tool_calls": calls, "flags": flags})
@@ -718,63 +647,25 @@ class Handler(BaseHTTPRequestHandler):
 
         if chat:
             send({"index": 0, "delta": {"role": "assistant"}, "finish_reason": None})
-        phase = {"think": chat and think_open, "buf": ""}   # reasoning until </think>
-        tc = {"on": False, "pend": "", "tail": ""}           # tools: content up to <tool_call>, the rest held
 
-        def content(s):
-            if not tools:
-                return send({"index": 0, "delta": {"content": s}, "finish_reason": None})
-            if tc["on"]:
-                tc["tail"] += s
-                return True
-            buf = tc["pend"] + s
-            i = buf.find(TOOL_OPEN)
-            if i >= 0:
-                tc["on"], tc["pend"], tc["tail"] = True, "", buf[i:]
-                out = buf[:i]
-            else:                                # hold a suffix that may open a call
-                k = next((n for n in range(min(len(TOOL_OPEN) - 1, len(buf)), 0, -1) if TOOL_OPEN.startswith(buf[-n:])), 0)
-                out, tc["pend"] = (buf[:-k], buf[-k:]) if k else (buf, "")
-            return send({"index": 0, "delta": {"content": out}, "finish_reason": None}) if out else True
+        def delta(key):
+            return lambda s: send({"index": 0, "delta": {key: s}, "finish_reason": None})
 
-        def on_text(s):
-            if not chat:
+        def send_calls(calls):
+            return send({"index": 0, "delta": {"tool_calls": [dict(c, index=i) for i, c in enumerate(calls)]},
+                         "finish_reason": None})
+
+        if chat:
+            ps = self.eng.dialect.stream(think_open, tools, delta("reasoning_content"), delta("content"), send_calls)
+            on_text = ps.feed
+        else:
+            def on_text(s):
                 return send({"index": 0, "text": s, "finish_reason": None})
-            if phase["think"]:
-                phase["buf"] += s
-                if "</think>" in phase["buf"]:
-                    r, c = phase["buf"].split("</think>", 1)
-                    phase["think"] = False
-                    ok = True
-                    r = r.replace("<think>", "")
-                    if r:
-                        ok = send({"index": 0, "delta": {"reasoning_content": r}, "finish_reason": None})
-                    c = c.lstrip("\n")
-                    if c and ok:
-                        ok = content(c)
-                    return ok
-                keep = len("</think>") - 1      # a split closing tag stays buffered
-                out, phase["buf"] = phase["buf"][:-keep] if len(phase["buf"]) > keep else "", \
-                    phase["buf"][-keep:] if len(phase["buf"]) > keep else phase["buf"]
-                out = out.replace("<think>", "")
-                return send({"index": 0, "delta": {"reasoning_content": out}, "finish_reason": None}) if out else True
-            return content(s)
 
-        text, ids, st, finish = self.eng.generate(prompt, max_new, on_text, stop, want_ids or tr is not None, ign, sampling, imgs)
-        if chat and phase["think"] and phase["buf"]:
-            send({"index": 0, "delta": {"reasoning_content": phase["buf"].replace("<think>", "")},
-                  "finish_reason": None})
-        if tools and tc["pend"] and not tc["on"]:
-            send({"index": 0, "delta": {"content": tc["pend"]}, "finish_reason": None})
-        calls = []
-        if tools and tc["on"]:
-            rest, calls = parse_tool_calls(tc["tail"], tools)
-            if calls:
-                send({"index": 0, "delta": {"tool_calls": [dict(c, index=i) for i, c in enumerate(calls)]},
-                      "finish_reason": None})
-                finish = "tool_calls"
-            else:                                 # no parsable call: the text goes out as content
-                send({"index": 0, "delta": {"content": tc["tail"]}, "finish_reason": None})
+        text, ids, st, finish = self.eng.generate(prompt, max_new, on_text, stop, want_ids or tr is not None, ign, sampling, imgs,
+                                                  chat and self.eng.dialect.special_pieces)
+        if chat and ps.close():
+            finish = "tool_calls"
         self._summary(st, finish)
         self._trace(tr, chat, text, ids, st, finish, think_open, tools, max_new)
         if finish == "error":                    # headers are out: the error goes as an SSE event
@@ -874,7 +765,7 @@ def supervise(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--model", required=True, help="target GGUF (Qwen3.8-27B Q8_0 with the nextn block)")
+    ap.add_argument("--model", required=True, help="target GGUF (a supported architecture: docs/adding-a-model.md)")
     ap.add_argument("--lib", default=os.path.join(REPO, "build/bin/libquartz.so"))
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8090)
