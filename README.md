@@ -1,8 +1,8 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.svg">
-  <img src="docs/images/logo-light.svg" alt="gfx906-quartz" width="560">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/brand/logo-dark.svg">
+  <img src="docs/images/brand/logo-light.svg" alt="gfx906-quartz" width="560">
 </picture>
 
 <h3>An inference engine for AMD MI50 GPUs</h3>
@@ -28,7 +28,7 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 ## Models
 
 <details open>
-<summary><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/qwen3.8-27b-dark.svg"><img src="docs/images/qwen3.8-27b-light.svg" alt="Qwen3.8-27B · any version · Q8_0" height="25" align="middle"></picture></summary>
+<summary><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/models/qwen3.8-27b-dark.svg"><img src="docs/images/models/qwen3.8-27b-light.svg" alt="Qwen3.8-27B · any version · Q8_0" height="25" align="middle"></picture></summary>
 
 <br>
 
@@ -46,8 +46,8 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 | **Vision** | Image input through the vision projector |
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/qwen3.8-27b-bench-dark.svg">
-  <img src="docs/images/qwen3.8-27b-bench-light.svg" alt="Qwen3.8-27B Q8_0 on 2x MI50: prefill, decode by text type and perplexity against llama.cpp" width="880">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench/qwen3.8-27b-dark.svg">
+  <img src="docs/images/bench/qwen3.8-27b-light.svg" alt="Qwen3.8-27B Q8_0 on 2x MI50: prefill, decode by text type and perplexity against llama.cpp" width="880">
 </picture>
 
 <details>
@@ -93,7 +93,7 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 <br>
 
 <details>
-<summary><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/inkling-2-mini-dark.svg"><img src="docs/images/inkling-2-mini-light.svg" alt="Inkling 2 Mini" height="25" align="middle"></picture></summary>
+<summary><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/models/inkling-2-mini-dark.svg"><img src="docs/images/models/inkling-2-mini-light.svg" alt="Inkling 2 Mini" height="25" align="middle"></picture></summary>
 
 <br>
 
@@ -112,8 +112,8 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 | **Vision** | Image input at the image's own resolution, up to 4096 tokens |
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/inkling-2-mini-bench-dark.svg">
-  <img src="docs/images/inkling-2-mini-bench-light.svg" alt="Inkling-2-Mini Q8_0 on 2x MI50: prefill, decode by text type in the three modes, and VRAM per card at full context" width="880">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench/inkling-2-mini-dark.svg">
+  <img src="docs/images/bench/inkling-2-mini-light.svg" alt="Inkling-2-Mini Q8_0 on 2x MI50: prefill, decode by text type in the three modes, and VRAM per card at full context" width="880">
 </picture>
 
 <details>
