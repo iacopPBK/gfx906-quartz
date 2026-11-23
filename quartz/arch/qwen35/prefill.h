@@ -707,6 +707,15 @@ struct qz_prefill {
             // in the shared scratch the buffers hold the decode's partials: zero them, as
             // fresh buffers were (rows past n are padding the kernels never mix in)
             if (c[i].scr) CHECK(hipMemsetAsync(e.C[i].scr, 0, c[i].scr, K.st));
+            CHECK(hipEventRecord(c[i].ev, K.st));
+        }
+        for (int i = 0; i < 2; i++) {
+            qz_card & K = e.C[i];
+            CHECK(hipSetDevice(qz_dev_of(i)));
+            // the first row-parallel partial goes straight into the peer's scratch: only
+            // after the peer zeroed it (the peer may still be busy, e.g. with the last
+            // chunk's snapshot copies; its memset then wiped this card's partial)
+            CHECK(hipStreamWaitEvent(K.st, c[1 - i].ev, 0));
             CHECK(hipMemcpyAsync(c[i].tok, toks, (size_t) n * 4, hipMemcpyHostToDevice, K.st));
             if (mm) { mm_stage(e, mm, p0, n, i); CHECK(hipSetDevice(qz_dev_of(i))); }   // after the scratch memset
             hipLaunchKernelGGL(pf_embed, dim3(Mp), dim3(256), 0, K.st, c[i].tok, K.A.emb_vals, K.A.emb_scal, c[i].x, n, Mp,
