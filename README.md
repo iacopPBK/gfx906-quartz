@@ -5,7 +5,7 @@
   <img src="docs/images/brand/logo-light.svg" alt="gfx906-quartz" width="560">
 </picture>
 
-<h3>An inference engine for AMD MI50 GPUs</h3>
+<h3>built for AMD MI50 GPUs</h3>
 
 <p>
 <a href="#models">MODELS</a> &nbsp;·&nbsp;
@@ -178,3 +178,7 @@ endpoints and request fields.
 - [Server](docs/server.md): endpoints, request fields, responses, traces
 - [Testing](docs/testing.md): checking a change
 - [Adding a model](docs/adding-a-model.md): the per-architecture layout
+
+## Credits
+
+Credits to the gfx906 discord server community and to the mothership [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
