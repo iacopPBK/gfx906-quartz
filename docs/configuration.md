@@ -41,7 +41,7 @@ The server sets
 | `QZ_DSPINE` | unset | Draft GGUF path; the server sets it from `--dspine` |
 | `QZ_NO_SWITCH` | unset | Set to `1` to keep the draft model for the whole answer. By default, with `--dspine`, Qwen switches between DSpine and MTP mid-answer on acceptance, and Inkling between DSpark rounds and one token per step on measured speed |
 | `QZ_SW_LO`, `QZ_SW_HI`, `QZ_SW_WIN` | Qwen: `3.8`, `3.4`, `128` | Leave DSpine below, leave MTP at or above this many tokens per round; window averaged. Each on its drafter's own scale, so `lo > hi` is intended |
-| `QZ_SW_LO`, `QZ_SW_WIN` | Inkling: `2.7`, `32` | The window (tokens) over which DSpark rounds are timed against the plain step; `lo` is the tokens per round to leave below while the plain step has not been timed yet |
+| `QZ_SW_LO`, `QZ_SW_WIN` | Inkling: `2.7`, `16` | The window (tokens) over which DSpark rounds are timed against the plain step; `lo` is the tokens per round to leave below while the plain step has not been timed yet |
 | `QZ_IMG_MIN_TOKENS`, `QZ_IMG_MAX_TOKENS` | `8`, `4096` | Fewest and most tokens an image resizes to; each token takes a context row |
 
 ## Log

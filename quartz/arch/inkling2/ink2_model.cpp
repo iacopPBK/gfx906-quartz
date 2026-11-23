@@ -123,18 +123,20 @@ struct ink2_ctx : qz_ctx {
         int32_t anc = 0;
         // the drafter switch (as qwen35's; QZ_NO_SWITCH=1: off): the speculative rounds' rate
         // over a window of the last sw_win tokens (wall time per loop iteration) against the
-        // plain step's rate; below it decode goes plain, then back to the rounds after
-        // SW_PROBE tokens (doubled while the rounds fail again within 4 windows, up to 2048).
+        // plain step's rate; below SW_MARGIN of it decode goes plain, then back to the rounds
+        // after SW_PROBE tokens (doubled while the rounds fail again within 4 windows, up to SW_CAP).
         // The plain step is timed by a few plain steps whenever no timing is within 2048
         // positions (kept across requests); without one, the window's tok / round against
         // sw_lo. Both paths give the same tokens and the plain path fills the drafter's
         // context, so a switch costs nothing.
         static const bool sw_on = [] { const char * v = getenv("QZ_NO_SWITCH"); return !(v && *v && strcmp(v, "0") != 0); }();
         static const float sw_lo = getenv("QZ_SW_LO") ? (float) atof(getenv("QZ_SW_LO")) : 2.7f;
-        static const int sw_win = getenv("QZ_SW_WIN") ? atoi(getenv("QZ_SW_WIN")) : 32;
+        static const int sw_win = getenv("QZ_SW_WIN") ? atoi(getenv("QZ_SW_WIN")) : 16;
         static double step_ms = 0.0;                            // the plain step's time (EMA) at step_pos
         static int step_pos = -(1 << 30);
-        constexpr int SW_MEAS = 6, SW_REMEAS = 2048, SW_PROBE = 256;
+        // tuned 2026-11-23 on 16 sampled prompts (code, structured, prose, mixed; 400 / 800 tokens)
+        constexpr int SW_MEAS = 6, SW_REMEAS = 2048, SW_PROBE = 64, SW_CAP = 2048;
+        constexpr double SW_MARGIN = 0.85;                      // plain only below 85% of the plain rate
         bool spec = true, meas = false;
         int plain_left = 0, probe = SW_PROBE, seg = 0, nsw = 0, ntok_plain = 0;
         std::deque<std::pair<int, double>> wq;                  // (tokens, ms) per round in the window
@@ -150,9 +152,9 @@ struct ink2_ctx : qz_ctx {
                     while (wtok - wq.front().first >= sw_win) { wtok -= wq.front().first; wms -= wq.front().second; wq.pop_front(); }
                     if (seg >= sw_win) {
                         const double tpr = (double) wtok / (double) wq.size();
-                        const bool slow = step_ms > 0 ? wtok / wms < 1.0 / step_ms : tpr < sw_lo;
+                        const bool slow = step_ms > 0 ? wtok / wms < SW_MARGIN / step_ms : tpr < sw_lo;
                         if (slow) {
-                            probe = nsw && seg < 4 * sw_win ? std::min(2 * probe, 2048) : SW_PROBE;
+                            probe = nsw && seg < 4 * sw_win ? std::min(2 * probe, SW_CAP) : SW_PROBE;
                             plain_left = probe; spec = false; meas = false; nsw++;
                         }
                     }

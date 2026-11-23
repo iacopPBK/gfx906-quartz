@@ -121,18 +121,18 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 
 | Decode, 400 tokens | Plain | DSpark | SWITCH |
 |:---|---:|---:|---:|
-| C code | 105.2 tok/s | 78.0 tok/s | 98.6 tok/s |
-| Python code | 105.1 tok/s | 158.2 tok/s | 110.9 tok/s |
-| Prose | 105.4 tok/s | 52.6 tok/s | 87.6 tok/s |
-| Explanation | 105.4 tok/s | 73.1 tok/s | 97.4 tok/s |
-| JSON | 105.1 tok/s | 152.4 tok/s | 112.6 tok/s |
+| C code | 105.2 tok/s | 78.0 tok/s | 101.4 tok/s |
+| Python code | 105.1 tok/s | 158.2 tok/s | 146.2 tok/s |
+| Prose | 105.4 tok/s | 52.6 tok/s | 91.5 tok/s |
+| Explanation | 105.4 tok/s | 73.1 tok/s | 99.5 tok/s |
+| JSON | 105.1 tok/s | 152.4 tok/s | 138.5 tok/s |
 
 | Mixed answers, 800 tokens | Plain | DSpark | SWITCH |
 |:---|---:|---:|---:|
-| Code → prose | 103.9 tok/s | 80.2 tok/s | 107.0 tok/s |
-| JSON → prose | 104.1 tok/s | 91.9 tok/s | 133.9 tok/s |
-| Prose → code | 104.0 tok/s | 71.4 tok/s | 95.9 tok/s |
-| Code → prose → code | 104.1 tok/s | 98.4 tok/s | 139.2 tok/s |
+| Code → prose | 103.9 tok/s | 80.2 tok/s | 113.6 tok/s |
+| JSON → prose | 104.1 tok/s | 91.9 tok/s | 129.5 tok/s |
+| Prose → code | 104.0 tok/s | 71.4 tok/s | 109.8 tok/s |
+| Code → prose → code | 104.1 tok/s | 98.4 tok/s | 110.3 tok/s |
 
 | VRAM per card, `--max-ctx 262144` | card 0 | card 1 |
 |:---|---:|---:|
