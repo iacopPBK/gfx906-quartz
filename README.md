@@ -195,3 +195,4 @@ Run `python3 quartz/server/quartz_server.py --help` for every option; the
 - [Architecture](docs/architecture.md): how a request becomes tokens on two cards
 - [Server](docs/server.md): endpoints, request fields, responses, traces
 - [Testing](docs/testing.md): checking a change, how the benchmarks were measured
+- [Adding a model](docs/adding-a-model.md): the per-architecture layout and the steps for a new one

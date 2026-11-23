@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -29,6 +30,7 @@ struct qz_dev_tensor {
     bool shared = false;           // not loaded: the caller points vals/scal at another owner's copy
     void * scal = nullptr;         // Q8_0: scale plane
     int64_t src_ne0 = 0, src_ne1 = 1;   // file dims (differ from ne0/ne1 when sliced)
+    int64_t ne[GGML_MAX_DIMS] = {0, 1, 1, 1};   // the file's dims, ggml order (ne[0] fastest)
     qz_slice slice;                // TP2 card slice; empty = whole tensor
     int64_t bytes() const {
         if (type == GGML_TYPE_Q8_0) return (vstride ? vstride : ne0) * ne1 + ne0 / 16 * ne1;
@@ -56,4 +58,8 @@ public:
     // the tensor table and need_bytes only, nothing allocated (load() runs it first)
     bool plan(const qz_gguf & g, int card = -1);
     int64_t find(const char * name) const;   // index into ts, -1 if absent
+    const qz_dev_tensor * get(const char * name) const { const int64_t i = find(name); return i < 0 ? nullptr : &ts[i]; }
+    // the file dims of `name` are exactly `dims` (ggml order, trailing 1s implied);
+    // false (with a message) when it is absent or shaped otherwise
+    bool shape(const char * name, std::initializer_list<int64_t> dims) const;
 };

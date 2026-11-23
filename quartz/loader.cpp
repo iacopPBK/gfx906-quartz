@@ -24,6 +24,7 @@ bool qz_loader::plan(const qz_gguf & g, int card) {
         ts[t].name = gguf_get_tensor_name(g.ctx, t);
         ts[t].type = gguf_get_tensor_type(g.ctx, t);
         const int64_t * ne = gguf_get_tensor_ne(g.ctx, t);
+        for (int d = 0; d < GGML_MAX_DIMS; d++) ts[t].ne[d] = ne[d] > 0 ? ne[d] : 1;
         ts[t].ne0 = ne[0];
         ts[t].ne1 = 1;                      // rows: every dim past ne0 (4-D conv kernels too)
         for (int d = 1; d < GGML_MAX_DIMS; d++) ts[t].ne1 *= ne[d] > 0 ? ne[d] : 1;
@@ -218,4 +219,20 @@ int64_t qz_loader::find(const char * name) const {
     for (size_t i = 0; i < ts.size(); i++)
         if (ts[i].name == name) return (int64_t) i;
     return -1;
+}
+
+bool qz_loader::shape(const char * name, std::initializer_list<int64_t> dims) const {
+    const qz_dev_tensor * t = get(name);
+    if (!t) { fprintf(stderr, "qz_loader: missing tensor %s\n", name); return false; }
+    int d = 0;
+    bool ok = dims.size() <= GGML_MAX_DIMS;
+    for (int64_t n : dims) if (d < GGML_MAX_DIMS && t->ne[d++] != n) ok = false;
+    for (; d < GGML_MAX_DIMS; d++) if (t->ne[d] != 1) ok = false;
+    if (!ok) {
+        fprintf(stderr, "qz_loader: %s is [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "], expected [", name, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+        d = 0;
+        for (int64_t n : dims) fprintf(stderr, "%s%" PRId64, d++ ? ", " : "", n);
+        fprintf(stderr, "]\n");
+    }
+    return ok;
 }
