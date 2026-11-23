@@ -71,7 +71,7 @@ __global__ void __launch_bounds__(512) mv_phase_a(qz_trunk_args A, const int * t
                 if (blockIdx.x == 0) xin[(size_t) t * QZ_D + i] = x;
             }
         }
-        qz_norm_requant_slice(xn, W->attn_norm, ss, A.eps, A.nq_vals + (size_t) t * QZ_D,
+        qz_norm_requant_slice<QZ_D>(xn, W->attn_norm, ss, A.eps, A.nq_vals + (size_t) t * QZ_D,
                               A.nq_scal + (size_t) t * n_u, red, tid);
     }
 }
@@ -97,7 +97,7 @@ __global__ void __launch_bounds__(512) mv_phase_g(qz_trunk_args A, int il) {
             xn[i] = xr[k];
             ss = fmaf(xr[k], xr[k], ss);
         }
-        qz_norm_requant_slice(xn, W->post_norm, ss, A.eps, A.nq_vals + (size_t) t * QZ_D,
+        qz_norm_requant_slice<QZ_D>(xn, W->post_norm, ss, A.eps, A.nq_vals + (size_t) t * QZ_D,
                               A.nq_scal + (size_t) t * n_u, red, tid);
     }
 }

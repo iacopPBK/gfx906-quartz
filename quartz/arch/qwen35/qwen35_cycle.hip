@@ -158,246 +158,12 @@ template <int T, int CAP = QZ_TMAX, int TR = QZ_TMAX> __device__ __forceinline__
     __syncthreads();
 }
 
-// T-row GEMV core: acc[t][s] = row r0+s (clamped to N-1) . activation row t,
-// in lane 0; buffer loads for T <= QZ_GEMV_BUF_TMAX (bit-identical either way)
-#ifndef QZ_GEMV_BUF_TMAX
-#define QZ_GEMV_BUF_TMAX 3
-#endif
-#define QZ_GEMV_INL __forceinline__
-template <int T, int S> __device__ QZ_GEMV_INL void qz_gemv_core(
-        const unsigned char * a_vals, const float * a_scal, int lda, int lsa, int n_u,
-        const char * w_vals, const __half * w_scal, int ldw, int lsw, int N, int r0, int lane, float (&acc)[T][S]) {
-    #pragma unroll
-    for (int t = 0; t < T; t++)
-        #pragma unroll
-        for (int s = 0; s < S; s++) acc[t][s] = 0.f;
-    auto compute = [&](int u, const qz_v4u (&w0)[S], const qz_v4u (&w1)[S], const float (&sw)[S]) {
-        #pragma unroll
-        for (int t = 0; t < T; t++) {
-            const uint4 a0 = *(const uint4 *)(a_vals + (size_t) t * lda + u * 32);
-            const uint4 a1 = *(const uint4 *)(a_vals + (size_t) t * lda + u * 32 + 16);
-            const float sa = a_scal[(size_t) t * lsa + u];
-            #pragma unroll
-            for (int s = 0; s < S; s++) {
-                int d = 0;
-                DOT4(d, w0[s].x, a0.x);
-                DOT4(d, w0[s].y, a0.y);
-                DOT4(d, w0[s].z, a0.z);
-                DOT4(d, w0[s].w, a0.w);
-                DOT4(d, w1[s].x, a1.x);
-                DOT4(d, w1[s].y, a1.y);
-                DOT4(d, w1[s].z, a1.z);
-                DOT4(d, w1[s].w, a1.w);
-                acc[t][s] += (float) d * sw[s] * sa;
-            }
-        }
-    };
-    if constexpr (T > QZ_GEMV_BUF_TMAX) {
-        for (int u = lane; u < n_u; u += 64) {
-            qz_v4u w0[S], w1[S];
-            float sw[S];
-            #pragma unroll
-            for (int s = 0; s < S; s++) {
-                const int r = min(r0 + s, N - 1);
-                const qz_gu4 * wr = (const qz_gu4 *)(w_vals + (size_t) r * ldw + u * 32);
-                w0[s] = wr[0];
-                w1[s] = wr[1];
-                sw[s] = __half2float(__ushort_as_half(((const qz_gh *) w_scal)[(size_t) r * lsw + u]));
-            }
-            compute(u, w0, w1, sw);
-        }
-    } else {
-        const int rb = __builtin_amdgcn_readfirstlane(r0);      // wave-uniform: descriptors in SGPRs
-        __amdgpu_buffer_rsrc_t rv[S], rs[S];
-        #pragma unroll
-        for (int s = 0; s < S; s++) {
-            const int r = min(rb + s, N - 1);
-            rv[s] = __builtin_amdgcn_make_buffer_rsrc((void *)(w_vals + (size_t) r * ldw), (short) 0, n_u * 32, 0x00027000);
-            rs[s] = __builtin_amdgcn_make_buffer_rsrc((void *)(w_scal + (size_t) r * lsw), (short) 0, n_u * 2, 0x00027000);
-        }
-        for (int u = lane; u < n_u; u += 64) {
-            qz_v4u w0[S], w1[S];
-            float sw[S];
-            #pragma unroll
-            for (int s = 0; s < S; s++) {
-                w0[s] = __builtin_bit_cast(qz_v4u, __builtin_amdgcn_raw_buffer_load_b128(rv[s], u * 32, 0, 0));
-                w1[s] = __builtin_bit_cast(qz_v4u, __builtin_amdgcn_raw_buffer_load_b128(rv[s], u * 32 + 16, 0, 0));
-                sw[s] = __half2float(__ushort_as_half(__builtin_amdgcn_raw_buffer_load_b16(rs[s], u * 2, 0, 0)));
-            }
-            compute(u, w0, w1, sw);
-        }
-    }
-    #pragma unroll
-    for (int t = 0; t < T; t++)
-        #pragma unroll
-        for (int s = 0; s < S; s++)
-            #pragma unroll
-            for (int off = 32; off > 0; off >>= 1) acc[t][s] += __shfl_down(acc[t][s], off, 64);
-}
+#include "kernels/gemv.h"
+#include "kernels/xchg.h"
 
-template <int T, int S> __device__ __forceinline__ void qz_gemv_rows_t(
-        const unsigned char * a_vals, const float * a_scal, int K,
-        const char * w_vals, const __half * w_scal, int N, int r0, int lane, float (&acc)[T][S]) {
-    qz_gemv_core<T, S>(a_vals, a_scal, K, K / 32, K / 32, w_vals, w_scal, K, K / 32, N, r0, lane, acc);
-}
-
-// T-row phase GEMV, y is [T][N]; off rotates the slab walk
-template <int T> __device__ __forceinline__ void qz_gemv_slice_t(
-        const unsigned char * a_vals, const float * a_scal, int K,
-        const char * w_vals, const __half * w_scal, int N, float * y, int off = 0) {
-    const int wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
-    const int S = 4;
-    int g0 = (int) blockIdx.x - off;
-    if (g0 < 0) g0 += gridDim.x;
-    for (int g = g0; g * (8 * S) < N; g += gridDim.x) {
-        const int r0 = g * (8 * S) + wave * S;
-        float acc[T][S];
-        qz_gemv_rows_t<T, S>(a_vals, a_scal, K, w_vals, w_scal, N, r0, lane, acc);
-        if (lane == 0)
-            #pragma unroll
-            for (int t = 0; t < T; t++)
-                #pragma unroll
-                for (int s = 0; s < S; s++)
-                    if (r0 + s < N) y[(size_t) t * N + r0 + s] = acc[t][s];
-    }
-}
-
-// qz_gemv_rows_t over n_uh units of a K slice (pointers at the slice start)
-template <int T, int S> __device__ __forceinline__ void qz_gemv_rows_tk(
-        const unsigned char * a_vals, const float * a_scal, int lda, int n_uh,
-        const char * w_vals, const __half * w_scal, int ldw, int N, int r0, int lane, float (&acc)[T][S]) {
-    qz_gemv_core<T, S>(a_vals, a_scal, lda, lda / 32, n_uh, w_vals, w_scal, ldw, ldw / 32, N, r0, lane, acc);
-}
-
-// ---- TP2 exchange ----------------------------------------------
-// push partials to the peer inbox (slot tok & 1), wait for its flag, y = p0 + p1
-#define QZ_XSPIN 2000000000ll     // clock64 ticks before a wait gives up
-
-__device__ __forceinline__ void qz_xflag(const qz_trunk_args & A, unsigned int tok) {
-    __threadfence_system();
-    __hip_atomic_store(A.xflag_peer, tok, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-}
-
-// per-block exchange flags: block b only needs the peer's block b push (slot 0
-// doubles as the head-merge flag)
-__device__ __forceinline__ void qz_xflag_b(const qz_trunk_args & A, unsigned int tok, int b) {
-    __threadfence_system();
-    __hip_atomic_store(A.xflag_peer + b, tok, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-}
-__device__ __forceinline__ void qz_xwait_b(const qz_trunk_args & A, unsigned int tok, int b) {
-    const long long t0 = clock64();
-    for (;;) {
-        const unsigned int v = __hip_atomic_load(A.xflag_mine + b, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
-        if ((int) (v - tok) >= 0) return;
-        if (__hip_atomic_load(&A.xerr[1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) return;
-        if (clock64() - t0 > QZ_XSPIN) {
-            if (atomicCAS(&A.xerr[1], 0, 1) == 0) { A.xerr[2] = 1; A.xerr[3] = (int) tok; A.xerr[4] = (int) v; }
-            return;
-        }
-    }
-}
-
-// one thread: wait for the peer's flag >= tok. Past the spin limit, or once
-// any wait gave up, set the abort word and return so the launch drains.
-__device__ __forceinline__ void qz_xwait(const qz_trunk_args & A, unsigned int tok) {
-    const long long t0 = clock64();
-    for (;;) {
-        const unsigned int v = __hip_atomic_load(A.xflag_mine, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
-        if ((int) (v - tok) >= 0) return;
-        if (__hip_atomic_load(&A.xerr[1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) return;
-        if (clock64() - t0 > QZ_XSPIN) {
-            if (atomicCAS(&A.xerr[1], 0, 1) == 0) { A.xerr[2] = 1; A.xerr[3] = (int) tok; A.xerr[4] = (int) v; }
-            return;
-        }
-    }
-}
-
-// row-parallel GEMV over the card's K slice: the block's slabs stage in LDS and
-// push after the loop (one fence); activations optionally staged in LDS region 0
+// TP2 exchange staging: slabs per block (grid >= 40) x rows x 32 floats
 #define QZ_XSLAB 4                                   // slabs per block, grid >= 40
 #define QZ_XSTAGE_BYTES (QZ_XSLAB * QZ_TMAX * 32 * 4)
-// CX: the exchange buffers' row capacity (QZ_TMAX, or MV_T for the verify);
-// LX: LDS activation staging (off for the verify: it does not fit)
-template <int T, int CX = QZ_TMAX, bool LX = T <= 4> __device__ __forceinline__ void qz_gemv_xpush_t(
-        const unsigned char * a_vals, const float * a_scal, int K,
-        const char * w_vals, const __half * w_scal, const qz_trunk_args & A, unsigned int tok, float * stage,
-        unsigned char * lds0) {
-    const int wave = threadIdx.x >> 6, lane = threadIdx.x & 63, tid = threadIdx.x;
-    const int S = 4;
-    const int par = tok & 1;
-    if constexpr (LX) {
-        unsigned char * lv = lds0;
-        float * ls = (float *)(lds0 + (size_t) T * K);
-        __syncthreads();
-        for (int i = tid; i < T * K / 16; i += blockDim.x) ((uint4 *) lv)[i] = ((const uint4 *) a_vals)[i];
-        for (int i = tid; i < T * (K / 32); i += blockDim.x) ls[i] = a_scal[i];
-        __syncthreads();
-        a_vals = lv;
-        a_scal = ls;
-    } else {
-        (void) lds0;
-    }
-    float * dst = A.xin_peer + (size_t) par * CX * QZ_D;
-    int ns = 0;
-    for (int g = blockIdx.x; g * 32 < QZ_D; g += gridDim.x, ns++) {
-        const int r0 = g * 32 + wave * S;
-        float acc[T][S];
-        qz_gemv_rows_tk<T, S>(a_vals, a_scal, K, K / 32, w_vals, w_scal, K, QZ_D, r0, lane, acc);
-        if (lane == 0)
-            #pragma unroll
-            for (int t = 0; t < T; t++)
-                #pragma unroll
-                for (int s = 0; s < S; s++) stage[(ns * T + t) * 32 + wave * S + s] = acc[t][s];
-    }
-    __syncthreads();
-    for (int i = tid; i < ns * 8 * T; i += blockDim.x) {
-        const int k = i / (8 * T), t = (i >> 3) % T, q = i & 7;
-        const int g = blockIdx.x + k * gridDim.x;
-        const float4 v = *(const float4 *)(stage + (k * T + t) * 32 + q * 4);
-        const size_t o = (size_t) t * QZ_D + g * 32 + q * 4;
-        *(float4 *)(A.y_part + o) = v;
-        *(float4 *)(dst + o) = v;
-    }
-    __threadfence_system();
-}
-
-// after qz_gemv_xpush_t: flag the peer, wait for its flag, y = p0 + p1 over this
-// block's slabs; BX = false drops the trailing grid barrier (standalone launch)
-template <int T, int CX = QZ_TMAX, bool BX = true> __device__ __forceinline__ void qz_xfinish_t(
-        qz_barrier_state * bst, int & kb, const qz_trunk_args & A, unsigned int tok, float * y) {
-    const int tid = threadIdx.x;
-    const int par = tok & 1;
-    __syncthreads();                 // every thread's remote stores are fenced (push)
-    if (tid == 0) { qz_xflag_b(A, tok, blockIdx.x); qz_xwait_b(A, tok, blockIdx.x); }
-    __syncthreads();
-    const float * src = A.xin_mine + (size_t) par * CX * QZ_D;
-    for (int g = blockIdx.x; g * 32 < QZ_D; g += gridDim.x) {
-        if (tid < 32 * T) {
-            const int t = tid >> 5, i = tid & 31;
-            const size_t o = (size_t) t * QZ_D + g * 32 + i;
-            const float own = __builtin_nontemporal_load(A.y_part + o);
-            const float peer = __builtin_nontemporal_load(src + o);
-            y[o] = A.tp_card == 0 ? __fadd_rn(own, peer) : __fadd_rn(peer, own);
-        }
-    }
-    if constexpr (BX) qz_grid_barrier(bst, ++kb);
-}
-
-// one row-parallel phase with its exchange: gemv + push, then flag, wait
-// and combine
-template <int T, int CX = QZ_TMAX, bool LX = T <= 4, bool BX = true> __device__ __forceinline__ void qz_xrow_t(
-        qz_barrier_state * bst, int & kb, const qz_trunk_args & A, unsigned int tok,
-        const unsigned char * a_vals, const float * a_scal, int K,
-        const char * w_vals, const __half * w_scal, float * stage, float * y, unsigned char * lds0) {
-    qz_gemv_xpush_t<T, CX, LX>(a_vals, a_scal, K, w_vals, w_scal, A, tok, stage, lds0);
-    // BX forwarded: a standalone launch has no barrier state
-    qz_xfinish_t<T, CX, BX>(bst, kb, A, tok, y);
-}
-
-// head merge: larger value wins, ties to the lower token id
-__device__ __forceinline__ int qz_xpick(float ov, int oi, float pv, int pi) {
-    return (pv > ov || (pv == ov && pi < oi)) ? pi : oi;
-}
 
 // T-row qkv GEMV + conv1d + silu: the window commits the previous cycle's
 // n_rep rows, then the T new rows run without committing
@@ -551,45 +317,7 @@ __device__ __forceinline__ void qz_norm_requant_row(
     __syncthreads();
 }
 
-// qz_norm_requant_row split across the grid: every block reduces the full row,
-// then requants only its own units into gq / gs (bit-equal)
-__device__ __forceinline__ void qz_norm_requant_slice(
-        const float * xn, const float * nw, float ss, float eps,
-        unsigned char * gq, float * gs, float * red, int tid) {
-    #pragma unroll
-    for (int off = 32; off > 0; off >>= 1) ss += __shfl_down(ss, off, 64);
-    const int wave = tid >> 6, lane = tid & 63;
-    if (lane == 0) red[wave] = ss;
-    __syncthreads();
-    if (tid == 0) {
-        float ms = 0.f;
-        for (int w = 0; w < 8; w++) ms += red[w];
-        red[8] = 1.f / sqrtf(ms / QZ_D + eps);
-    }
-    __syncthreads();
-    const float rs = red[8];
-    const int u = blockIdx.x + gridDim.x * (tid >> 5), l = tid & 31;
-    if (u < QZ_D / 32) {             // whole half-waves: the 32-lane amax stays in one unit
-        const int i = u * 32 + l;
-        const float x = xn[i] * rs * nw[i];
-        const float amax = qz_amax32(fabsf(x));
-        const float d = amax / 127.f;
-        const float id = d != 0.f ? 1.f / d : 0.f;
-        int q = (int) roundf(x * id);
-        if (q > 127) q = 127; else if (q < -127) q = -127;
-        gq[i] = (unsigned char) q;
-        if (l == 0) gs[u] = __half2float(__float2half(d));
-    }
-    __syncthreads();                 // xn / red are reused by the next row
-}
-
-// after the grid barrier: the T published plane rows into this block's LDS
-template <int T> __device__ __forceinline__ void qz_planes_to_lds(
-        const unsigned char * gq, const float * gs, unsigned char * act_vals, float * act_scales, int tid) {
-    for (int i = tid; i < T * QZ_D / 16; i += 512) ((uint4 *) act_vals)[i] = ((const uint4 *) gq)[i];
-    for (int i = tid; i < T * (QZ_D / 32); i += 512) act_scales[i] = gs[i];
-    __syncthreads();
-}
+#include "kernels/rowops.h"
 
 // q (or k) head row: f16 staging in aq, per-head rms norm, rope at position
 // pos on dims (j, j+32), j < 32; rope'd row stays in aq
@@ -781,7 +509,7 @@ __device__ __forceinline__ void qz_mtp_pass(
 
     // attn_output GEMV, then h = inpSA + core out (block 0 keeps the row),
     // post norm planes
-    qz_xrow_t<T>(bst, kb, A, ++xs, A.pl_vals, A.pl_scal, Gm::G, W->out_vals, W->out_scal, fslot + T * 64, A.y_core, (unsigned char *) lds_raw);
+    qz_xrow_t<T, QZ_TMAX>(bst, kb, A, ++xs, A.pl_vals, A.pl_scal, Gm::G, W->out_vals, W->out_scal, fslot + T * 64, A.y_core, (unsigned char *) lds_raw);
     #pragma unroll
     for (int k = 0; k < QZ_D / 512; k++) nwr[k] = W->post_norm[tid + 512 * k];
     #pragma unroll
@@ -802,7 +530,7 @@ __device__ __forceinline__ void qz_mtp_pass(
     qz_gemv_ffn_fused_t<T>(act_vals, act_scales, QZ_D, W->fg_vals, W->fg_scal, W->fu_vals, W->fu_scal,
                            Gm::FF, A.ffn_q, A.ffn_sc, fslot);
     qz_grid_barrier(bst, ++kb);
-    qz_xrow_t<T>(bst, kb, A, ++xs, A.ffn_q, A.ffn_sc, Gm::FF, W->fd_vals, W->fd_scal, fslot + T * 64, A.y_ffn, (unsigned char *) lds_raw);
+    qz_xrow_t<T, QZ_TMAX>(bst, kb, A, ++xs, A.ffn_q, A.ffn_sc, Gm::FF, W->fd_vals, W->fd_scal, fslot + T * 64, A.y_ffn, (unsigned char *) lds_raw);
 
     // head input: out = h + ffn out, shared_head_norm; the normed row is the
     // next draft step's hidden (block 0 keeps it in mtp_h)
@@ -948,11 +676,11 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
                     if (blockIdx.x == 0) xin[(size_t) t * QZ_D + i] = x;
                 }
             }
-            qz_norm_requant_slice(xn, W->attn_norm, ss, A.eps, A.nq_vals + (size_t) t * QZ_D,
+            qz_norm_requant_slice<QZ_D>(xn, W->attn_norm, ss, A.eps, A.nq_vals + (size_t) t * QZ_D,
                                   A.nq_scal + (size_t) t * n_u, red, tid);
         }
         qz_grid_barrier(bst, ++kb);
-        qz_planes_to_lds<T>(A.nq_vals, A.nq_scal, act_vals, act_scales, tid);
+        qz_planes_to_lds<T, QZ_D>(A.nq_vals, A.nq_scal, act_vals, act_scales, tid);
 
         // phase B: core projections over T rows
         if (W->recr) {
@@ -1021,7 +749,7 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
         }
 
         // phase F: core-out GEMV off the gmem planes
-        qz_xrow_t<T>(bst, kb, A, ++xs, A.pl_vals, A.pl_scal, Gm::G, W->out_vals, W->out_scal, fslot + T * 64, A.y_core, (unsigned char *) lds_raw);
+        qz_xrow_t<T, QZ_TMAX>(bst, kb, A, ++xs, A.pl_vals, A.pl_scal, Gm::G, W->out_vals, W->out_scal, fslot + T * 64, A.y_core, (unsigned char *) lds_raw);
 
         // phase G: per row, h = x + core out -> post norm -> requant as phase A;
         // T <= 3 prefetches the next row's y_core (slower at T = 4)
@@ -1050,11 +778,11 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
                 xn[tid + 512 * k] = xr[k];
                 ss = fmaf(xr[k], xr[k], ss);   // as the rolled loop's v_fmac
             }
-            qz_norm_requant_slice(xn, W->post_norm, ss, A.eps, A.nq_vals + (size_t) t * QZ_D,
+            qz_norm_requant_slice<QZ_D>(xn, W->post_norm, ss, A.eps, A.nq_vals + (size_t) t * QZ_D,
                                   A.nq_scal + (size_t) t * n_u, red, tid);
         }
         qz_grid_barrier(bst, ++kb);
-        qz_planes_to_lds<T>(A.nq_vals, A.nq_scal, act_vals, act_scales, tid);
+        qz_planes_to_lds<T, QZ_D>(A.nq_vals, A.nq_scal, act_vals, act_scales, tid);
 
         // phase H/I: fused gate/up + silu*up + requant, T rows
         qz_gemv_ffn_fused_t<T>(act_vals, act_scales, QZ_D, W->fg_vals, W->fg_scal, W->fu_vals, W->fu_scal,
@@ -1066,7 +794,7 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
             xin[i] = xin[i] + A.y_core[i];
 
         // phase J: ffn down GEMV
-        qz_xrow_t<T>(bst, kb, A, ++xs, A.ffn_q, A.ffn_sc, Gm::FF, W->fd_vals, W->fd_scal, fslot + T * 64, A.y_ffn, (unsigned char *) lds_raw);
+        qz_xrow_t<T, QZ_TMAX>(bst, kb, A, ++xs, A.ffn_q, A.ffn_sc, Gm::FF, W->fd_vals, W->fd_scal, fslot + T * 64, A.y_ffn, (unsigned char *) lds_raw);
     }
 
     // head: per row, x_out = h + ffn out -> out_norm -> planes; lm_head GEMV
