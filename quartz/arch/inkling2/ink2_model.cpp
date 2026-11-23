@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <deque>
 
 namespace ink2 {
 
@@ -117,15 +118,63 @@ struct ink2_ctx : qz_ctx {
         // not fit) this is one step per token, as before.
         bool anchor = false;
         int32_t anc = 0;
+        // the drafter switch (as qwen35's; QZ_NO_SWITCH=1: off): the speculative rounds' rate
+        // over a window of the last sw_win tokens (wall time per loop iteration) against the
+        // plain step's rate; below it decode goes plain, then back to the rounds after
+        // SW_PROBE tokens (doubled while the rounds fail again within 4 windows, up to 2048).
+        // The plain step is timed by a few plain steps whenever no timing is within 2048
+        // positions (kept across requests); without one, the window's tok / round against
+        // sw_lo. Both paths give the same tokens and the plain path fills the drafter's
+        // context, so a switch costs nothing.
+        static const bool sw_on = [] { const char * v = getenv("QZ_NO_SWITCH"); return !(v && *v && strcmp(v, "0") != 0); }();
+        static const float sw_lo = getenv("QZ_SW_LO") ? (float) atof(getenv("QZ_SW_LO")) : 2.7f;
+        static const int sw_win = getenv("QZ_SW_WIN") ? atoi(getenv("QZ_SW_WIN")) : 32;
+        static double step_ms = 0.0;                            // the plain step's time (EMA) at step_pos
+        static int step_pos = -(1 << 30);
+        constexpr int SW_MEAS = 6, SW_REMEAS = 2048, SW_PROBE = 256;
+        bool spec = true, meas = false;
+        int plain_left = 0, probe = SW_PROBE, seg = 0, nsw = 0, ntok_plain = 0;
+        std::deque<std::pair<int, double>> wq;                  // (tokens, ms) per round in the window
+        int wtok = 0; double wms = 0.0;
+        int last_kind = 0, last_n = 0;                          // the previous iteration: 1 plain, 2 a round of last_n tokens
+        auto tlast = clk::now();
         while (st.n_gen < max_new) {
+            if (sw_on && dsr && last_kind) {                    // the previous iteration's wall time
+                const double ms = std::chrono::duration<double, std::milli>(clk::now() - tlast).count();
+                if (last_kind == 1) { step_ms = step_ms > 0 ? 0.8 * step_ms + 0.2 * ms : ms; step_pos = pos; }
+                else {
+                    wq.push_back({last_n, ms}); wtok += last_n; wms += ms; seg += last_n;
+                    while (wtok - wq.front().first >= sw_win) { wtok -= wq.front().first; wms -= wq.front().second; wq.pop_front(); }
+                    if (seg >= sw_win) {
+                        const double tpr = (double) wtok / (double) wq.size();
+                        const bool slow = step_ms > 0 ? wtok / wms < 1.0 / step_ms : tpr < sw_lo;
+                        if (slow) {
+                            probe = nsw && seg < 4 * sw_win ? std::min(2 * probe, 2048) : SW_PROBE;
+                            plain_left = probe; spec = false; meas = false; nsw++;
+                        }
+                    }
+                }
+            }
+            if (sw_on && dsr && spec && std::abs(pos - step_pos) > SW_REMEAS && pos + VR <= E.ctx) {
+                spec = false; meas = true; plain_left = SW_MEAS;    // time the plain step here
+            }
+            tlast = clk::now();
+            last_kind = 0;
             if (!anchor) anc = pick();
             anchor = false;
             if (emit(anc)) break;
-            if (!dsr || pos + VR > E.ctx) {
+            if (!dsr || pos + VR > E.ctx || !spec) {
                 hi = std::max(hi, pos);
                 E.step(anc, pos++, true);
                 if (ds_on) DS.fill(DS.tap, 4 * D, pos - 1, 1);
                 st.decode_cycles++;
+                if (dsr && !spec) {
+                    last_kind = 1; ntok_plain++;
+                    if (--plain_left <= 0) {                    // back to the rounds (after a timing: the same window)
+                        if (!meas) { seg = 0; wq.clear(); wtok = 0; wms = 0.0; nsw++; }
+                        spec = true; meas = false;
+                    }
+                }
                 continue;
             }
             DS.draft(anc, pos, dr);
@@ -148,10 +197,13 @@ struct ink2_ctx : qz_ctx {
             pos += n + 1;
             anc = g[n];
             anchor = true;
+            last_kind = 2; last_n = n + 1;
         }
         if (dsr && DS.rounds > r0)
             fprintf(stderr, "dspark: %ld rounds, %.2f tok/rnd (%.2f drafts accepted of %d)\n", DS.rounds - r0,
                     (double) (DS.accepted - a0 + DS.rounds - r0) / (DS.rounds - r0), (double) (DS.accepted - a0) / (DS.rounds - r0), DS_BS - 1);
+        if (dsr && sw_on && ntok_plain)
+            fprintf(stderr, "switch: %d, %d tokens plain (%.2f ms/step)\n", nsw, ntok_plain, step_ms);
         st.decode_tok = st.decode_cycles;
         st.decode_ms = std::chrono::duration<double, std::milli>(clk::now() - t1).count();
         return fin(0);

@@ -25,13 +25,12 @@ constexpr int VR = 8;
 struct vtok { int t[VR]; float tau[VR]; };        // per row: the token, its tau (host tau_at)
 
 // The verify arguments: the decode args (tab -> the VR-row table, cpart -> VR
-// groups, GU / aq3 / ... as row-0 pointers) plus the row-replicated buffers.
+// groups, aq3 / hq / ... as row-0 pointers) plus the row-replicated buffers.
 struct vargs {
     cyc_args A;
     int rs, rsf;                          // the activation row stride: bytes, floats
     float * uh;                           // [NAPP][VR][CHL]: each row's conv input
     float * LOGV;                         // [VR][nvalid]: the head logits per row
-    int * gcnt;                           // VR * (NE_USED * FFL / 32) quant group counters
     float * vtap;                         // card 0: the rows' [4][D] drafter features, else null
     float * hist;                         // the histories' base (the table's hist pointers are the slot's)
     float * ws;                           // the attention waves' states (v_attn_a / v_attn_b)
@@ -318,9 +317,11 @@ template <int T, int S, int RS = 0> VR_NI void v_core_acc(
 }
 
 
-// one activation (gate row j, up row j + 32) of an expert's quant group, all VR rows:
-// the weights of the next activation are loaded while this one computes (wbuf).
-// Lane L sums its unit L, then the tail unit 64 + L (L < D / 32 - 64) as v_core_acc
+// a K = D row pair for all VR rows (v_core_acc's values): v_wload issues the pair's
+// weights (the caller loads the next pair while v_wdot computes this one), lane L
+// sums its unit L, the 8 tail units 64 .. 71 run one row per 8 lanes and go back to
+// lanes 0 .. 7 by shuffles (d * sw and sa apart: the owner lane fuses the add as the
+// plain walk does); v_wdot returns v_tsum's value (row, s) = lane >> 2
 struct v_wbuf { qz_v4u w0[2], w1[2], t0[2], t1[2]; float sw[2], tw[2]; };
 VR_NI void v_wload(v_wbuf & b, const char * wv, const __half * ws, size_t row0, size_t row1, int lane) {
     constexpr int NU = D / 32;
@@ -477,18 +478,17 @@ VR_NI int v_slot(const int * sids, int r, int e) {
     for (int q = 0; q < NE_USED; q++) k = sids[r * NE_USED + q] == e ? q : k;
     return k;
 }
-// gate | up + SITU + quant over the distinct experts: task (u, activation pair) runs
-// c_up_situ_w's 4-row GEMV for all VR rows at once (the expert's weights read once;
-// qz_gemv_core's per-row value does not depend on T) and stores the rows that picked
-// it: SITU into the row's GU at its slot, the 32-group count and quant per row
+// gate | up + SITU + quant over the distinct experts (c_up_situ_w's values for every
+// row that picked the expert): a wave owns an (expert, 32-activation quant group) and
+// walks its 32 (gate, up) row pairs for all VR rows at once (the weights read once,
+// the next pair's in flight), the SITU values in the wave's LDS tile, then the wave
+// quantizes the group of each row that picked the expert into its slot
 VR_NI void v_up_dd(const char * wv, const __half * ws, const int * sids, const vdist & dd,
                    const unsigned char * av0, const float * as0, float beta, float lb,
-                   float * sv0, int * gcnt0, unsigned char * hq0, float * hs0, int tid, int rs, int rsf) {
+                   unsigned char * hq0, float * hs0, int tid, int rs, int rsf) {
     asm volatile ("" : "+v"(tid));
-    constexpr int NT = FFL / UP_A;                    // tasks per expert
-    av0 = gp(av0); as0 = gp(as0); sv0 = gp(sv0); gcnt0 = gp(gcnt0); hq0 = gp(hq0); hs0 = gp(hs0);
+    av0 = gp(av0); as0 = gp(as0); hq0 = gp(hq0); hs0 = gp(hs0);
     const int wave = tid >> 6, lane = tid & 63, nw = gridDim.x * 8;
-    const int ntask = dd.nd * NT;
     // the VR activation rows (int8 + scales) in the dynamic LDS: every task reads them
     unsigned char * la = (unsigned char *) cyc_lds;                       // [VR][D]
     float * ls = cyc_lds + VR * D / 4;                                     // [VR][D / 32]
@@ -502,8 +502,6 @@ VR_NI void v_up_dd(const char * wv, const __half * ws, const int * sids, const v
         ls[i] = as0[(size_t) r * rsf + c];
     }
     __syncthreads();
-    // a wave owns an expert's 32-activation quant group (UP_TG tasks): the SITU values of
-    // the rows that picked it gather in the wave's LDS tile, then the wave quantizes them
     float * lq = ls + VR * D / 32 + wave * VR * 32;                        // [VR][32] per wave
     constexpr int NG = FFL / 32;
     #pragma unroll 1
@@ -523,7 +521,8 @@ VR_NI void v_up_dd(const char * wv, const __half * ws, const int * sids, const v
             v_wload(B, wv, ws, r0 + a + 1, r0 + a + 33, lane);
             float val = v_wdot(A, la, ls, lane, acc), upv = __shfl_down(val, 4, 64);
             if (wl) lq[vr * 32 + a] = situ_v(val, upv, beta, lb);
-            v_wload(A, wv, ws, r0 + min(a + 2, 31), r0 + min(a + 2, 31) + 32, lane);          // (the last one unused)
+            // unconditional (the last one unused): a conditional reload here miscompiled (NaN)
+            v_wload(A, wv, ws, r0 + min(a + 2, 31), r0 + min(a + 2, 31) + 32, lane);
             val = v_wdot(B, la, ls, lane, acc); upv = __shfl_down(val, 4, 64);
             if (wl) lq[vr * 32 + a + 1] = situ_v(val, upv, beta, lb);
         }
@@ -547,9 +546,10 @@ VR_NI void v_up_dd(const char * wv, const __half * ws, const int * sids, const v
     }
 }
 // the down rows over the distinct experts: c_moe_down_q's quads and per-(row, slot)
-// values (lanes 0..31 / 32..63 two experts, the unit products, shfl_down 16..1), each
-// expert's 4 weight rows loaded once for all the rows that picked it; then per row
-// the same k-order fold of wk * acc. lacc: [VR][MD_Q][NE_USED][4] (the dynamic LDS)
+// values (4 experts per wave, 16 lanes each; see the task loop), each expert's 4
+// weight rows loaded once for the rows that picked it (its own row list), the rows'
+// SITU activations staged in LDS; then per row the same k-order fold of wk * acc.
+// LDS: lacc [VR][MD_Q][NE_USED][4], then the activations (VER_LDS)
 constexpr int VER_LDS = (VR * MD_Q * NE_USED * 4) * 4 + VR * NE_USED * FFL + VR * NE_USED * (FFL / 32) * 4;
 static_assert(VER_LDS >= CYC_LDS, "verify's dynamic LDS covers the decode's");
 VR_NI void v_down_dd(const char * wv, const __half * ws, const int * sids, const float * swts, const vdist & dd,
@@ -687,43 +687,6 @@ template <int S> VR_NI void v_gemv(CK gjobs * J, int hb, int rs, int rsf, float 
         }
     }
 }
-// c_pick_rank for the VR rows at once (row r's router scores at H0 + r rsf): the same
-// ranks, ids and weight sums per row, the 1024 (row, candidate) pairs 2 per thread
-VR_NI void v_pick_all(const float * H0, int rsf, float scale, int * sids, float * swts, int tid) {
-    static_assert(VR * NE == 2 * 512, "two candidates per thread");
-    float (*lv)[NE] = (float (*)[NE]) cyc_lds;                       // the dynamic LDS (the mix states are dead here)
-    float (*lp)[NE_USED] = (float (*)[NE_USED]) (cyc_lds + VR * NE);
-    asm volatile ("" : "+v"(tid));
-    H0 = gp(H0);
-    float p[2];
-    #pragma unroll
-    for (int m = 0; m < 2; m++) {
-        const int i = tid + 512 * m, r = i / NE, c = i % NE;
-        lv[r][c] = H0[(size_t) r * rsf + NE + c];
-        p[m] = H0[(size_t) r * rsf + c];
-    }
-    __syncthreads();
-    #pragma unroll
-    for (int m = 0; m < 2; m++) {
-        const int i = tid + 512 * m, r = i / NE, c = i % NE;
-        const float v = lv[r][c];
-        int rk = 0;
-        #pragma unroll 16
-        for (int j = 0; j < NE; j++) { const float o = lv[r][j]; rk += (o > v) | ((o == v) & (j < c)); }
-        if (rk < NE_USED) { sids[r * NE_USED + rk] = c; lp[r][rk] = p[m]; }
-    }
-    __syncthreads();
-    if (tid < VR * NE_USED) {
-        const int r = tid / NE_USED, k = tid % NE_USED;
-        float sum = 0.f;
-        #pragma unroll
-        for (int q = 0; q < NE_USED; q++) sum += lp[r][q];
-        sum += 1e-20f;
-        swts[tid] = lp[r][k] / sum * scale;
-    }
-    __syncthreads();
-}
-
 // c_ctrl_down_all over the VR rows: each (job, row pair) loads its weights once and
 // runs the decode's per-row sums for every row in turn (row t: cur / msg / g + t rsf)
 template <int NJ> VR_NI void v_ctrl_down(CK cjob * cj, int rsf, int tid) {
@@ -993,6 +956,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
     const int tr = chain ? cr : 0;
     unsigned int xs = *Vp->A.xseq;
     int vai = 0;
+    // VTS(j): block 0's own clock as phase j (no barrier: the in-phase marks pick / distinct / up)
     // the embedding: chain group r's leader block, then the group's sync
     if (chain && cw == 0)
         d_embed(Vp->A.ev, Vp->A.es, tv.t[tr], Vp->A.embd_norm, Vp->A.eps,
@@ -1100,7 +1064,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
             ((float *) ((char *) Av.WTS + (size_t) r * rs))[k] = swts[tid];
         }
         v_distinct(sids, dd, tid);
-        v_up_dd(e0->guv, e0->gus, sids, dd, Av.aq3, Av.as3, Av.beta, Av.lb, Av.GU, Vq->gcnt, Av.hq, Av.hs, tid, rs, rsf);
+        v_up_dd(e0->guv, e0->gus, sids, dd, Av.aq3, Av.as3, Av.beta, Av.lb, Av.hq, Av.hs, tid, rs, rsf);
         cyc_barrier(vbst, ++kb);
         ++xs;
         v_down_dd(e0->dnv, e0->dns, sids, swts, dd, Av.hq, Av.hs, Av.PART1, Av.xin_peer + 2 * D + (size_t) (xs & 1) * VR * D,

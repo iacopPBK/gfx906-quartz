@@ -901,7 +901,6 @@ struct ink2_pf {
     }
 
     bool alloc(int c) {
-        ink2_engine & E = *this->E;
         ICHECK(hipSetDevice(qz_dev_of(c)));
         qz_mem_scope mem("state");
         pf_card & b = B[c];

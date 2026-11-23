@@ -645,7 +645,6 @@ CYC_NI void c_moe_down_q(const char * wv, const __half * ws, const int * sids, c
 __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_args * Ag, int tok, int pos, float tau, int head) {
     __shared__ int sids[NE_USED];
     __shared__ float swts[NE_USED];
-    __shared__ float tl[64];
     __shared__ float mdl[MD_Q * NE_USED * 4];
     const int tid_k = threadIdx.x, nb = gridDim.x;
     const bool b0 = blockIdx.x == 0;

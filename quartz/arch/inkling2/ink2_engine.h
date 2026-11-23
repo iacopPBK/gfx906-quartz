@@ -203,9 +203,9 @@ struct ink2_engine {
         ICHECK(hipEventCreateWithFlags(&K.ev, hipEventDisableTiming));
         ICHECK(K.x.alloc(VR + 1, D));              // the verify rows' inbox past the decode's 2 D
         K.apsz = (size_t) HKVL * ATT_SPL * GQ * ATT_PW;
-        ICHECK(qz_dmalloc(&K.apart, VR * K.apsz * sizeof(float), "state"));
-        ICHECK(qz_dmalloc(&K.acnt, VR * HKVL * sizeof(int), "state"));
-        ICHECK(hipMemset(K.acnt, 0, VR * HKVL * sizeof(int)));
+        ICHECK(qz_dmalloc(&K.apart, K.apsz * sizeof(float), "state"));   // the decode's (verify: vws)
+        ICHECK(qz_dmalloc(&K.acnt, HKVL * sizeof(int), "state"));
+        ICHECK(hipMemset(K.acnt, 0, HKVL * sizeof(int)));
         ICHECK(qz_dmalloc((void **) &K.bst, CYC_NBX * sizeof(unsigned int), "state"));
         ICHECK(qz_dmalloc((void **) &K.vbst, (CYC_NBMAX + VR * CG) * sizeof(unsigned int), "state"));
         ICHECK(hipMemset(K.vbst, 0, (CYC_NBMAX + VR * CG) * sizeof(unsigned int)));
@@ -229,8 +229,8 @@ struct ink2_engine {
         A.ev = K.embd.v; A.es = K.embd.s; A.embd_norm = K.embd_norm; A.eps = hp.eps;
         A.X = K.X; A.P = K.P; A.PART0 = K.PART[0]; A.PART1 = K.PART[1];
         A.F = K.F; A.FN = K.FN; A.H = K.H; A.IDS = K.IDS; A.WTS = K.WTS; A.aq3 = K.aq[3]; A.as3 = K.as[3]; A.hq = K.hq; A.hs = K.hs; A.GU = K.LOG;
-        ICHECK(qz_dmalloc(&A.gcnt, VR * NE_USED * FFL / 32 * sizeof(int), "state"));
-        ICHECK(hipMemset(A.gcnt, 0, VR * NE_USED * FFL / 32 * sizeof(int)));
+        ICHECK(qz_dmalloc(&A.gcnt, NE_USED * FFL / 32 * sizeof(int), "state"));
+        ICHECK(hipMemset(A.gcnt, 0, NE_USED * FFL / 32 * sizeof(int)));
         ICHECK(qz_dmalloc((void **) &A.cpart, VR * CP_SZ * sizeof(float), "state"));
         A.route_scale = hp.route_scale; A.beta = hp.situ_beta; A.lb = hp.situ_lin_beta;
         A.xin_mine = K.x.xin; A.xflag_mine = K.x.xflag; A.xseq = K.x.xseq; A.xerr = K.x.xerr;
@@ -452,7 +452,7 @@ struct ink2_engine {
         for (int i = 0; i < J.n; i++) { J.j[i].av = shp(J.j[i].av, o); J.j[i].as = shp(J.j[i].as, o); J.j[i].y = shp(J.j[i].y, o); }
     }
     // row r's entry: activations + r * rs; weights, the KV caches and the histories stay
-    void shift_appk(appk & e, int r, size_t o, size_t ao, size_t co) {
+    void shift_appk(appk & e, int r, size_t o) {
         e.pre_out = shp(e.pre_out, o);
         sh_sptrs(e.mres, o); e.res_out = shp(e.res_out, o);
         sh_sptrs(e.mmsg, o); e.msg_out = shp(e.msg_out, o);
@@ -465,7 +465,6 @@ struct ink2_engine {
         h.q = shp(h.q, o); h.tb = shp(h.tb, o);
         attn_args & t = e.at;
         t.q = shp(t.q, o); t.tb = shp(t.tb, o); t.gate = shp(t.gate, o); t.oq = shp(t.oq, o); t.os = shp(t.os, o);
-        t.part = shp(t.part, ao); t.cnt = shp(t.cnt, co);
         e.blk = shp(e.blk, o);
         sh_sptrs(e.mff, o);
         sh_cjob(e.cb.j[0], o);
@@ -478,13 +477,13 @@ struct ink2_engine {
         vplanned = true;
         for (int c = 0; c < 2; c++) {
             const int napp = C[c].ca.napp;                 // the table rows follow the (possibly truncated) count
-            const size_t o = C[c].rs, ao = C[c].apsz * sizeof(float), co = HKVL * sizeof(int);
+            const size_t o = C[c].rs;
             vtab[c].resize((size_t) VR * napp);
             for (int r = 0; r < VR; r++)
                 for (int a = 0; a < napp; a++) {
                     appk & e = vtab[c][(size_t) r * napp + a];
                     e = tab[c][a];
-                    shift_appk(e, r, (size_t) r * o, (size_t) r * ao, (size_t) r * co);
+                    shift_appk(e, r, (size_t) r * o);
                 }
             ICHECK(hipSetDevice(qz_dev_of(c)));
             const size_t bytes = vtab[c].size() * sizeof(appk);
@@ -495,7 +494,7 @@ struct ink2_engine {
             V.A = C[c].ca;
             V.A.tab = vtab_d[c];
             V.rs = (int) C[c].rs; V.rsf = (int) (C[c].rs / 4);
-            V.uh = C[c].uh; V.LOGV = C[c].LOGV; V.gcnt = C[c].ca.gcnt;
+            V.uh = C[c].uh; V.LOGV = C[c].LOGV;
             V.vtap = c == 0 ? vtap : nullptr;
             V.hist = C[c].hist;
             if (!C[c].vws) ICHECK(qz_dmalloc((void **) &C[c].vws, VR * VWS * sizeof(float), "state"));

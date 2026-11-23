@@ -107,10 +107,10 @@ static __global__ __launch_bounds__(256) void k_ds_swiglu_quant(float * g, const
         quant32(v, q + (size_t) blockIdx.y * K, qs + (size_t) blockIdx.y * (K / 32), i);
     }
 }
-// T-row Q8_0 GEMV, y = [T][N], with the activation planes staged in LDS: the same
-// per-lane walk (u = lane, lane + 64, ...), the same 4 rows per wave and the same wave
-// sum as qz_gemv_slice_t, so the results are bit-identical; only the weights stream
-// from HBM then (S = 4 rows per wave, one 32-value unit per lane)
+// T-row Q8_0 GEMV, y = [T][N], with the activation planes staged in LDS: 4 rows per
+// wave, qz_gemv_slice_t's per-row values (ink2_verify's v_core_acc: the same per-lane
+// walk, the units past 64 spread over the wave) and wave sums (v_tsum: the butterfly's
+// pairs for all T x 4 values at once, T padded to 8), so the results are bit-identical
 template <int T, int NT = DS_NT>
 static __global__ __launch_bounds__(NT) void k_ds_gemv(const unsigned char * aq, const float * as, int K,
                                                        const char * wv, const __half * ws, int N, float * y) {
@@ -123,8 +123,6 @@ static __global__ __launch_bounds__(NT) void k_ds_gemv(const unsigned char * aq,
     for (int i = tid; i < T * n_u; i += NT) ls[i] = as[i];
     __syncthreads();
     const int S = 4;
-    // the per-row values as before (ink2_verify's v_core_acc: the same walk, the units past
-    // 64 spread over the wave), the wave sums by v_tsum (the butterfly's pairs, T padded to 8)
     constexpr int TP = T == 1 ? 1 : 8, NV = TP * 4;
     static_assert(T <= TP, "T <= 8");
     for (int g = blockIdx.x; g * (NT / 64 * S) < N; g += gridDim.x) {
@@ -135,17 +133,16 @@ static __global__ __launch_bounds__(NT) void k_ds_gemv(const unsigned char * aq,
         #pragma unroll
         for (int t = 0; t < TP; t++)
             #pragma unroll
-            for (int q = 0; q < 4; q++) fv[t * 4 + q] = t < T ? acc[t < T ? t : 0][q] : 0.f;
+            for (int q = 0; q < 4; q++) fv[t * 4 + q] = t < T ? acc[t < T ? t : 0][q] : 0.f;   // (the index kept in range)
         const float val = v_tsum<NV>(fv, lane);
         const int kv = v_tsum_k<NV>(lane), vt = kv / 4, vs = kv % 4;
         if ((lane & (64 / NV - 1)) == 0 && vt < T && r0 + vs < N) y[(size_t) vt * N + r0 + vs] = val;
     }
 }
 // the same walk for a K too wide to stage (the FFN down projection, T = 8, K = 9216):
-// 512-thread blocks of qz_gemv_slice_t, activations read from HBM / L2
+// activations read from HBM / L2, 4 waves x 2 rows per block (N / 8 blocks, enough to
+// fill the 60 CUs; the per-row value does not depend on the rows per wave)
 template <int T>
-// (4 waves x 2 rows per block: N / 8 blocks, enough to fill the 60 CUs; the per-row value
-// does not depend on the rows per wave)
 static __global__ __launch_bounds__(256) void k_ds_gemv_wide(const unsigned char * aq, const float * as, int K,
                                                             const char * wv, const __half * ws, int N, float * y) {
     const int wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
@@ -165,7 +162,7 @@ static __global__ __launch_bounds__(256) void k_ds_gemv_wide(const unsigned char
 static __global__ __launch_bounds__(128) void k_ds_hnorm_rope(float * xq, const float * wq, int nq, float * xk, const float * wk,
                                                               int nk, int pos0, float eps) {
     __shared__ float red[4], s[HD];
-    const bool isq = blockIdx.x < nq;
+    const bool isq = (int) blockIdx.x < nq;
     float * x = isq ? xq : xk;
     const float * w = isq ? wq : wk;
     const int nh = isq ? nq : nk;
@@ -324,8 +321,9 @@ static __global__ __launch_bounds__(256) void k_ds_markov(const float * joint, f
 }
 // draft row logits over this card's head rows: base + fold . lat1; the argmax as a packed
 // (orderable value, ~id) max into best (ties: the lower id). WT: wait for lat1 first
-// (card 1). fold rows are nhp halves apart (128-byte aligned), walked in j order
-constexpr int DS_FE = 4;                // fold entries per thread
+// (card 1). fold rows are nhp halves apart (128-byte aligned), walked in j order;
+// DS_FE consecutive entries per thread (8-byte loads)
+constexpr int DS_FE = 4;
 template <bool WT>
 static __global__ __launch_bounds__(256) void k_ds_fold_argmax(const float * base, const __half * fold, int nhp, int nvalid,
                                                                const float * lat1, int id0, unsigned long long * best,
@@ -337,7 +335,7 @@ static __global__ __launch_bounds__(256) void k_ds_fold_argmax(const float * bas
     }
     for (int j = threadIdx.x; j <= DS_R; j += 256) sl[j] = lat1[j];
     __syncthreads();
-    // DS_FE consecutive entries per thread (8-byte loads), each entry's sum in j order
+    // each entry's sum in j order
     const int v0 = (blockIdx.x * 256 + threadIdx.x) * DS_FE;
     unsigned long long key = 0;
     if (v0 < nvalid) {
