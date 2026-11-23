@@ -98,7 +98,8 @@ template <class T> __device__ __forceinline__ T * gp(T * p) {
 #else
 #define CK const
 #endif
-constexpr int CYC_LDS = 6 * D * 4;           // dynamic LDS: the mix states
+constexpr int CYC_LDS = 6 * D * 4;           // dynamic LDS: the mix states (attention partials between mixes)
+static_assert(ATT_LDS <= CYC_LDS, "attention scratch fits the dynamic LDS");
 extern __shared__ float cyc_lds[];
 #define CYC_NI __device__ __forceinline__
 template <int MQ> CYC_NI void c_mix(CK sptrs * S, const float * q, float * o, int tid) {
@@ -498,7 +499,7 @@ CYC_NI void c_attn(CK attn_args * e, int pos, int v, int tid) {
     t.q = gp(t.q); t.tb = gp(t.tb); t.gate = gp(t.gate); t.kc = gp(t.kc); t.vc = gp(t.vc); t.oq = gp(t.oq); t.os = gp(t.os);
     t.part = gp(t.part); t.cnt = gp(t.cnt);
     t.pos = pos;
-    d_attn(t, v / ATT_SPL, v % ATT_SPL, tid);
+    d_attn(t, v / ATT_SPL, v % ATT_SPL, tid, cyc_lds);   // the mix states are dead here
 }
 CYC_NI void c_xconv_b0(const float * own, const float * peer, const float * w, float * hs, float * x, float * blk, int tid) {
     d_xconv_blk<512>(gp(own), gp(peer), gp(w), gp(hs), gp(x), blk ? gp(blk) : nullptr, tid);
@@ -705,7 +706,7 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
         BAR();
         for (int v = blockIdx.x; v < HQL + 2 * HKVL; v += nb) c_head_post(&e->hp, pos, tau, v, tid);
         BAR();
-        for (int v = blockIdx.x; v < HQL * ATT_SPL; v += nb) c_attn(&e->at, pos, v, tid);
+        for (int v = blockIdx.x; v < HKVL * ATT_SPL; v += nb) c_attn(&e->at, pos, v, tid);
         BAR();
         ++xs;
         for (int v = blockIdx.x; v < 2 * e->ngo; v += nb) c_gemv2(&e->go, v, A.xin_peer + (size_t) (xs & 1) * D);

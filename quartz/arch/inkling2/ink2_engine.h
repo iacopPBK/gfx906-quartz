@@ -181,9 +181,9 @@ struct ink2_engine {
         K.hist = (float *) nx_();
         ICHECK(hipEventCreateWithFlags(&K.ev, hipEventDisableTiming));
         ICHECK(K.x.alloc(1, D));
-        ICHECK(qz_dmalloc(&K.apart, (size_t) HQL * ATT_NW * ATT_PW * sizeof(float), "state"));
-        ICHECK(qz_dmalloc(&K.acnt, HQL * sizeof(int), "state"));
-        ICHECK(hipMemset(K.acnt, 0, HQL * sizeof(int)));
+        ICHECK(qz_dmalloc(&K.apart, (size_t) HKVL * ATT_SPL * GQ * ATT_PW * sizeof(float), "state"));
+        ICHECK(qz_dmalloc(&K.acnt, HKVL * sizeof(int), "state"));
+        ICHECK(hipMemset(K.acnt, 0, HKVL * sizeof(int)));
         ICHECK(qz_dmalloc((void **) &K.bst, CYC_NBX * sizeof(unsigned int), "state"));
         ICHECK(hipDeviceGetAttribute(&K.ncu, hipDeviceAttributeMultiprocessorCount, qz_dev_of(c)));
         if (K.ncu > CYC_NBMAX) K.ncu = CYC_NBMAX;      // the barrier's flag lanes
