@@ -100,16 +100,16 @@
 <rect x="172" y="782" width="520.0" height="16" rx="3" fill="#21262d"/>
 <rect x="172.0" y="782" width="215.3" height="16" fill="#3b82f6"/>
 <rect x="387.3" y="782" width="89.4" height="16" fill="#1e40af"/>
-<rect x="476.7" y="782" width="56.1" height="16" fill="#8b5cf6"/>
-<rect x="532.8" y="782" width="7.6" height="16" fill="#6e7681"/>
-<text x="700.0" y="794" font-size="12" fill="#e6edf3">24.3 <tspan fill="#8b949e">/ 34.3 GB</tspan></text>
+<rect x="476.7" y="782" width="28.8" height="16" fill="#8b5cf6"/>
+<rect x="505.5" y="782" width="6.1" height="16" fill="#6e7681"/>
+<text x="700.0" y="794" font-size="12" fill="#e6edf3">22.4 <tspan fill="#8b949e">/ 34.3 GB</tspan></text>
 <text x="30" y="818" font-size="12" fill="#e6edf3">DSpark, card 1</text>
 <rect x="172" y="806" width="520.0" height="16" rx="3" fill="#21262d"/>
 <rect x="172.0" y="806" width="215.3" height="16" fill="#3b82f6"/>
 <rect x="387.3" y="806" width="89.4" height="16" fill="#1e40af"/>
-<rect x="476.7" y="806" width="1.5" height="16" fill="#8b5cf6"/>
-<rect x="478.2" y="806" width="6.1" height="16" fill="#6e7681"/>
-<text x="700.0" y="818" font-size="12" fill="#e6edf3">20.6 <tspan fill="#8b949e">/ 34.3 GB</tspan></text>
+<rect x="476.7" y="806" width="27.3" height="16" fill="#8b5cf6"/>
+<rect x="504.0" y="806" width="4.5" height="16" fill="#6e7681"/>
+<text x="700.0" y="818" font-size="12" fill="#e6edf3">22.2 <tspan fill="#8b949e">/ 34.3 GB</tspan></text>
 <text x="30" y="856" font-size="11" fill="#8b949e">2026-11-23. Decode: T 1.0, top-k 20, top-p 0.95, seed 7, thinking off, --max-ctx 262144.</text>
 <text x="30" y="874" font-size="11" fill="#8b949e">Same prompts as the Qwen3.8-27B chart. VRAM: the server's per-card ledger.</text>
 </svg>

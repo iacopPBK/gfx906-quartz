@@ -36,7 +36,7 @@ defaults and environment variables are in
   sliding-window rings take a fixed 0.7 GB. The DSpark drafter is split over
   both cards like the target; its context cache adds 6 KB per token per card
   (1.6 GB at 262144). At the default context the cards hold 20.6 GB each, and
-  about 2 GB more each with DSpark. The start-up check is in
+  with DSpark 22.4 GB on card 0 and 22.2 GB on card 1. The start-up check is in
   `arch/inkling2/ink2_preflight.h`.
 - **gfx906 only** (MI50, MI60). The kernels use gfx906 instructions and assume
   its 60 CUs and 64 KB of LDS; load aborts on a card where they do not fit.

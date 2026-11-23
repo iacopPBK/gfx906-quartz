@@ -137,7 +137,7 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 | VRAM per card, `--max-ctx 262144` | card 0 | card 1 |
 |:---|---:|---:|
 | Plain | 20.6 GB | 20.6 GB |
-| DSpark | 24.3 GB | 20.6 GB |
+| DSpark | 22.4 GB | 22.2 GB |
 
 <sub>Decode is sampled (T 1.0, top-k 20, top-p 0.95, seed 7), thinking off, the same prompts as Qwen3.8-27B's, one run each; the three modes give the same tokens. Measured 2026-11-23 at a 178 W power limit.</sub>
 
