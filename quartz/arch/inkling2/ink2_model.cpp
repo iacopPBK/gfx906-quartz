@@ -11,6 +11,7 @@ namespace ink2 {
 #include "ink2_hparams.h"
 #include "ink2_tp2.h"
 #include "ink2_kernels.h"
+#include "ink2_cycle.h"
 #include "ink2_engine.h"
 #include "ink2_pf.h"
 

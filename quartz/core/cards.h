@@ -48,14 +48,18 @@ struct qz_xbufs {
 };
 
 // after a sync: the card's exchange error words must be 0, else report and exit
-inline void qz_xerr_check(int card, const int * xerr, long long n_launch) {
-    int e[8];
-    if (hipMemcpy(e, xerr, sizeof(e), hipMemcpyDeviceToHost) != hipSuccess) { fprintf(stderr, "card %d: xerr read failed\n", card); exit(1); }
+// the error words already on the host (e: 8 ints)
+inline void qz_xerr_check_h(int card, const int * e, long long n_launch) {
     if (e[0] || e[1]) {
         fprintf(stderr, "exchange error card %d after launch %lld: chk mismatches %d (first tok %d slab %d row %d), "
                         "abort %d code %d tok %d seen %d\n", card, n_launch, e[0], e[5], e[6], e[7], e[1], e[2], e[3], e[4]);
         exit(1);
     }
+}
+inline void qz_xerr_check(int card, const int * xerr, long long n_launch) {
+    int e[8];
+    if (hipMemcpy(e, xerr, sizeof(e), hipMemcpyDeviceToHost) != hipSuccess) { fprintf(stderr, "card %d: xerr read failed\n", card); exit(1); }
+    qz_xerr_check_h(card, e, n_launch);
 }
 
 // a persistent kernel's grid must be resident at once (its grid barrier spins);

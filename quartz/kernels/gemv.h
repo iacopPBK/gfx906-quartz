@@ -10,7 +10,8 @@
 #define QZ_GEMV_BUF_TMAX 3
 #endif
 #define QZ_GEMV_INL __forceinline__
-template <int T, int S> __device__ QZ_GEMV_INL void qz_gemv_core(
+// RS > 0: rows r0 .. r0 + S/2 - 1 then r0 + RS .. r0 + RS + S/2 - 1 (two row groups)
+template <int T, int S, int RS = 0> __device__ QZ_GEMV_INL void qz_gemv_core(
         const unsigned char * a_vals, const float * a_scal, int lda, int lsa, int n_u,
         const char * w_vals, const __half * w_scal, int ldw, int lsw, int N, int r0, int lane, float (&acc)[T][S]) {
     #pragma unroll
@@ -44,7 +45,7 @@ template <int T, int S> __device__ QZ_GEMV_INL void qz_gemv_core(
             float sw[S];
             #pragma unroll
             for (int s = 0; s < S; s++) {
-                const int r = min(r0 + s, N - 1);
+                const int r = min(r0 + s + (RS && s >= S / 2 ? RS - S / 2 : 0), N - 1);
                 const qz_gu4 * wr = (const qz_gu4 *)(w_vals + (size_t) r * ldw + u * 32);
                 w0[s] = wr[0];
                 w1[s] = wr[1];
@@ -57,7 +58,7 @@ template <int T, int S> __device__ QZ_GEMV_INL void qz_gemv_core(
         __amdgpu_buffer_rsrc_t rv[S], rs[S];
         #pragma unroll
         for (int s = 0; s < S; s++) {
-            const int r = min(rb + s, N - 1);
+            const int r = min(rb + s + (RS && s >= S / 2 ? RS - S / 2 : 0), N - 1);
             rv[s] = __builtin_amdgcn_make_buffer_rsrc((void *)(w_vals + (size_t) r * ldw), (short) 0, n_u * 32, 0x00027000);
             rs[s] = __builtin_amdgcn_make_buffer_rsrc((void *)(w_scal + (size_t) r * lsw), (short) 0, n_u * 2, 0x00027000);
         }
@@ -77,14 +78,18 @@ template <int T, int S> __device__ QZ_GEMV_INL void qz_gemv_core(
     for (int t = 0; t < T; t++)
         #pragma unroll
         for (int s = 0; s < S; s++)
+#ifdef QZ_GEMV_WSUM
+            QZ_GEMV_WSUM(acc[t][s]);          // an arch's equivalent wave sum (lane 0 the same value)
+#else
             #pragma unroll
             for (int off = 32; off > 0; off >>= 1) acc[t][s] += __shfl_down(acc[t][s], off, 64);
+#endif
 }
 
-template <int T, int S> __device__ __forceinline__ void qz_gemv_rows_t(
+template <int T, int S, int RS = 0> __device__ __forceinline__ void qz_gemv_rows_t(
         const unsigned char * a_vals, const float * a_scal, int K,
         const char * w_vals, const __half * w_scal, int N, int r0, int lane, float (&acc)[T][S]) {
-    qz_gemv_core<T, S>(a_vals, a_scal, K, K / 32, K / 32, w_vals, w_scal, K, K / 32, N, r0, lane, acc);
+    qz_gemv_core<T, S, RS>(a_vals, a_scal, K, K / 32, K / 32, w_vals, w_scal, K, K / 32, N, r0, lane, acc);
 }
 
 // T-row phase GEMV, y is [T][N]; off rotates the slab walk

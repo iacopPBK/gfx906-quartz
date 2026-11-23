@@ -1,5 +1,6 @@
-// inkling2 engine: the forward pass of docs/inkling2.md as a host-issued
-// kernel sequence on both cards, one token per step. TP2: each card runs its
+// inkling2 engine: weights, buffers and the per-token tables of the forward
+// pass of docs/inkling2.md on both cards; decode runs in the persistent kernel
+// (ink2_cycle.h), one launch per card per token. TP2: each card runs its
 // q / kv heads and its half of every expert's FF; the attention output and
 // the expert down projection are summed across the cards (each reads the
 // peer's partial over P2P after a cross-stream event wait).
@@ -17,6 +18,7 @@ struct lw {
     const float * an = nullptr, * qn = nullptr, * kn = nullptr, * vn = nullptr, * resq = nullptr;
     const float * ffq, * ffn, * gin, * pb;
     const float * msgq = nullptr, * cd[NCTRL] = {}, * cg[NCTRL] = {}, * cf[NCTRL] = {};
+    const float * cgt[NCTRL] = {}, * cft[NCTRL] = {};          // cg / cf transposed (the cycle's ctrl_up)
 };
 
 struct ink2_card {
@@ -32,11 +34,18 @@ struct ink2_card {
     int * IDS;
     unsigned char * aq[4]; float * as[4];      // input planes: Q | K | V inputs, ffn / head input
     unsigned char * oq; float * os;           // attention output planes [QL]
+    float * apart = nullptr; int * acnt = nullptr;   // attention split partials / counters
     unsigned char * hq; float * hs;           // expert activation planes [NE_USED][FFL]
     float2 * tk;                              // head top-K [QZ_TOPK_NB][QZ_TOPK]
     __half * kc[NAPP], * vc[NAPP];            // per slot: full [ctx][KVL], SWA ring [WIN][KVL]
     float * hist;                             // [NAPP][3][CHL]
     int nvalid = 0, id0 = 0;                  // head rows that are real vocab ids, the first id
+    // persistent decode (ink2_cycle.h)
+    qz_xbufs x;                               // TP2 exchange buffers (core/cards.h)
+    unsigned int * bst = nullptr;      // the grid barrier flags (CYC_NBMAX)
+    int ncu = 0;
+    cyc_args ca{};                            // static args, uploaded to ca_d by plan_all
+    void * ca_d = nullptr;
 };
 
 struct ink2_engine {
@@ -45,6 +54,7 @@ struct ink2_engine {
     ink2_card C[2];
     int nx = 0;                               // exchanges issued (partial double-buffer parity)
     std::vector<float2> tkh[2];
+    float2 * tkp[2] = {nullptr, nullptr};     // pinned: the top-K, then the exchange error words (8 ints)
 
     // ---- setup
     static qw Qw(const qz_loader & ld, const char * n) {
@@ -97,6 +107,11 @@ struct ink2_engine {
                     snprintf(s, sizeof(s), "loop_%s_ctrl_down.weight", cn[j]);   L.cd[j] = Fw(ld, nm(il, s));
                     snprintf(s, sizeof(s), "loop_%s_ctrl_gain.weight", cn[j]);   L.cg[j] = Fw(ld, nm(il, s));
                     snprintf(s, sizeof(s), "loop_%s_ctrl_forget.weight", cn[j]); L.cf[j] = Fw(ld, nm(il, s));
+                    float * t = nullptr;
+                    ICHECK(qz_dmalloc(&t, 2 * (size_t) GRANK * D * sizeof(float), "weights"));
+                    k_ctrl_t<<<(D + 255) / 256, 256>>>(L.cg[j], t);
+                    k_ctrl_t<<<(D + 255) / 256, 256>>>(L.cf[j], t + (size_t) GRANK * D);
+                    L.cgt[j] = t; L.cft[j] = t + (size_t) GRANK * D;
                 }
             }
         }
@@ -165,7 +180,32 @@ struct ink2_engine {
         for (int s = 0; s < NAPP; s++) { K.kc[s] = (__half *) nx_(); K.vc[s] = (__half *) nx_(); }
         K.hist = (float *) nx_();
         ICHECK(hipEventCreateWithFlags(&K.ev, hipEventDisableTiming));
+        ICHECK(K.x.alloc(1, D));
+        ICHECK(qz_dmalloc(&K.apart, (size_t) HQL * ATT_NW * ATT_PW * sizeof(float), "state"));
+        ICHECK(qz_dmalloc(&K.acnt, HQL * sizeof(int), "state"));
+        ICHECK(hipMemset(K.acnt, 0, HQL * sizeof(int)));
+        ICHECK(qz_dmalloc((void **) &K.bst, CYC_NBX * sizeof(unsigned int), "state"));
+        ICHECK(hipDeviceGetAttribute(&K.ncu, hipDeviceAttributeMultiprocessorCount, qz_dev_of(c)));
+        if (K.ncu > CYC_NBMAX) K.ncu = CYC_NBMAX;      // the barrier's flag lanes
+        if (K.ncu < 2 * CG) { fprintf(stderr, "inkling2: card %d: %d CUs, the persistent decode needs %d\n", c, K.ncu, 2 * CG); return false; }
+        {
+            ICHECK(hipFuncSetAttribute((const void *) ink2_cycle, hipFuncAttributeMaxDynamicSharedMemorySize, CYC_LDS));
+            ICHECK(hipFuncSetAttribute((const void *) k_mix<1>, hipFuncAttributeMaxDynamicSharedMemorySize, MIX_LDS));
+            ICHECK(hipFuncSetAttribute((const void *) k_mix<3>, hipFuncAttributeMaxDynamicSharedMemorySize, MIX_LDS));
+            ICHECK(hipFuncSetAttribute((const void *) k_mix<4>, hipFuncAttributeMaxDynamicSharedMemorySize, MIX_LDS));
+            const qz_resident_kernel ks[] = {{(const void *) ink2_cycle, CYC_LDS, "ink2_cycle"}};
+            if (!qz_resident(qz_dev_of(c), ks, 1, K.ncu, 512)) return false;
+        }
+        cyc_args & A = K.ca;
+        A.ev = K.embd.v; A.es = K.embd.s; A.embd_norm = K.embd_norm; A.eps = hp.eps;
+        A.X = K.X; A.P = K.P; A.PART0 = K.PART[0]; A.PART1 = K.PART[1];
+        A.F = K.F; A.FN = K.FN; A.H = K.H; A.IDS = K.IDS; A.WTS = K.WTS; A.aq3 = K.aq[3]; A.as3 = K.as[3]; A.hq = K.hq; A.hs = K.hs; A.GU = K.LOG;
+        ICHECK(qz_dmalloc(&A.gcnt, NE_USED * FFL / 32 * sizeof(int), "state")); ICHECK(hipMemset(A.gcnt, 0, NE_USED * FFL / 32 * sizeof(int)));
+        ICHECK(qz_dmalloc((void **) &A.cpart, 2 * CP_SZ * sizeof(float), "state"));
+        A.route_scale = hp.route_scale; A.beta = hp.situ_beta; A.lb = hp.situ_lin_beta;
+        A.xin_mine = K.x.xin; A.xflag_mine = K.x.xflag; A.xseq = K.x.xseq; A.xerr = K.x.xerr;
         tkh[c].resize((size_t) QZ_TOPK_NB * QZ_TOPK);
+        ICHECK(hipHostMalloc((void **) &tkp[c], ((size_t) QZ_TOPK_NB * QZ_TOPK + 4) * sizeof(float2), 0));
         return true;
     }
     void reset() {   // a fresh sequence: zero conv history (KV rows are written before they are read)
@@ -189,7 +229,9 @@ struct ink2_engine {
         sptrs S{};
         for (const float * p : st) S.p[S.n++] = p;
         S.p[S.n++] = cur;
-        k_mix<<<1, 256, 0, C[c].st>>>(S, q, m, out);
+        if (m == 1) k_mix<1><<<1, 512, MIX_LDS, C[c].st>>>(S, q, out);
+        else if (m == 3) k_mix<3><<<1, 512, MIX_LDS, C[c].st>>>(S, q, out);
+        else k_mix<4><<<1, 512, MIX_LDS, C[c].st>>>(S, q, out);
     }
     // both cards' partials written: each waits for the other's, then reads it
     void exchange() {
@@ -197,143 +239,109 @@ struct ink2_engine {
         for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamWaitEvent(C[c].st, C[1 - c].ev, 0)); }
     }
 
-    // ---- one layer application at state slot `slot` of physical layer ip, for the token at pos
+    // ---- the token's 48 layer applications as a table (appk, ink2_cycle.h),
+    // built once per card; the persistent kernel walks it. Only pos / tau / the cache row vary per token.
     struct seq {           // the host-side lists of block buffers (per card the same indices)
         std::vector<int> blocks;      // indices into BLK
         int nblk = 0;                 // BLK buffers used
         int bank = -1;                // pass > 0: BLK index of the previous pass's layer-12 input; OUT parity
         int bank_out = -1;
     };
-    void layer(int slot, int ip, int pos, seq & S) {
-        const bool full = is_full(ip), msg = S.bank >= 0;
-        const float tau = full ? 1.f + hp.tau_alpha * logf(fmaxf(1.f, (float) (pos + 1) / (float) hp.tau_floor)) : 1.f;
-        const int buf = nx & 1;
-        const int push = ip % ARB == 0 ? S.nblk : -1;
-        for (int c = 0; c < 2; c++) {
-            ink2_card & K = C[c];
-            const lw & L = K.L[ip];
-            hipStream_t st = K.st;
-            ICHECK(hipSetDevice(qz_dev_of(c)));
-            std::vector<const float *> bl;
-            for (int b : S.blocks) bl.push_back(K.BLK[b]);
-            const float * in[3] = {K.X, K.X, K.X};
-            if (L.resq) {
-                mix(c, bl, K.X, L.resq, full ? 3 : 1, K.IN[0]);
-                for (int j = 0; j < 3; j++) in[j] = K.IN[full ? j : 0];
-            }
-            if (msg) {
-                mix(c, {K.BLK[S.bank]}, K.OUT[S.bank_out], L.msgq, NCTRL, K.MSG[0]);
-                cjobs J{};
-                for (int j = 0; j < 3; j++) J.j[j] = {in[j], K.MSG[j], L.cd[j], L.cg[j], L.cf[j], K.G + j * GRANK, K.CT[j]};
-                k_ctrl_down<<<dim3(GRANK, 3), 256, 0, st>>>(J);
-                k_ctrl_up<<<dim3((D + 255) / 256, 3), 256, 0, st>>>(J);
-                for (int j = 0; j < 3; j++) in[j] = K.CT[j];
-            }
-            njobs N{};
-            int nn;
-            if (full) {
-                N.j[0] = {in[0], L.qn, nullptr, K.aq[0], K.as[0]};
-                N.j[1] = {in[1], L.kn, nullptr, K.aq[1], K.as[1]};
-                N.j[2] = {in[2], L.vn, nullptr, K.aq[2], K.as[2]};
-                nn = 3;
-            } else if (msg) {
-                for (int j = 0; j < 3; j++) N.j[j] = {in[j], L.an, nullptr, K.aq[j], K.as[j]};
-                nn = 3;
-            } else {
-                N.j[0] = {in[0], L.an, nullptr, K.aq[0], K.as[0]};
-                nn = 1;
-            }
-            k_norm_quant<<<nn, 256, 0, st>>>(N, hp.eps);
-            const int ik = nn == 3 ? 1 : 0, iv = nn == 3 ? 2 : 0;
-            if (full)
-                gemv(c, {job(L.q, K.aq[0], K.as[0], K.QR), job(L.gate, K.aq[0], K.as[0], K.GR), job(L.rel, K.aq[0], K.as[0], K.RR),
-                         job(L.sink, K.aq[0], K.as[0], K.SK), job(L.k, K.aq[ik], K.as[ik], K.KR), job(L.v, K.aq[iv], K.as[iv], K.VR),
-                         job(L.kcp, K.aq[ik], K.as[ik], K.DK), job(L.vcp, K.aq[iv], K.as[iv], K.DV)});
-            else
-                gemv(c, {job(L.q, K.aq[0], K.as[0], K.QR), job(L.gate, K.aq[0], K.as[0], K.GR), job(L.rel, K.aq[0], K.as[0], K.RR),
-                         job(L.sink, K.aq[0], K.as[0], K.SK), job(L.k, K.aq[ik], K.as[ik], K.KR), job(L.v, K.aq[iv], K.as[iv], K.VR)});
-            const int row = full ? pos : pos % PF_RING;
-            hpost a{};
-            a.qr = K.QR; a.rr = K.RR; a.sk = K.SK; a.kr = K.KR; a.vr = K.VR;
-            a.dk = full ? K.DK : nullptr; a.dv = full ? K.DV : nullptr;
-            a.qclip = L.qclip; a.rclip = L.rclip; a.relb = L.relb; a.kconv = L.kconv; a.vconv = L.vconv;
-            a.hist = K.hist + (size_t) slot * 3 * CHL;
-            a.q = K.Q; a.tb = K.TB;
-            a.kc = K.kc[slot] + (size_t) row * KVL; a.vc = K.vc[slot] + (size_t) row * KVL;
-            a.tau = tau; a.qk_clip = hp.qk_clip; a.rel_clip = hp.rel_clip; a.eps = hp.eps;
-            k_head_post<<<HQL + 2 * HKVL, 128, 0, st>>>(a);
-            attn_args t{};
-            t.q = K.Q; t.tb = K.TB; t.gate = K.GR; t.kc = K.kc[slot]; t.vc = K.vc[slot]; t.pos = pos; t.full = full;
-            t.oq = K.oq; t.os = K.os;
-            k_attn<<<HQL, 256, 0, st>>>(t);
-            gemv(c, {job(L.out, K.oq, K.os, K.PART[buf])});
-        }
-        exchange();
-        nx++;
-        for (int c = 0; c < 2; c++) {
-            ink2_card & K = C[c];
-            const lw & L = K.L[ip];
-            hipStream_t st = K.st;
-            ICHECK(hipSetDevice(qz_dev_of(c)));
-            k_xconv<<<(D + 255) / 256, 256, 0, st>>>(K.PART[buf], C[1 - c].PART[buf], L.pconv,
-                                                     K.hist + (size_t) slot * 3 * CHL + H_A, K.X, push >= 0 ? K.BLK[push] : nullptr);
-        }
-        if (push >= 0) { S.blocks.push_back(push); S.nblk++; }
-        const int buf2 = nx & 1;
-        for (int c = 0; c < 2; c++) {
-            ink2_card & K = C[c];
-            const lw & L = K.L[ip];
-            hipStream_t st = K.st;
-            ICHECK(hipSetDevice(qz_dev_of(c)));
-            std::vector<const float *> bl;
-            for (int b : S.blocks) bl.push_back(K.BLK[b]);
-            mix(c, bl, K.X, L.ffq, 1, K.F);
-            const float * f = K.F;
-            if (msg) {
-                cjobs J{};
-                J.j[0] = {K.F, K.MSG[3], L.cd[3], L.cg[3], L.cf[3], K.G + 3 * GRANK, K.CT[3]};
-                k_ctrl_down<<<dim3(GRANK, 1), 256, 0, st>>>(J);
-                k_ctrl_up<<<dim3((D + 255) / 256, 1), 256, 0, st>>>(J);
-                f = K.CT[3];
-            }
-            njobs N{};
-            N.j[0] = {f, L.ffn, K.FN, K.aq[3], K.as[3]};
-            k_norm_quant<<<1, 256, 0, st>>>(N, hp.eps);
-            k_router<<<1, 1024, 0, st>>>(K.FN, L.gin, L.pb, hp.route_scale, K.IDS, K.WTS);
-            k_moe_up<<<dim3(FFE / 32, NE_USED), 512, 0, st>>>(L.gu.v, L.gu.s, K.IDS, K.aq[3], K.as[3], K.H);
-            k_situ<<<NE_USED, FFL, 0, st>>>(K.H, hp.situ_beta, hp.situ_lin_beta, K.hq, K.hs);
-            k_moe_down<<<D / 32, 512, 0, st>>>(L.dn.v, L.dn.s, K.IDS, K.WTS, K.hq, K.hs, K.PART[buf2]);
-        }
-        exchange();
-        nx++;
-        for (int c = 0; c < 2; c++) {
-            ink2_card & K = C[c];
-            const lw & L = K.L[ip];
-            ICHECK(hipSetDevice(qz_dev_of(c)));
-            k_xconv<<<(D + 255) / 256, 256, 0, K.st>>>(K.PART[buf2], C[1 - c].PART[buf2], L.fconv,
-                                                       K.hist + (size_t) slot * 3 * CHL + H_F, K.X, nullptr);
-        }
-    }
+    std::vector<appk> tab[2];
+    sptrs head_mix[2];
+    appk * tab_d[2] = {nullptr, nullptr};
 
-    // the whole forward for one token; logits: also run the head and leave the top-K on the host
-    void step(int32_t tok, int pos, bool logits) {
-        for (int c = 0; c < 2; c++) {
-            ICHECK(hipSetDevice(qz_dev_of(c)));
-            k_embed<<<1, 256, 0, C[c].st>>>(C[c].embd.v, C[c].embd.s, tok, C[c].embd_norm, hp.eps, C[c].X);
+    static sptrs sp(const std::vector<const float *> & st, const float * cur) {
+        sptrs S{};
+        for (const float * p : st) S.p[S.n++] = p;
+        S.p[S.n++] = cur;
+        return S;
+    }
+    gjobs gj(std::initializer_list<gjob> js, int & nb) {
+        gjobs J{};
+        int g = 0;
+        for (const gjob & j : js) { J.j[J.n] = j; g += (j.N + 31) / 32; J.j[J.n].g1 = g; J.n++; }
+        nb = g;
+        return J;
+    }
+    appk app(int c, int slot, int ip, seq & S, int pre, int pre_ob) {
+        ink2_card & K = C[c];
+        const lw & L = K.L[ip];
+        const bool full = is_full(ip), msg = S.bank >= 0;
+        const int push = ip % ARB == 0 ? S.nblk : -1;
+        appk e{};
+        e.slot = slot; e.ip = ip; e.full = full; e.msg = msg;
+        e.pre = pre; e.pre_out = pre > 1 ? K.OUT[pre_ob] : nullptr;
+        std::vector<const float *> bl;
+        for (int b : S.blocks) bl.push_back(K.BLK[b]);
+        const float * in[3] = {K.X, K.X, K.X};
+        if (L.resq) {
+            e.has_res = 1; e.mres_m = full ? 3 : 1;
+            e.mres = sp(bl, K.X); e.qres = L.resq; e.res_out = K.IN[0];
+            for (int j = 0; j < 3; j++) in[j] = K.IN[full ? j : 0];
         }
+        if (msg) {
+            e.mmsg = sp({K.BLK[S.bank]}, K.OUT[S.bank_out]); e.qmsg = L.msgq; e.msg_out = K.MSG[0];
+            for (int j = 0; j < 3; j++) e.ca.j[j] = {in[j], K.MSG[j], L.cd[j], L.cg[j], L.cf[j], K.G + j * GRANK, K.CT[j], L.cgt[j], L.cft[j]};
+            for (int j = 0; j < 3; j++) in[j] = K.CT[j];
+        }
+        if (full) {
+            e.na.j[0] = {in[0], L.qn, nullptr, K.aq[0], K.as[0]};
+            e.na.j[1] = {in[1], L.kn, nullptr, K.aq[1], K.as[1]};
+            e.na.j[2] = {in[2], L.vn, nullptr, K.aq[2], K.as[2]};
+            e.nna = 3;
+        } else if (msg) {
+            for (int j = 0; j < 3; j++) e.na.j[j] = {in[j], L.an, nullptr, K.aq[j], K.as[j]};
+            e.nna = 3;
+        } else {
+            e.na.j[0] = {in[0], L.an, nullptr, K.aq[0], K.as[0]};
+            e.nna = 1;
+        }
+        const int ik = e.nna == 3 ? 1 : 0, iv = e.nna == 3 ? 2 : 0;
+        if (full)
+            e.ga = gj({job(L.q, K.aq[0], K.as[0], K.QR), job(L.gate, K.aq[0], K.as[0], K.GR), job(L.rel, K.aq[0], K.as[0], K.RR),
+                       job(L.sink, K.aq[0], K.as[0], K.SK), job(L.k, K.aq[ik], K.as[ik], K.KR), job(L.v, K.aq[iv], K.as[iv], K.VR),
+                       job(L.kcp, K.aq[ik], K.as[ik], K.DK), job(L.vcp, K.aq[iv], K.as[iv], K.DV)}, e.nga);
+        else
+            e.ga = gj({job(L.q, K.aq[0], K.as[0], K.QR), job(L.gate, K.aq[0], K.as[0], K.GR), job(L.rel, K.aq[0], K.as[0], K.RR),
+                       job(L.sink, K.aq[0], K.as[0], K.SK), job(L.k, K.aq[ik], K.as[ik], K.KR), job(L.v, K.aq[iv], K.as[iv], K.VR)}, e.nga);
+        hpost & a = e.hp;
+        a.qr = K.QR; a.rr = K.RR; a.sk = K.SK; a.kr = K.KR; a.vr = K.VR;
+        a.dk = full ? K.DK : nullptr; a.dv = full ? K.DV : nullptr;
+        a.qclip = L.qclip; a.rclip = L.rclip; a.relb = L.relb; a.kconv = L.kconv; a.vconv = L.vconv;
+        a.hist = K.hist + (size_t) slot * 3 * CHL;
+        a.q = K.Q; a.tb = K.TB;
+        a.kc = K.kc[slot]; a.vc = K.vc[slot];              // + the row, per token
+        a.tau = 1.f; a.qk_clip = hp.qk_clip; a.rel_clip = hp.rel_clip; a.eps = hp.eps;
+        attn_args & t = e.at;
+        t.q = K.Q; t.tb = K.TB; t.gate = K.GR; t.kc = K.kc[slot]; t.vc = K.vc[slot]; t.full = full;
+        t.oq = K.oq; t.os = K.os; t.part = K.apart; t.cnt = K.acnt;
+        e.go = gj({job(L.out, K.oq, K.os, K.PART[0])}, e.ngo);
+        e.pconv = L.pconv; e.hsa = K.hist + (size_t) slot * 3 * CHL + H_A; e.blk = push >= 0 ? K.BLK[push] : nullptr;
+        if (push >= 0) { S.blocks.push_back(push); S.nblk++; }
+        bl.clear();
+        for (int b : S.blocks) bl.push_back(K.BLK[b]);
+        e.mff = sp(bl, K.X); e.qff = L.ffq;
+        const float * f = K.F;
+        if (msg) { e.cb.j[0] = {K.F, K.MSG[3], L.cd[3], L.cg[3], L.cf[3], K.G + 3 * GRANK, K.CT[3], L.cgt[3], L.cft[3]}; f = K.CT[3]; }
+        e.nb.j[0] = {f, L.ffn, K.FN, K.aq[3], K.as[3]};
+        e.gin = L.gin; e.pb = L.pb;
+        e.guv = L.gu.v; e.gus = L.gu.s; e.dnv = L.dn.v; e.dns = L.dn.s;
+        e.fconv = L.fconv; e.hsf = K.hist + (size_t) slot * 3 * CHL + H_F;
+        return e;
+    }
+    // the step() order of applications, slots and residual-block lists (as the host loop had it)
+    void plan(int c) {
+        std::vector<appk> & T = tab[c];
+        T.clear();
         seq S;
-        for (int il = 0; il < LOOP0; il++) layer(il, il, pos, S);
+        for (int il = 0; il < LOOP0; il++) T.push_back(app(c, il, il, S, 0, 0));
         const seq pre = S;
-        for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipMemcpyAsync(C[c].P, C[c].X, D * 4, hipMemcpyDeviceToDevice, C[c].st)); }
         for (int pass = 0; pass < NPASS; pass++) {
+            int ob = 0;
             if (pass > 0) {
                 const int bank = S.blocks[pre.blocks.size() + 1];      // the previous pass's layer-12 input
-                const int ob = (pass - 1) & 1;
-                for (int c = 0; c < 2; c++) {
-                    ICHECK(hipSetDevice(qz_dev_of(c)));
-                    ICHECK(hipMemcpyAsync(C[c].OUT[ob], C[c].X, D * 4, hipMemcpyDeviceToDevice, C[c].st));
-                    ICHECK(hipMemcpyAsync(C[c].X, C[c].P, D * 4, hipMemcpyDeviceToDevice, C[c].st));
-                }
+                ob = (pass - 1) & 1;
                 const int nblk = S.nblk;
                 S = pre;
                 S.nblk = nblk;                   // fresh BLK buffers for this pass (the bank stays intact)
@@ -342,27 +350,69 @@ struct ink2_engine {
             }
             for (int ip = LOOP0; ip < LOOP1; ip++) {
                 const int slot = pass == 0 ? ip : NL + (pass - 1) * (LOOP1 - LOOP0) + (ip - LOOP0);
-                layer(slot, ip, pos, S);
+                T.push_back(app(c, slot, ip, S, ip == LOOP0 ? (pass == 0 ? 1 : 2) : 0, ob));
             }
         }
         S.bank = -1;
-        for (int il = LOOP1; il < NL; il++) layer(il, il, pos, S);
-        if (!logits) return;
+        for (int il = LOOP1; il < NL; il++) T.push_back(app(c, il, il, S, 0, 0));
+        std::vector<const float *> bl;
+        for (int b : S.blocks) bl.push_back(C[c].BLK[b]);
+        head_mix[c] = sp(bl, C[c].X);
+    }
+    bool planned = false;
+    void plan_all() {
+        if (planned) return;
+        for (int c = 0; c < 2; c++) { C[c].ca.xin_peer = C[1 - c].x.xin; C[c].ca.xflag_peer = C[1 - c].x.xflag; }
+        for (int c = 0; c < 2; c++) {
+            plan(c);
+            ICHECK(hipSetDevice(qz_dev_of(c)));
+            {
+                cyc_args & A = C[c].ca;
+                A.hmix = head_mix[c]; A.hq_out = C[c].out_q;
+                A.hn = {C[c].F, C[c].out_norm, nullptr, C[c].aq[3], C[c].as[3]};
+                A.hg = job(C[c].head, C[c].aq[3], C[c].as[3], C[c].LOG);
+                A.nvalid = C[c].nvalid; A.softcap = hp.softcap;
+            }
+            C[c].ca.napp = (int) tab[c].size();
+            if (!tab_d[c]) ICHECK(hipMalloc(&tab_d[c], tab[c].size() * sizeof(appk)));
+            ICHECK(hipMemcpy(tab_d[c], tab[c].data(), tab[c].size() * sizeof(appk), hipMemcpyHostToDevice));
+            C[c].ca.tab = tab_d[c];
+            if (!C[c].ca_d) ICHECK(hipMalloc(&C[c].ca_d, sizeof(cyc_args)));
+            ICHECK(hipMemcpy(C[c].ca_d, &C[c].ca, sizeof(cyc_args), hipMemcpyHostToDevice));
+        }
+        planned = true;
+    }
+    float tau_at(int pos) const { return 1.f + hp.tau_alpha * logf(fmaxf(1.f, (float) (pos + 1) / (float) hp.tau_floor)); }
+    // the persistent path: embed + all applications in one launch per card
+    long long n_cyc = 0;
+    void run_cycle(int32_t tok, int pos, bool head) {
         for (int c = 0; c < 2; c++) {
             ink2_card & K = C[c];
             ICHECK(hipSetDevice(qz_dev_of(c)));
-            std::vector<const float *> bl;
-            for (int b : S.blocks) bl.push_back(K.BLK[b]);
-            mix(c, bl, K.X, K.out_q, 1, K.F);
-            njobs N{};
-            N.j[0] = {K.F, K.out_norm, nullptr, K.aq[3], K.as[3]};
-            k_norm_quant<<<1, 256, 0, K.st>>>(N, hp.eps);
-            gemv(c, {job(K.head, K.aq[3], K.as[3], K.LOG)});
-            k_softcap<<<(K.nvalid + 255) / 256, 256, 0, K.st>>>(K.LOG, K.nvalid, hp.softcap);
+            ICHECK(hipMemsetAsync(K.bst, 0, CYC_NBX * sizeof(unsigned int), K.st));
+            hipLaunchKernelGGL(ink2_cycle, dim3(K.ncu), dim3(512), CYC_LDS, K.st, K.bst, (const cyc_args *) K.ca_d, tok, pos, tau_at(pos), head ? 1 : 0);
+            ICHECK(hipGetLastError());
+        }
+        n_cyc++;
+    }
+
+    // the whole forward for one token; logits: also run the head and leave the top-K on the host
+    void step(int32_t tok, int pos, bool logits) {
+        plan_all();
+        run_cycle(tok, pos, logits);
+        if (logits) for (int c = 0; c < 2; c++) {
+            ink2_card & K = C[c];
+            ICHECK(hipSetDevice(qz_dev_of(c)));
             qz_topk_rows<<<dim3(QZ_TOPK_NB, 1), 256, 0, K.st>>>(K.LOG, K.nvalid, K.id0, K.tk);
-            ICHECK(hipMemcpyAsync(tkh[c].data(), K.tk, tkh[c].size() * sizeof(float2), hipMemcpyDeviceToHost, K.st));
+            ICHECK(hipMemcpyAsync(tkp[c], K.tk, tkh[c].size() * sizeof(float2), hipMemcpyDeviceToHost, K.st));
+        }
+        for (int c = 0; c < 2; c++) {          // the error words ride the same stream: no extra sync
+            ICHECK(hipSetDevice(qz_dev_of(c)));
+            ICHECK(hipMemcpyAsync(tkp[c] + QZ_TOPK_NB * QZ_TOPK, C[c].x.xerr, 8 * sizeof(int), hipMemcpyDeviceToHost, C[c].st));
         }
         for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(C[c].st)); }
+        if (logits) for (int c = 0; c < 2; c++) memcpy(tkh[c].data(), tkp[c], tkh[c].size() * sizeof(float2));
+        for (int c = 0; c < 2; c++) qz_xerr_check_h(c, (const int *) (tkp[c] + QZ_TOPK_NB * QZ_TOPK), n_cyc);
     }
     int greedy() const {
         float bv = -INFINITY;
