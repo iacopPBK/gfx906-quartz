@@ -7,6 +7,9 @@
 constexpr int HQL = HQ / 2, HKVL = HKV / 2;            // local heads per card
 constexpr int QL = HQL * HD, KVL = HKVL * HD;          // 1536, 512
 constexpr int FFL = FFE / 2;                           // local expert FF: 576
+// prefill chunk rows (batched prefill) and the SWA ring size it needs: a
+// window of WIN plus the in-flight chunk, indexed pos % PF_RING everywhere
+constexpr int PF_M = 2048, PF_RING = WIN + PF_M;
 constexpr int CHL = 2 * KVL + 2 * D;                   // local conv history channels: K | V | attn post | ffn post
 constexpr int H_K = 0, H_V = KVL, H_A = 2 * KVL, H_F = 2 * KVL + D;
 constexpr int TBW = REL_EXT + 1;                       // bias table width (the zero column past the extent)
@@ -256,7 +259,7 @@ static __global__ __launch_bounds__(256) void k_attn(attn_args a) {
     const int lo = a.full ? 0 : max(0, a.pos - (WIN - 1));
     float m = -INFINITY, l = 0.f, o0 = 0.f, o1 = 0.f;
     for (int j = lo + wave; j <= a.pos; j += 4) {
-        const int row = a.full ? j : j % WIN;
+        const int row = a.full ? j : j % PF_RING;
         const __half2 k2 = *(const __half2 *) (a.kc + (size_t) row * KVL + kvh * HD + 2 * lane);
         float s = q0 * __low2float(k2) + q1 * __high2float(k2);
         #pragma unroll
@@ -330,7 +333,19 @@ static __global__ __launch_bounds__(1024) void k_router(const float * f, const f
     }
 }
 
-// the selected experts' local gate | up rows: h[k][FFE] (gate FFL then up FFL)
+// gate_up rows are interleaved per 32 at load (gu_interleave): tile T of 64 rows holds
+// gate rows 32T..32T+31 then the matching up rows; gate row j sits at gu_row(j), its up row 32 later
+__device__ __host__ __forceinline__ int gu_row(int j) { return (j / 32) * 64 + j % 32; }
+static __global__ __launch_bounds__(256) void k_gu_interleave(const char * sv, const __half * ss, char * dv, __half * ds) {
+    const int p = blockIdx.x, e = blockIdx.y, r = p % 64;
+    const int src = r < 32 ? (p / 64) * 32 + r : FFL + (p / 64) * 32 + r - 32;
+    const size_t so = (size_t) e * FFE + src, dof = (size_t) e * FFE + p;
+    const uint4 * a = (const uint4 *) (sv + so * D);
+    uint4 * b = (uint4 *) (dv + dof * D);
+    for (int i = threadIdx.x; i < D / 16; i += 256) b[i] = a[i];
+    for (int i = threadIdx.x; i < D / 32; i += 256) ds[dof * (D / 32) + i] = ss[so * (D / 32) + i];
+}
+// the selected experts' local gate | up rows: h[k][FFE] (interleaved per 32, see gu_row)
 static __global__ __launch_bounds__(512) void k_moe_up(const char * wv, const __half * ws, const int * ids,
                                                        const unsigned char * av, const float * as, float * h) {
     const int wave = threadIdx.x >> 6, lane = threadIdx.x & 63, k = blockIdx.y;
@@ -346,7 +361,8 @@ static __global__ __launch_bounds__(512) void k_moe_up(const char * wv, const __
 // SITU on the local halves -> int8 planes per expert: [k][FFL]
 static __global__ __launch_bounds__(FFL) void k_situ(const float * h, float beta, float lb, unsigned char * q, float * qs) {
     const int k = blockIdx.x, j = threadIdx.x;
-    const float g = h[k * FFE + j], u = h[k * FFE + FFL + j];
+    const int gi = gu_row(j);
+    const float g = h[k * FFE + gi], u = h[k * FFE + gi + 32];
     const float act = beta * tanhf(g / beta) * sigm(g) * (lb * tanhf(u / lb));
     quant32(act, q + k * FFL, qs + k * (FFL / 32), j);
 }

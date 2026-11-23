@@ -100,6 +100,19 @@ struct ink2_engine {
                 }
             }
         }
+        {   // gate_up rows interleaved per 32 (gu_row): the prefill GEMM's 64-row tiles pair them for SITU
+            const size_t nv = (size_t) NE * FFE * D, ns = (size_t) NE * FFE * (D / 32);
+            char * tv; __half * ts;
+            ICHECK(hipMalloc(&tv, nv)); ICHECK(hipMalloc(&ts, ns * 2));
+            for (int il = 0; il < NL; il++) {
+                qw & W = K.L[il].gu;
+                ICHECK(hipMemcpy(tv, W.v, nv, hipMemcpyDeviceToDevice));
+                ICHECK(hipMemcpy(ts, W.s, ns * 2, hipMemcpyDeviceToDevice));
+                k_gu_interleave<<<dim3(FFE, NE), 256>>>(tv, ts, (char *) W.v, (__half *) W.s);
+            }
+            ICHECK(hipDeviceSynchronize());
+            ICHECK(hipFree(tv)); ICHECK(hipFree(ts));
+        }
         const int half = VOCAB / 2;
         K.id0 = half * c;
         K.nvalid = std::min(half, VOCAB_REAL - K.id0);
@@ -124,7 +137,7 @@ struct ink2_engine {
         add(f32(NE_USED * FFL / 4)); add(f32(NE_USED * FFL / 32));
         add(f32(QZ_TOPK_NB * QZ_TOPK * 2));
         for (int s = 0; s < NAPP; s++) {
-            const size_t rows = is_full(slot_phys(s)) ? (size_t) ctx : (size_t) WIN;
+            const size_t rows = is_full(slot_phys(s)) ? (size_t) ctx : (size_t) PF_RING;
             add(f32(rows * KVL / 2)); add(f32(rows * KVL / 2));
         }
         add(f32((size_t) NAPP * 3 * CHL));
@@ -239,7 +252,7 @@ struct ink2_engine {
             else
                 gemv(c, {job(L.q, K.aq[0], K.as[0], K.QR), job(L.gate, K.aq[0], K.as[0], K.GR), job(L.rel, K.aq[0], K.as[0], K.RR),
                          job(L.sink, K.aq[0], K.as[0], K.SK), job(L.k, K.aq[ik], K.as[ik], K.KR), job(L.v, K.aq[iv], K.as[iv], K.VR)});
-            const int row = full ? pos : pos % WIN;
+            const int row = full ? pos : pos % PF_RING;
             hpost a{};
             a.qr = K.QR; a.rr = K.RR; a.sk = K.SK; a.kr = K.KR; a.vr = K.VR;
             a.dk = full ? K.DK : nullptr; a.dv = full ? K.DV : nullptr;

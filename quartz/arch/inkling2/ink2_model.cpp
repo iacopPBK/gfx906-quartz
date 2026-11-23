@@ -1,9 +1,10 @@
-// inkling2_loop: the C API model (ink2_ctx). The correctness path of
-// ink2_engine.h (one token per step, prefill as forced steps); the batched
-// prefill and the persistent decode kernel replace it.
+// inkling2_loop: the C API model (ink2_ctx). Prefill runs batched in chunks
+// (ink2_pf.h);
+// decode is one step() per token.
 #include "ink2_prelude.h"
 
 #include <atomic>
+#include <algorithm>
 
 namespace ink2 {
 
@@ -11,10 +12,12 @@ namespace ink2 {
 #include "ink2_tp2.h"
 #include "ink2_kernels.h"
 #include "ink2_engine.h"
+#include "ink2_pf.h"
 
 struct ink2_ctx : qz_ctx {
     std::string name;
     ink2_engine E;
+    ink2_pf EPF;
     std::atomic<bool> abort_flag{false};
 
     void info(qz_model_info * out) const override {
@@ -51,13 +54,12 @@ struct ink2_ctx : qz_ctx {
         };
         const auto t0 = clk::now();
         E.reset();
-        for (int i = 0; i < n_prompt; i++) {
-            if (abort_flag) { st.stop = 2; return fin(0); }
-            E.step(prompt[i], i, i == n_prompt - 1);
-            st.prefill_cycles++;
-        }
+        EPF.abort = &abort_flag;
+        const bool pf_ok = EPF.prefill(prompt, n_prompt, true);
+        st.prefill_cycles = n_prompt;
         const auto t1 = clk::now();
         st.prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        if (!pf_ok) { st.stop = 2; return fin(0); }
         int pos = n_prompt;
         while (st.n_gen < max_new) {
             const int32_t t = pick();
@@ -86,6 +88,7 @@ static qz_ctx * create(const char * path, const qz_create_opts & o) {
     ink2_ctx * c = new ink2_ctx();
     c->name = g.str("general.name");
     c->E.hp = hp;
+    c->EPF.E = &c->E;
     c->E.ctx = std::min(o.max_ctx > 0 ? o.max_ctx : 32768, 262144);
     qz_mem_baseline(2);
     if (!qz_peer_enable()) { delete c; return nullptr; }
@@ -100,7 +103,7 @@ static qz_ctx * create(const char * path, const qz_create_opts & o) {
         ICHECK(hipSetDevice(qz_dev_of(i)));
         ICHECK(hipStreamCreateWithFlags(&K.st, hipStreamNonBlocking));
         c->E.bind(i);
-        if (!c->E.alloc(i)) { delete c; return nullptr; }
+        if (!c->E.alloc(i) || !c->EPF.alloc(i)) { delete c; return nullptr; }
     }
     ICHECK(hipSetDevice(qz_dev_of(0)));
     qz_mem_report(stdout, 2);
