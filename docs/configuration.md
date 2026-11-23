@@ -16,7 +16,7 @@ pi model and DSpine, `--max-ctx 32768`, a 2.7k-token prompt; they vary ±3%.
 | Flag | Default | Effect |
 |---|---|---|
 | `--model` | required | Target GGUF |
-| `--dspine` | unset | Draft GGUF: DSpine for Qwen (images stay on MTP), DSpark for Inkling (greedy requests) |
+| `--dspine` | unset | Draft GGUF: DSpine for Qwen (images stay on MTP), DSpark for Inkling |
 | `--mmproj` | unset | `qwen3vl_merger` projector; enables image input (Qwen only) |
 | `--lib` | `build/bin/libquartz.so` | Engine library |
 | `--host`, `--port` | `127.0.0.1`, `8090` | Bind address, no authentication |

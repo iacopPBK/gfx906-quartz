@@ -30,7 +30,7 @@ struct ink2_ctx : qz_ctx {
     qz_pcache pc;
     float * shist[2] = {};
     int hi = -1;
-    // DSpark drafter (QZ_DSPINE=<drafter gguf>): speculative greedy rounds (the
+    // DSpark drafter (QZ_DSPINE=<drafter gguf>): speculative rounds (the
     // anchor and the 7 drafts are the verify kernel's 8 rows, ink2_verify.h)
     ink2_dspark DS;
     bool ds_on = false;
@@ -100,7 +100,7 @@ struct ink2_ctx : qz_ctx {
         const auto t1 = clk::now();
         st.prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         int pos = n_prompt;
-        const bool dsr = ds_on && !sam.smp;
+        const bool dsr = ds_on;
         int dr[DS_BS - 1];
         const long r0 = DS.rounds, a0 = DS.accepted;
         // one token: 0 = the generation goes on, 1 = it ends here (the token was emitted)
@@ -112,9 +112,11 @@ struct ink2_ctx : qz_ctx {
             if (abort_flag) { st.stop = 2; return 1; }
             return 0;
         };
-        // DSpark greedy rounds: the anchor t0 at pos is verify row 0, the drafter's 7
-        // drafts rows 1 .. 7; n leading drafts match the target's own pick, so rows
-        // 0 .. n commit, d[0 .. n-1] are emitted, and the row-n pick g[n] at pos + n + 1
+        // DSpark rounds: the anchor t0 at pos is verify row 0, the drafter's 7 greedy
+        // drafts rows 1 .. 7. Row r's pick is the target's own: greedy, or sampled from
+        // the row with the request's sampler (one draw per row, as one plain step takes
+        // per token, so the output is the plain decode's). n leading drafts equal their
+        // row's pick, so rows 0 .. n commit, d[0 .. n-1] are emitted, and the row-n pick g[n] at pos + n + 1
         // is the next anchor (emitted at the top of the next round). Without the drafter (or when the 8 rows do
         // not fit) this is one step per token, as before.
         bool anchor = false;
@@ -184,8 +186,18 @@ struct ink2_ctx : qz_ctx {
             for (int r = 0; r < DS_BS - 1; r++) toks[r + 1] = dr[r];
             E.verify(toks, pos);
             int g[VR], n = 0;
-            for (int r = 0; r < VR; r++) g[r] = E.greedy_row(r);
-            while (n < DS_BS - 1 && dr[n] == g[n]) n++;
+            if (!sam.smp) {
+                for (int r = 0; r < VR; r++) g[r] = E.greedy_row(r);
+                while (n < DS_BS - 1 && dr[n] == g[n]) n++;
+            } else {                                  // rows sampled in order, up to the first miss
+                const size_t rb = (size_t) QZ_TOPK_NB * QZ_TOPK;
+                for (int c = 0; c < 2; c++) sam.tk[c].assign(E.vtkp[c], E.vtkp[c] + VR * rb);
+                for (;;) {
+                    g[n] = sam.sample_row(n);
+                    if (n == DS_BS - 1 || g[n] != dr[n]) break;
+                    n++;
+                }
+            }
             DS.rounds++;
             DS.accepted += n;
             hi = std::max(hi, pos + VR - 1);          // the SWA ring rows the verify wrote

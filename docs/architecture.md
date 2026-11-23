@@ -74,7 +74,8 @@ own engine; its forward pass is written down in [inkling2.md](inkling2.md).
   selected experts (`ink2_pf.h`). The prefix cache saves the conv histories
   and checks that the sliding-window rings still cover the resumed position.
 - **Decode** is one persistent kernel per card per token (`ink2_cycle.h`).
-  With a DSpark draft, greedy requests run rounds of 7 drafts checked as 8
-  rows by a second persistent kernel (`ink2_dspark.h`, `ink2_verify.h`).
+  With a DSpark draft, decode runs rounds of 7 drafts checked as 8 rows by a
+  second persistent kernel (`ink2_dspark.h`, `ink2_verify.h`); each row's
+  token is picked (greedy or sampled) as one plain step would pick it.
   The switch falls back to one token per step while that is faster.
 - **Memory** is checked at start by `ink2_preflight.h`.

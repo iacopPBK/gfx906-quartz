@@ -104,7 +104,7 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 
 | Feature | Details |
 |:---|:---|
-| **Speculative decode** | With the DSpark drafter, each round drafts 7 tokens and verifies them with the anchor as 8 rows in one persistent kernel (greedy requests). Decode drops to one token per step while the rounds are slower than that and probes them again later (`QZ_NO_SWITCH=1` turns that off). Sampled requests decode one token per step |
+| **Speculative decode** | With the DSpark drafter, each round drafts 7 tokens and verifies them with the anchor as 8 rows in one persistent kernel. A draft is kept only if it equals the target's own pick for its row (greedy or sampled), so the output is the same as plain decoding. Decode drops to one token per step while the rounds are slower than that and probes them again later (`QZ_NO_SWITCH=1` turns that off) |
 | **Megakernel execution** | Persistent decode loop over the 48 layer applications (24 layers, 12 of them looped 3 times) |
 | **Batched prefill** | 2048-token chunks, grouped expert GEMMs |
 | **Prefix cache** | Conv histories and sliding-window rings in the snapshots |
@@ -121,25 +121,25 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 
 | Decode, 400 tokens | Plain | DSpark | SWITCH |
 |:---|---:|---:|---:|
-| C code | 105.7 tok/s | 101.2 tok/s | 101.0 tok/s |
-| Python code | 105.8 tok/s | 161.7 tok/s | 111.6 tok/s |
-| Prose | 105.7 tok/s | 74.6 tok/s | 105.7 tok/s |
-| Explanation | 105.8 tok/s | 68.4 tok/s | 97.3 tok/s |
-| JSON | 105.6 tok/s | 143.2 tok/s | 115.6 tok/s |
+| C code | 105.2 tok/s | 78.0 tok/s | 98.6 tok/s |
+| Python code | 105.1 tok/s | 158.2 tok/s | 110.9 tok/s |
+| Prose | 105.4 tok/s | 52.6 tok/s | 87.6 tok/s |
+| Explanation | 105.4 tok/s | 73.1 tok/s | 97.4 tok/s |
+| JSON | 105.1 tok/s | 152.4 tok/s | 112.6 tok/s |
 
 | Mixed answers, 800 tokens | Plain | DSpark | SWITCH |
 |:---|---:|---:|---:|
-| Code → prose | 104.3 tok/s | 67.5 tok/s | 106.3 tok/s |
-| JSON → prose | 104.5 tok/s | 98.2 tok/s | 134.9 tok/s |
-| Prose → code | 104.5 tok/s | 75.0 tok/s | 98.3 tok/s |
-| Code → prose → code | 104.6 tok/s | 101.4 tok/s | 135.3 tok/s |
+| Code → prose | 103.9 tok/s | 80.2 tok/s | 107.0 tok/s |
+| JSON → prose | 104.1 tok/s | 91.9 tok/s | 133.9 tok/s |
+| Prose → code | 104.0 tok/s | 71.4 tok/s | 95.9 tok/s |
+| Code → prose → code | 104.1 tok/s | 98.4 tok/s | 139.2 tok/s |
 
 | VRAM per card, `--max-ctx 262144` | card 0 | card 1 |
 |:---|---:|---:|
 | Plain | 20.6 GB | 20.6 GB |
 | DSpark | 24.3 GB | 20.6 GB |
 
-<sub>Greedy (DSpark drafts for greedy requests only; sampled requests decode plain), thinking off, the same prompts as Qwen3.8-27B's, one run each (greedy: the three modes give the same tokens). Measured 2026-11-23 at a 178 W power limit.</sub>
+<sub>Decode is sampled (T 1.0, top-k 20, top-p 0.95, seed 7), thinking off, the same prompts as Qwen3.8-27B's, one run each; the three modes give the same tokens. Measured 2026-11-23 at a 178 W power limit.</sub>
 
 </details>
 
