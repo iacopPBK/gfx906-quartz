@@ -101,8 +101,8 @@ struct qz_dsrun {
             DS_CHECK(hipEventRecord(fev, cx[0].st));
             DS_CHECK(hipSetDevice(qz_dev_of(1)));
             DS_CHECK(hipStreamWaitEvent(cx[1].st, fev, 0));
-            DS_CHECK(hipMemcpyPeerAsync(fa[1], 1, fa[0], 0, (size_t) Mp * KF, cx[1].st));
-            DS_CHECK(hipMemcpyPeerAsync(fas[1], 1, fas[0], 0, (size_t) Mp * KF / 32 * 4, cx[1].st));
+            DS_CHECK(hipMemcpyPeerAsync(fa[1], qz_dev_of(1), fa[0], qz_dev_of(0), (size_t) Mp * KF, cx[1].st));
+            DS_CHECK(hipMemcpyPeerAsync(fas[1], qz_dev_of(1), fas[0], qz_dev_of(0), (size_t) Mp * KF / 32 * 4, cx[1].st));
             for (int c = 0; c < 2; c++) {
                 DS_CHECK(hipSetDevice(qz_dev_of(c)));
                 qz_ds_ctx & d = cx[c];

@@ -371,7 +371,7 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
                 {(const void *) qz_cycle<1>, sm1, "qz_cycle<1>"}, {(const void *) qz_cycle<2>, sm2, "qz_cycle<2>"},
                 {(const void *) qz_cycle<3>, sm3, "qz_cycle<3>"}, {(const void *) qz_cycle<4>, sm4, "qz_cycle<4>"},
                 {(const void *) qz_mtp<3>, sm3, "qz_mtp<3>"}, {(const void *) qz_mtp<4>, sm4, "qz_mtp<4>"}};
-            if (!qz_resident(c, ks, (int) (sizeof(ks) / sizeof(ks[0])), 60, 512)) return 1;
+            if (!qz_resident(qz_dev_of(c), ks, (int) (sizeof(ks) / sizeof(ks[0])), 60, 512)) return 1;
         }
     }
     for (int c = 0; c < 2; c++) {
