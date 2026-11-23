@@ -26,6 +26,7 @@
 
 #include "arch.h"
 #include "core/cards.h"
+#include "core/prefix_cache.h"
 #include "core/sampler.h"
 #include "kernels/gemv.h"
 #include "kernels/dev.h"

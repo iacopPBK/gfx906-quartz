@@ -47,7 +47,6 @@ namespace mv12 {
 
 constexpr int32_t QZ_IM_START = 248045;   
 constexpr int32_t QZ_IMG_PAD = 248056;
-struct qz_snap { int pos = -1; unsigned long use = 0; float * dn[2] = {}, * cs[2] = {}; };
 // qwen35 (Qwen3.8-27B Q8_0, TP2): the engine, batched prefill, prefix cache, DSpine, vision
 struct q35_ctx : qz_ctx {
     qz_engine eng;
@@ -56,15 +55,13 @@ struct q35_ctx : qz_ctx {
     bool pf_ok = false;
     static constexpr int pf_min = 16;   // shorter prompts decode on the cycle's forced rows
     static constexpr int tail = 64;
-    int head = -1;                
-    std::vector<qz_snap> snaps;
-    float * sdn[2] = {}, * scs[2] = {};   
-    std::vector<uint64_t> ckeys;
-    unsigned long clock = 0;
+    qz_pcache pc;                 // blobs: the GDN state dn, the conv state cs
+    float * sdn[2] = {}, * scs[2] = {};   // mid-chunk staging of dn / cs
     int last_cached = 0;
     struct img { uint64_t hash = 0; int id = 0, nx = 0, ny = 0; unsigned long use = 0; std::vector<float> rows; };
     qz_vision * vis = nullptr;
     std::vector<img> imgs;
+    unsigned long img_clock = 0;
     int img_next = 0;
     float * img_dev[2] = {};
     size_t img_cap = 0;
@@ -95,75 +92,7 @@ struct q35_ctx : qz_ctx {
 
 static size_t qz_dn_bytes(const qz_engine & e) { return (size_t) e.hp.n_recr * g2_HV * QZ_S * QZ_S * 4; }
 static size_t qz_cs_bytes(const qz_engine & e) { return (size_t) e.hp.n_recr * 3 * g2_CCH * 4; }
-static void qz_snap_alloc(q35_ctx * c, qz_snap & sn) {
-    for (int i = 0; i < 2; i++)
-        if (!sn.dn[i]) {
-            CHECK(hipHostMalloc((void **) &sn.dn[i], qz_dn_bytes(c->eng), hipHostMallocPortable));
-            CHECK(hipHostMalloc((void **) &sn.cs[i], qz_cs_bytes(c->eng), hipHostMallocPortable));
-        }
-}
-
-
-static qz_snap * qz_snap_victim(q35_ctx * c, const qz_snap * keep) {
-    std::vector<qz_snap *> live;
-    for (auto & sn : c->snaps) if (sn.pos >= 0) live.push_back(&sn);
-    std::sort(live.begin(), live.end(), [](const qz_snap * x, const qz_snap * y) { return x->pos < y->pos; });
-    qz_snap * best = nullptr;
-    double best_cost = 0;
-    const int n = (int) live.size();
-    for (int i = 0; i + 2 < n; i++) {
-        qz_snap * sn = live[i];
-        if (sn == keep || sn->pos == c->head) continue;
-        const int prev = i > 0 ? live[i - 1]->pos : 0, next = live[i + 1]->pos;
-        const double cost = (double) (next - prev) / next;
-        if (!best || cost < best_cost) { best = sn; best_cost = cost; }
-    }
-    if (!best) for (auto & sn : c->snaps) if (&sn != keep && (!best || sn.use < best->use)) best = &sn;
-    return best;
-}
-
-
-static qz_snap * qz_snap_slot(q35_ctx * c, int pos, const qz_snap * keep = nullptr) {
-    qz_snap * best = nullptr;
-    for (auto & sn : c->snaps) if (sn.pos == pos) best = &sn;          // same position: refresh in place
-    if (!best) for (auto & sn : c->snaps) if (sn.pos < 0) { best = &sn; break; }
-    if (!best) best = qz_snap_victim(c, keep);
-    qz_snap_alloc(c, *best);
-    best->pos = -1;
-    return best;
-}
-
-static void qz_snap_take(q35_ctx * c, int pos, const qz_snap * keep = nullptr) {
-    qz_snap * best = qz_snap_slot(c, pos, keep);
-    for (int i = 0; i < 2; i++) {
-        qz_card & K = c->eng.C[i];
-        CHECK(hipSetDevice(qz_dev_of(i)));
-        CHECK(hipMemcpyAsync(best->dn[i], K.dn_all, qz_dn_bytes(c->eng), hipMemcpyDeviceToHost, K.st));
-        CHECK(hipMemcpyAsync(best->cs[i], K.cs_all, qz_cs_bytes(c->eng), hipMemcpyDeviceToHost, K.st));
-    }
-    CHECK(hipSetDevice(qz_dev_of(0)));
-    best->pos = pos;
-    best->use = ++c->clock;
-}
-
-static void qz_snap_restore(q35_ctx * c, qz_snap & sn) {
-    for (int i = 0; i < 2; i++) {
-        qz_card & K = c->eng.C[i];
-        CHECK(hipSetDevice(qz_dev_of(i)));
-        CHECK(hipMemcpyAsync(K.dn_all, sn.dn[i], qz_dn_bytes(c->eng), hipMemcpyHostToDevice, K.st));
-        CHECK(hipMemcpyAsync(K.cs_all, sn.cs[i], qz_cs_bytes(c->eng), hipMemcpyHostToDevice, K.st));
-        CHECK(hipMemsetAsync(K.ring_all, 0, (size_t) c->eng.hp.n_recr * 2 * g2_RING_PAR * 4, K.st));
-        CHECK(hipMemsetAsync(K.ctl_d, 0, 8 * sizeof(int), K.st));
-    }
-    c->eng.sync2();
-    sn.use = ++c->clock;
-}
-
-static void qz_cache_drop(q35_ctx * c) {   // the engine state no longer matches any snapshot's K / V
-    for (auto & sn : c->snaps) sn.pos = -1;
-    c->ckeys.clear();
-    c->head = -1;
-}
+static void qz_cache_drop(q35_ctx * c) { c->pc.drop(); }   // the engine state no longer matches any snapshot's K / V
 
 static void qz_pf_setup(q35_ctx * c) {
     // + headroom; the buffers themselves come from the engine's scratch when it holds them
@@ -180,17 +109,21 @@ static void qz_pf_setup(q35_ctx * c) {
     }
     CHECK(hipSetDevice(qz_dev_of(0)));
     c->pf_ok = c->pf.init(c->eng, 2048) == 0;
-    // one slot cannot hold a chunk's mid-chunk snapshot and its end one at once
-    c->snaps.resize(8);
     // the snapshots up front in pinned host memory (~75 MB per slot per card),
-    // the mid-chunk staging on each card
+    // the mid-chunk staging on each card; one slot cannot hold a chunk's
+    // mid-chunk snapshot and its end one at once
     qz_mem_scope mem("snapshot staging");
     if (c->pf_ok) {
-        for (auto & sn : c->snaps) qz_snap_alloc(c, sn);
+        qz_blob dn, cs;
+        dn.bytes = qz_dn_bytes(c->eng); cs.bytes = qz_cs_bytes(c->eng);
         for (int i = 0; i < 2; i++) {
             CHECK(hipSetDevice(qz_dev_of(i)));
-            CHECK(qz_dmalloc(&c->sdn[i], qz_dn_bytes(c->eng))); CHECK(qz_dmalloc(&c->scs[i], qz_cs_bytes(c->eng)));
+            CHECK(qz_dmalloc(&c->sdn[i], dn.bytes)); CHECK(qz_dmalloc(&c->scs[i], cs.bytes));
+            dn.live[i] = c->eng.C[i].dn_all; dn.stage[i] = c->sdn[i];
+            cs.live[i] = c->eng.C[i].cs_all; cs.stage[i] = c->scs[i];
         }
+        CHECK(hipSetDevice(qz_dev_of(0)));
+        c->pc.init({ dn, cs }, 8, c->eng.C[0].st, c->eng.C[1].st);
     }
     CHECK(hipSetDevice(qz_dev_of(0)));
 }
@@ -325,63 +258,28 @@ static int qz_run(q35_ctx * c, const std::vector<int32_t> & p, int max_new, cons
     // prompts with images decode on MTP (DSpine is exact there too, but it
     // accepts too little on image descriptions to beat MTP)
     const bool ds_on = c->ds.on && !mm;
-    // the deepest snapshot whose prompt keys 0 .. pos match (pos <= P - 1)
-    const std::vector<uint64_t> keys = qz_keys(p, mm, row_hash);
-    int L = 0;
-    while (L < (int) c->ckeys.size() && L < P && c->ckeys[L] == keys[L]) L++;
-    qz_snap * use = nullptr;
-    for (auto & sn : c->snaps) {
-        if (sn.pos < 0) continue;
-        if (sn.pos + 1 > L) { sn.pos = -1; continue; }   // its tokens differ from this prompt's
-        if (sn.pos <= P - 1 && (!use || sn.pos > use->pos)) use = &sn;
-    }
-    int start = 0;
-    if (use) { qz_snap_restore(c, *use); start = use->pos; }
-    else { c->eng.reset_state(); for (auto & sn : c->snaps) sn.pos = -1; }
-    c->ckeys = keys;
-    // the first message's end: the second <|im_start|> (a snapshot there is
-    // pinned while prompts keep matching it)
-    c->head = -1;
-    for (int q = 1; q < P - 1; q++)
-        if (p[q] == QZ_IM_START) { c->head = q; break; }
-    // chunks up to P - 2, a snapshot at each chunk end, at the first message's
-    // end and mid-chunk at the last <|im_start|> (else c->tail before the end)
-    const int chunk = 2048;
-    int cut = P - 1 - c->tail;
-    for (int q = P - 2; q > start; q--)
-        if (p[q] == QZ_IM_START) { cut = q; break; }
-    // progress per chunk on stderr when the prefill spans more than one chunk
-    const bool pf_prog = P - 1 - start > chunk;
-    auto tc = t0;
-    for (int a = start; a < P - 1;) {
-        int b = std::min(a + chunk, P - 1);
-        if (c->head > a && c->head < b) b = c->head;
-        qz_snap * mid = cut > a && cut < b ? qz_snap_slot(c, cut, use) : nullptr;
-        float * md[2] = { mid ? c->sdn[0] : nullptr, mid ? c->sdn[1] : nullptr }, * mc[2] = { mid ? c->scs[0] : nullptr, mid ? c->scs[1] : nullptr };
-        if (c->pf.run(c->eng, p.data() + a, a, b - a, p[b], mid ? cut - a : -1, md, mc, mm)) { qz_cache_drop(c); if (st) st->stop = -1; return -1; }
+    qz_pcache::hooks h;
+    h.reset = [&] { c->eng.reset_state(); };
+    h.restored = [&] {   // the decode rings and control words start clean
+        for (int i = 0; i < 2; i++) {
+            qz_card & K = c->eng.C[i];
+            CHECK(hipSetDevice(qz_dev_of(i)));
+            CHECK(hipMemsetAsync(K.ring_all, 0, (size_t) c->eng.hp.n_recr * 2 * g2_RING_PAR * 4, K.st));
+            CHECK(hipMemsetAsync(K.ctl_d, 0, 8 * sizeof(int), K.st));
+        }
+        c->eng.sync2();
+    };
+    h.chunk = [&](int a, int b, int mid) {
+        float * md[2] = { mid >= 0 ? c->sdn[0] : nullptr, mid >= 0 ? c->sdn[1] : nullptr };
+        float * mc[2] = { mid >= 0 ? c->scs[0] : nullptr, mid >= 0 ? c->scs[1] : nullptr };
+        if (c->pf.run(c->eng, p.data() + a, a, b - a, p[b], mid, md, mc, mm)) return -1;
         if (ds_on) { c->eng.sync2(); c->ds.fill_prefill(c->pf.feat, c->pf.Mmax, a, b - a); }
-        if (mid) {   // the staged mid-chunk state to its host slot (stream order: before the next chunk rewrites it)
-            for (int i = 0; i < 2; i++) {
-                CHECK(hipSetDevice(qz_dev_of(i)));
-                CHECK(hipMemcpyAsync(mid->dn[i], c->sdn[i], qz_dn_bytes(c->eng), hipMemcpyDeviceToHost, c->eng.C[i].st));
-                CHECK(hipMemcpyAsync(mid->cs[i], c->scs[i], qz_cs_bytes(c->eng), hipMemcpyDeviceToHost, c->eng.C[i].st));
-            }
-            CHECK(hipSetDevice(qz_dev_of(0)));
-            mid->pos = cut; mid->use = ++c->clock;
-        }
-        qz_snap_take(c, b, mid);
-        if (pf_prog) {
-            c->eng.sync2();
-            const auto t = std::chrono::steady_clock::now();
-            const double ms = std::chrono::duration<double, std::milli>(t - tc).count();
-            const double tot = std::chrono::duration<double, std::milli>(t - t0).count();
-            qz_stamp(stderr);
-            fprintf(stderr, "  prefill %d/%d %.0f t/s %.1f s\n",
-                    b, P - 1, 1000.0 * (b - a) / ms, tot / 1000.0);
-            tc = t;
-        }
-        a = b;
-    }
+        return 0;
+    };
+    h.sync = [&] { c->eng.sync2(); };
+    // message boundary: <|im_start|>
+    const int start = c->pc.prefill(p.data(), P, qz_keys(p, mm, row_hash), QZ_IM_START, 2048, c->tail, h);
+    if (start < 0) { if (st) st->stop = -1; return -1; }
     c->last_cached = start;
     const double pf_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     // greedy and sampled requests alike on DSpine (sampled: drafts from the
@@ -437,7 +335,7 @@ int q35_ctx::image_add(const void * bytes, size_t n, int * nx, int * ny) {
     const uint64_t h = qz_fnv(bytes, n) ^ (uint64_t) n;
     for (auto & im : c->imgs)
         if (im.hash == h) {
-            im.use = ++c->clock;
+            im.use = ++c->img_clock;
             if (nx) *nx = im.nx;
             if (ny) *ny = im.ny;
             return im.id;
@@ -452,7 +350,7 @@ int q35_ctx::image_add(const void * bytes, size_t n, int * nx, int * ny) {
         c->imgs.erase(lru);
     }
     q35_ctx::img im;
-    im.hash = h; im.id = c->img_next++; im.nx = gx; im.ny = gy; im.use = ++c->clock;
+    im.hash = h; im.id = c->img_next++; im.nx = gx; im.ny = gy; im.use = ++c->img_clock;
     im.rows.resize((size_t) nt * QZ_D);
     if (qz_vision_copy_rows(c->vis, im.rows.data()) != nt) return -1;
     c->imgs.push_back(std::move(im));
