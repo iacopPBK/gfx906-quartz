@@ -1,4 +1,4 @@
-// Tokenizer: byte-level BPE + the qwen35 pre-tokenizer from the GGUF metadata,
+// Tokenizer: byte-level BPE + the GGUF's pre-tokenizer (tokenizer.ggml.pre),
 // mirroring llama.cpp's BPE path; C entry points for ctypes.
 #include "gguf_lite.h"
 #include "unicode.h"
@@ -33,10 +33,24 @@ struct tok_data {
     uint32_t attr = 0;
 };
 
-// qwen35 pre-tokenizer regex; exact string from llama.cpp's
-// LLAMA_VOCAB_PRE_TYPE_QWEN35 (dispatches to the custom splitter in unicode.cpp)
+// pre-tokenizers by tokenizer.ggml.pre: llama.cpp's regex lists for those pre
+// types, exact strings (qwen35 dispatches to unicode.cpp's custom splitter;
+// gpt-4o is the lookahead form llama.cpp runs on std::regex)
 const char * const QWEN35_RE =
     "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+const char * const GPT4O_RE =
+    "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))*((?=[\\p{L}\\p{M}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))+((?=[\\p{L}\\p{M}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
+struct tok_pre {
+    const char * name;                       // tokenizer.ggml.pre
+    std::initializer_list<const char *> re;  // applied in order
+    bool no_bos;                             // llama.cpp clears the bos id
+};
+const tok_pre TOK_PRES[] = {
+    { "qwen35",   { QWEN35_RE }, false },
+    { "inkling2", { GPT4O_RE }, true },
+    { "gpt-4o",   { GPT4O_RE }, false },
+};
 
 struct tok_vocab {
     std::vector<tok_data> toks;                    // by id
@@ -48,6 +62,8 @@ struct tok_vocab {
     std::vector<int32_t> special;   // CONTROL|USER_DEFINED|UNKNOWN, text len desc
     std::vector<int32_t> eog;       // ascending
     std::string chat_template;      // tokenizer.chat_template, empty when absent
+    std::vector<std::string> pre_re;   // the pre-tokenizer's regexes
+    bool no_bos = false;
 
     int32_t find_token(const std::string & s) const {
         auto it = text_to_id.find(s);
@@ -139,6 +155,20 @@ static bool vocab_load(tok_vocab & v, const gguf_context * g) {
         fprintf(stderr, "qz_tok: unsupported tokenizer.ggml.model\n");
         return false;
     }
+    {   // absent key: qwen35, the only pre-tokenizer before the table
+        const int64_t id = gguf_find_key(g, "tokenizer.ggml.pre");
+        const std::string pre = id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_STRING ? gguf_get_val_str(g, id) : "qwen35";
+        const tok_pre * tp = nullptr;
+        for (const auto & e : TOK_PRES) if (pre == e.name) tp = &e;
+        if (!tp) {
+            fprintf(stderr, "qz_tok: unsupported tokenizer.ggml.pre '%s'; supported:", pre.c_str());
+            for (const auto & e : TOK_PRES) fprintf(stderr, " %s", e.name);
+            fprintf(stderr, "\n");
+            return false;
+        }
+        v.pre_re.assign(tp->re.begin(), tp->re.end());
+        v.no_bos = tp->no_bos;
+    }
     const int64_t tok_id = gguf_find_key(g, "tokenizer.ggml.tokens");
     if (tok_id < 0 || gguf_get_kv_type(g, tok_id) != GGUF_TYPE_ARRAY ||
         gguf_get_arr_type(g, tok_id) != GGUF_TYPE_STRING) {
@@ -213,6 +243,7 @@ static bool vocab_load(tok_vocab & v, const gguf_context * g) {
         const int64_t id = gguf_find_key(g, "tokenizer.ggml.bos_token_id");
         if (id >= 0) v.bos_id = (int32_t) gguf_get_val_u32(g, id);
     }
+    if (v.no_bos) v.bos_id = -1;
     {
         const int64_t id = gguf_find_key(g, "tokenizer.ggml.eos_token_id");
         if (id >= 0) v.eos_id = (int32_t) gguf_get_val_u32(g, id);
@@ -289,7 +320,7 @@ struct bigram_cmp {
 
 // llm_tokenizer_bpe_session::tokenize for one raw fragment (byte_encode BPE)
 static void bpe_fragment(const std::string & text, const tok_vocab & v, std::vector<int32_t> & output) {
-    const std::vector<std::string> words = unicode_regex_split(text, {QWEN35_RE}, true);
+    const std::vector<std::string> words = unicode_regex_split(text, v.pre_re, true);
     for (const std::string & word : words) {
         std::vector<sym> symbols;
         size_t off = 0;
