@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Read QZ_TRACE records: quartz_trace.py [dir] lists requests (* = flagged);
-quartz_trace.py <file.json> [--prompt [N]] shows one request."""
+"""Read QZ_TRACE records. `quartz_trace.py [dir]` lists the requests, * marking the
+flagged ones. `quartz_trace.py <file.json> [--prompt [N]]` shows one request."""
 import glob
 import json
 import os

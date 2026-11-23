@@ -1,4 +1,4 @@
-// host only: hparams from the GGUF (shared headers first, then the arch in namespace q35)
+// host only: hparams from the GGUF. Shared headers first, then the arch in namespace q35.
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -45,7 +45,7 @@ bool qz_hparams::load(const qz_gguf & g) {
 
     const int64_t nt = gguf_get_n_tensors(g.ctx);
 
-    // layer kinds from the tensor set: attn_output, ssm_out or nextn.*
+    // layer kinds come from the tensor set: attn_output, ssm_out or nextn.*
     int max_layer = -1;
     for (int64_t t = 0; t < nt; t++) {
         const char * name = gguf_get_tensor_name(g.ctx, t);
@@ -72,8 +72,8 @@ bool qz_hparams::load(const qz_gguf & g) {
     n_layer = n_attn + n_recr;
     if (n_layer <= 0) return false;
 
-    // vocab size and attn_q's output dim come from the tensors (the GGUF
-    // has no vocab key; some exports drop attn_q's 2x)
+    // vocab size and attn_q's output dim come from the tensors: the GGUF has no vocab
+    // key, and some exports drop attn_q's 2x.
     for (int64_t t = 0; t < nt; t++) {
         const char * name = gguf_get_tensor_name(g.ctx, t);
         const int64_t ne1 = gguf_get_tensor_ne(g.ctx, t)[1];

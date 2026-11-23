@@ -1,10 +1,8 @@
-// The two cards the engine runs on, as HIP device ordinals. qz_dev_select() runs
-// once before any allocation: QZ_DEVICES=a,b if set, else 0 and 1.
-//
-// HIP device 0 must be gfx906 whatever the pair is: this build carries gfx906
-// code objects only and the runtime resolves a kernel through device 0, so a
-// card of another architecture in slot 0 fails every launch ("invalid device
-// function") even when the work runs elsewhere.
+// The two cards the engine runs on, as HIP device ordinals. qz_dev_select() runs once
+// before any allocation: QZ_DEVICES=a,b when set, else devices 0 and 1. HIP device 0
+// must be gfx906 whatever the pair is. This build has gfx906 code objects only and
+// the runtime resolves kernels through device 0, so another architecture in slot 0 fails
+// every launch ("invalid device function") even when the work runs elsewhere.
 #pragma once
 #include <hip/hip_runtime.h>
 
@@ -63,7 +61,7 @@ inline int qz_dev_select() {
             return 1;
         }
 
-    if (n >= 1 && !qz_dev_gfx906(p[0])) {     // no launch can succeed, whatever the pair
+    if (n >= 1 && !qz_dev_gfx906(p[0])) {
         fprintf(stderr, "quartz: HIP device 0 is %s and this build has gfx906 code objects only;\n"
                         "        the runtime resolves kernels through device 0, so nothing can run.\n"
                         "        Put a gfx906 card first, or unset the visible set.\n", p[0].gcnArchName);
@@ -97,9 +95,9 @@ inline int qz_dev_select() {
         return 0;
     }
 
-    if (qz_dev_gfx906(p[1]) && qz_dev_peer(0, 1)) return 0;   // the usual pair
+    if (qz_dev_gfx906(p[1]) && qz_dev_peer(0, 1)) return 0;
 
-    // 0 and 1 are not a usable pair: name the pairs that are and let the caller pick
+    // 0 and 1 are not a usable pair: list the pairs that are and let the caller pick
     fprintf(stderr, "quartz: HIP 0 and HIP 1 are not a usable pair (%s); usable pairs:", qz_dev_why(p, 0, 1).c_str());
     int any = 0;
     for (int a = 0; a < n; a++)

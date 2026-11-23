@@ -1,8 +1,7 @@
-// Everything the qwen35 headers include from outside the arch: system, HIP
-// and shared quartz headers, at global scope. The arch's TUs include this first,
-// then their own headers inside namespace q35 (the shared headers' #pragma
-// once makes the nested includes no-ops), so no qwen35 symbol can collide
-// with another arch's in libquartz.so.
+// Everything the qwen35 headers include from outside the arch, at global scope: the
+// system, HIP and shared quartz headers. The arch's TUs include this first, then their
+// own headers inside namespace q35, where the include guards make the nested includes
+// no-ops, so no qwen35 symbol can collide with another arch's in libquartz.so.
 #pragma once
 
 #include <hip/hip_runtime.h>

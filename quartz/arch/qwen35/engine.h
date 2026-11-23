@@ -27,8 +27,8 @@
 #define CHECK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { \
     fprintf(stderr, "HIP error %s at %s:%d\n", hipGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
 
-// card geometry (before the short macros below, which clash with its member
-// names); matches the hardcoded trunk shapes of qwen35_device.hip
+// Card geometry, read before the short macros below (they clash with its member
+// names). Matches qwen35_device.hip's trunk shapes.
 static constexpr int g2_HV = qz_geo<>::HV, g2_CCH = qz_geo<>::CCH, g2_HKV = qz_geo<>::HKV,
                      g2_RING_PAR = qz_geo<>::RING_PAR;
 
@@ -57,17 +57,15 @@ struct qz_card {
     std::vector<__half *> kvk, kvv;
     size_t arena_rows = 0;
     float2 * topk_d = nullptr;      // [QZ_TMAX][QZ_TOPK_NB][QZ_TOPK] sampled-verify candidates
-    std::vector<qz_trunk_w> wh;     // host copy of the per-layer weight / state pointers (prefill)
+    std::vector<qz_trunk_w> wh;     // host copy of the per-layer weight and state pointers (prefill)
     qz_mtp_w mw = {};
     __half * kvk_m = nullptr, * kvv_m = nullptr;
     size_t mtp_arena_rows = 0;
     qz_xbufs x;                     // exchange buffers (core/cards.h)
-    // shared scratch: the cycle's and the verify's attention partials and the
-    // prefill's buffers, never live together
+    // Shared scratch for the cycle, verify and prefill buffers, never live together
     char * scr = nullptr;
     size_t scr_bytes = 0;
-    // the buffers, 256-byte aligned, from offset 0 of the scratch; false
-    // (nothing set) if they do not fit
+    // 256-byte aligned buffers from scratch offset 0; on false nothing is set
     bool scr_carve(const std::vector<std::pair<void **, size_t>> & v) {
         size_t o = 0;
         for (const auto & b : v) o += (b.second + 255) / 256 * 256;
@@ -83,15 +81,15 @@ inline size_t qz_scr_size(const std::vector<size_t> & v) {
     return o;
 }
 
-// production generate(): timings and counts of one request
+// timings and counts of one generate() request
 struct qz_gen_stats {
-    double prefill_ms = 0, decode_ms = 0;   // wall: forced cycles incl. the boundary one / the rest
+    double prefill_ms = 0, decode_ms = 0;   // wall: forced cycles with the boundary one, then the rest
     int n_prompt = 0, n_gen = 0;            // prompt tokens, emitted tokens
-    int prefill_cycles = 0, decode_cycles = 0, decode_tok = 0;   // decode_tok: accepted, overshoot incl.
+    int prefill_cycles = 0, decode_cycles = 0, decode_tok = 0;   // decode_tok: accepted, overshoot included
     int stop = 0;                           // 0 max_new, 1 stop id, 2 abort, 3 callback, -1 error
     int dspine = 0, wide_cycles = 0;        // decoded on DSpine; its 12-row verify rounds
 };
-// emit callback: n new tokens; return false to stop the request
+// emit callback: n new tokens; false stops the request
 typedef bool (*qz_emit_fn)(void * user, const int32_t * toks, int n);
 
 class qz_engine {
@@ -104,29 +102,28 @@ public:
     int n_vocab = 0, hrows = 0, n_layer = 64, steps = 0;
     float eps = 1e-6f;
     int slot_t = 3, adapt_slack = 0;
-    size_t scratch_min = 0;    // set before init: the other scratch users' largest need (qz_card::scr)
+    size_t scratch_min = 0;    // set before init: the largest need of the other scratch users (qz_card::scr)
 
-    // load both cards (weights, exchange buffers), check residency.
-    // Returns 0 on success; nonzero (message printed) on failure.
+    // Loads both cards and checks residency; 0 on success, nonzero with a message
     int init(const char * model, int steps, int slot_t, int adapt_slack);
     void launch_cyc(int T);
     void launch_mtp(int T);
-    void sync2();           // both streams; exchange error words must be 0
+    void sync2();           // both streams; the exchange error words must be 0
     void reset_state();     // zero all persistent device state
-    // rope position = arena position + s (images move the rope behind the arena)
+    // rope position is arena position + s; images move the rope behind the arena
     void set_rope_shift(int s) { for (auto & K : C) K.A.rope_shift = s; }
-    // sampled decode for the next generate() calls (nullptr = greedy); seeds the RNG
+    // sampled decode for the next generate() calls; nullptr is greedy. Seeds the RNG.
     void set_sampling(const qz_sampling * s) { sam.set(s); }
     qz_sampler sam;
     int sampled_verify(int T, bool verify, int pos);   // after launch_cyc(T): ctl[0..2] from samples
-    // prompt forced through the cycle, then MTP decode up to max_new tokens or a stop id;
-    // pos0 > 0: state up to pos0 already in place (batched prefill). 0, or -1 on error
+    // Runs the prompt through the cycle, then MTP decode up to max_new tokens or a stop
+    // id. pos0 > 0 means prefill already left the state up to pos0. Returns 0 or -1.
     int generate(const std::vector<int32_t> & prompt, int max_new,
                  const std::vector<int32_t> & stop, qz_emit_fn emit, void * user,
                  qz_gen_stats * out, int pos0 = 0);
     volatile int abort_flag = 0;          // set from another thread to end generate()
-    // drafter switch: after each decode cycle (pos, rows); true ends generate()
-    // with stop 4, sw_pc / sw_pend = the uncommitted rows + the next anchor
+    // Drafter switch, called after each decode cycle with (pos, rows). True ends
+    // generate() with stop 4; sw_pc / sw_pend = the rows and the next anchor.
     std::function<bool(int, int)> sw_hook;
     int sw_pc = 0;
     std::vector<int32_t> sw_pend;
@@ -144,8 +141,8 @@ private:
 #include <algorithm>
 #include <chrono>
 
-// K / V arena pages for `steps` positions (trunk layers, the MTP layer) and the
-// bytes both take per card; the preflight sizes the load from the same numbers
+// K / V arena pages for `steps` positions, trunk and MTP layer, and the bytes both
+// take per card. The preflight sizes the load from the same numbers.
 inline int qz_kv_pages(int steps) { return (steps + QZ_TMAX + 63) / 64 + 1; }
 inline int qz_kv_pages_mtp(int steps) { return (steps + 2 * QZ_TMAX + 63) / 64 + 1; }
 inline size_t qz_kv_bytes(int steps, int n_attn = 16) {
@@ -259,7 +256,7 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
             fz((void **) &K.kvk_m, K.mtp_arena_rows * 2);
             fz((void **) &K.kvv_m, K.mtp_arena_rows * 2);
         }
-        // exchange: inbox data + checksums, head-merge pairs, flag (own line)
+        // exchange: inbox data, checksums, head-merge pairs, flag on its own line
         CHECK(K.x.alloc(QZ_TMAX, D));
 
         std::vector<qz_trunk_w> wh(n_layer);
@@ -357,7 +354,7 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
         A.xseq = K.x.xseq; A.xerr = K.x.xerr;
 
         // dynamic LDS opt-in per device
-        const int xs_b = QZ_XSTAGE_BYTES;   // TP2 push stage past the cycle LDS
+        const int xs_b = QZ_XSTAGE_BYTES;   // TP2 push stage beyond the cycle's LDS
         const int sm1 = (int) qz_cycle_smem<1>() + xs_b, sm2 = (int) qz_cycle_smem<2>() + xs_b, sm3 = (int) qz_cycle_smem<3>() + xs_b, sm4 = (int) qz_cycle_smem<4>() + xs_b;
         CHECK(hipFuncSetAttribute((const void *) qz_cycle<1>, hipFuncAttributeMaxDynamicSharedMemorySize, sm1));
         CHECK(hipFuncSetAttribute((const void *) qz_cycle<2>, hipFuncAttributeMaxDynamicSharedMemorySize, sm2));
@@ -365,7 +362,7 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
         CHECK(hipFuncSetAttribute((const void *) qz_cycle<4>, hipFuncAttributeMaxDynamicSharedMemorySize, sm4));
         CHECK(hipFuncSetAttribute((const void *) qz_mtp<3>, hipFuncAttributeMaxDynamicSharedMemorySize, sm3));
         CHECK(hipFuncSetAttribute((const void *) qz_mtp<4>, hipFuncAttributeMaxDynamicSharedMemorySize, sm4));
-        // the grid barrier needs all 60 blocks resident: check every specialization
+        // the grid barrier needs all 60 blocks resident, so check every specialization
         {
             const qz_resident_kernel ks[] = {
                 {(const void *) qz_cycle<1>, sm1, "qz_cycle<1>"}, {(const void *) qz_cycle<2>, sm2, "qz_cycle<2>"},
@@ -464,7 +461,7 @@ inline int qz_engine::generate(const std::vector<int32_t> & prompt_in, int max_n
                                const std::vector<int32_t> & stop, qz_emit_fn emit, void * user,
                                qz_gen_stats * out, int pos0) {
     qz_gen_stats st;
-    // positions pos0 .. pos0 + size - 1; prompt[pos] below indexes absolute positions
+    // positions pos0 .. pos0 + size - 1; prompt[p] indexes absolute positions
     struct { const std::vector<int32_t> & v; int o; int32_t operator[](int p) const { return v[p - o]; } } prompt{prompt_in, pos0};
     const int P = pos0 + (int) prompt_in.size();
     st.n_prompt = (int) prompt_in.size();
@@ -478,16 +475,15 @@ inline int qz_engine::generate(const std::vector<int32_t> & prompt_in, int max_n
     H_mtp = true;
     H.mtp_t = 0;
     int pos = pos0;
-    // prefill: forced chunks; the last chunk's ctl[1] is the model's own token
-    // after the prompt
+    // prefill: forced chunks; the last chunk's ctl[1] holds the token after the prompt
     while (pos < P) {
         const int r = std::min(TF, P - pos);
         const bool last = pos + r == P;
         for (int t = 0; t < QZ_TMAX; t++) H.toks[t] = t < r ? prompt[pos + t] : 0;
         H.verify = 0;
         H.pos = pos; H.cycle = st.prefill_cycles;
-        // the last chunk's qz_mtp drafts the first decode cycle; earlier chunks
-        // only need the MTP K/V catch-up
+        // the last chunk's qz_mtp drafts the first decode cycle; earlier chunks only need
+        // the MTP K/V catch-up
         H.mtp_t = slot_t ? 0 : (last ? -(r + 8 * adapt_slack) : 3);
         launch_cyc(r);
         if (last && sam.smp) sampled_verify(r, false, pos);   // the first decode token, sampled
@@ -507,7 +503,7 @@ inline int qz_engine::generate(const std::vector<int32_t> & prompt_in, int max_n
     st.prefill_ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
     if (st.stop < 0) { H_mtp = false; H.mtp_t = 0; if (out) *out = st; return -1; }
     const auto t1 = clk::now();
-    // emit up to `room` tokens of v, cut at the first stop id
+    // emit tokens of v while they fit under max_new, cut at the first stop id
     auto push = [&](const int32_t * v, int n) {
         int k = 0;
         while (k < n && st.n_gen + k < max_new) {
@@ -523,7 +519,7 @@ inline int qz_engine::generate(const std::vector<int32_t> & prompt_in, int max_n
     };
     int TT = slot_t ? slot_t : ctl[7];
     if (TT < 3 || TT > 4) TT = 3;
-    // the first generated token: the last prefill chunk's bonus
+    // the first generated token: the last chunk's bonus
     bool done = max_new == 0 || push(&ctl[1], 1);
     H.toks[0] = ctl[1];
     for (int i = 1; i < TT; i++) H.toks[i] = ctl[2 + i];
@@ -568,7 +564,7 @@ inline int qz_engine::generate(const std::vector<int32_t> & prompt_in, int max_n
 }
 
 inline int qz_engine::sampled_verify(int T, bool verify, int pos) {
-    // candidates of rows 0 .. T-1 on both cards (the cycle's y_head, stream order)
+    // candidates of rows 0 .. T - 1 on both cards, from y_head, in stream order
     for (int c = 0; c < 2; c++) {
         qz_card & K = C[c];
         CHECK(hipSetDevice(qz_dev_of(c)));

@@ -1,36 +1,34 @@
-// inkling2 device bodies (docs/inkling2.md). Activations into a Q8 GEMV are
-// int8 planes (vals [K] + f32 scales [K/32]), as quartz/kernels/gemv.h reads them.
+// inkling2 device bodies (docs/inkling2.md). A Q8 GEMV takes int8 activations, values
+// [K] plus f32 scales [K/32], as quartz/kernels/gemv.h reads them.
 //
-// Every body d_* runs over one "virtual block" (index b, thread t of NT,
-// act = t < NT); the persistent decode kernel (ink2_cycle.h) runs them inside
-// 512-thread blocks. Bodies with block reductions must be called by every
-// thread of the real block (inactive threads pass act = false).
+// Every d_* body runs over one "virtual block" (index b, thread t of NT, active when
+// t < NT), and the persistent decode kernel (ink2_cycle.h) runs it inside 512-thread
+// blocks. A body with a block reduction must be called by every thread of the real block.
 #pragma once
 
-// fused multiply-adds decided by the source expression (FP_CONTRACT ON), not by
-// the backend (HIP's default "fast" fuses per inline context): the standalone
-// kernels and the persistent kernel then round identically. Restored at the end.
+// Fused multiply-adds follow the source expression (FP_CONTRACT ON) rather than the
+// backend, whose default "fast" fuses per inline context. That keeps the standalone
+// kernels and the persistent kernel rounding identically, and is restored at the end.
 #pragma clang fp contract(on)
 
 constexpr int HQL = HQ / 2, HKVL = HKV / 2;            // local heads per card
 constexpr int QL = HQL * HD, KVL = HKVL * HD;          // 1536, 512
 constexpr int FFL = FFE / 2;                           // local expert FF: 576
-// prefill chunk rows (batched prefill) and the SWA ring, indexed pos % PF_RING
-// everywhere: at least a window of WIN plus the in-flight chunk; the slack keeps
-// a prefix-cache snapshot at s restorable while writes stay below s - WIN + 1 + PF_RING
+// Prefill chunk rows, and the SWA ring, indexed pos % PF_RING everywhere. The ring holds
+// at least a window of WIN plus the in-flight chunk, and the slack keeps a prefix-cache
+// snapshot at s restorable while writes stay below s - WIN + 1 + PF_RING.
 constexpr int PF_M = 2048, PF_RING = 8192;
 static_assert(PF_RING >= WIN + PF_M, "the SWA ring holds a window plus a chunk");
 constexpr int CHL = 2 * KVL + 2 * D;                   // local conv history channels: K | V | attn post | ffn post
 constexpr int H_K = 0, H_V = KVL, H_A = 2 * KVL, H_F = 2 * KVL + D;
 constexpr int TBW = REL_EXT + 1;                       // bias table width (the zero column past the extent)
 
-// sum of N values over the first nw waves of the block (every thread of the
-// block calls it); every thread gets the sums
+// Sum of N values over the first nw waves of the block; every thread gets the sums.
 template <int N, bool DPP = true> __device__ __forceinline__ void bsum(float (&v)[N], float * red, int nw) {
     #pragma unroll
     for (int k = 0; k < N; k++)
         if constexpr (DPP) v[k] = qz_wsum_dpp(v[k]);
-        else   // inline, not qz_wsum: dev.h is outside the contract(on) region, so a caller's x * x would fuse into its first add
+        else   // not qz_wsum: dev.h is outside contract(on), so x * x would fuse into the first add
             #pragma unroll
             for (int off = 32; off > 0; off >>= 1) v[k] += __shfl_xor(v[k], off, 64);
     const int w = threadIdx.x >> 6;
@@ -50,7 +48,7 @@ template <int N> __device__ __forceinline__ void bsum(float (&v)[N], float * red
 
 __device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + expf(-x)); }
 
-// x (one row in each 32-lane half: lanes hold consecutive elements) -> int8 + the block's f16-rounded scale
+// x -> int8 plus the block's f16-rounded scale, one row per 32-lane half
 __device__ __forceinline__ void quant32(float x, unsigned char * q, float * qs, int i) {
     const float amax = qz_amax32(fabsf(x));
     const float d = amax / 127.f;
@@ -79,27 +77,28 @@ __device__ __forceinline__ void d_embed(const char * ev, const __half * es, int 
         }
 }
 
-// ---- mix(states, query): softmax over the rmsnormed states of Sn . q_j / sqrt(D); out[j] = sum w * Sn (NT 256)
+// ---- mix(states, query): softmax over the rmsnormed states of Sn . q_j / sqrt(D), and
+// out[j] = sum w * Sn (NT 256).
 struct sptrs { const float * p[6]; int n; };
 template <int MQ>
 __device__ __forceinline__ void d_mix_lds(const sptrs & S, const float * qy, float * out, int tid, bool act, float * sv) {
-    // a 512-thread block (both paths): half h takes states 3h .. 3h+2 in the sum
-    // pass (elements t + 256 k in order, one 4-wave reduction per half), the
-    // output pass takes element i = tid + 512 k over all 512 threads
+    // A 512-thread block on both paths: in the sum pass half h takes states 3h .. 3h+2,
+    // elements t + 256 k in order with one 4-wave reduction per half. The output pass
+    // takes element i = tid + 512 k over all 512 threads.
     (void) act;
     constexpr int NV = D / 256;
     __shared__ float red[2 * 4 * 3 * MQ];
     __shared__ float wsh[6][4];
     const int n = S.n;
     const int h = tid >> 8, t = tid & 255, w = (tid >> 6) & 3, lane = tid & 63;
-    // every load in flight at once: the states for LDS (512 threads), the queries
+    // Every load is in flight at once: the states for LDS and the queries.
     constexpr int NS = (D + 511) / 512;
     float st[6][NS];
     #pragma unroll
     for (int s = 0; s < 6; s++)
         #pragma unroll
         for (int k = 0; k < NS; k++) {
-            // branch-free: absent states read state 0 (never used), the D tail is clamped
+            // branch-free: absent states read state 0, never used; the D tail is clamped
             const int i = min((int) threadIdx.x + 512 * k, D - 1);
             st[s][k] = S.p[s < n ? s : 0][i];
         }
@@ -116,9 +115,8 @@ __device__ __forceinline__ void d_mix_lds(const sptrs & S, const float * qy, flo
         if (D % 512 && threadIdx.x < D % 512) sv[s * D + threadIdx.x + 512 * (D / 512)] = st[s][D / 512];
     }
     __syncthreads();
-    // two passes over the LDS states, d_mix's order: the sums of squares, then
-    // the dots of rms(x) with the queries (a one-pass rs * dot(x, q) is not
-    // bit-equal and moved a long-context greedy split to a large gap)
+    // Two passes over the LDS states, as in d_mix: the sums of squares, then the dots of
+    // rms(x) with the queries. A one-pass rs * dot(x, q) is not bit-equal.
     constexpr int NQ = 3 * MQ;
     const float * sh = sv + 3 * h * D + t;                // this half's states, this thread's column
     float r[NQ];
@@ -160,14 +158,14 @@ __device__ __forceinline__ void d_mix_lds(const sptrs & S, const float * qy, flo
         #pragma unroll
         for (int q = 0; q < NQ; q++) red[(h * 4 + w) * NQ + q] = r[q];
     __syncthreads();
-    // lanes 0 .. MQ-1 each the softmax of query j = tid (static selects): d_mix's values
+    // lanes 0 .. MQ-1 each run the softmax of query j = tid, on d_mix's values
     if (tid < MQ) {
         float v[6];
         #pragma unroll
         for (int s = 0; s < 6; s++) {
             float a = 0.f;
             #pragma unroll
-            for (int i = 0; i < 4; i++) a += red[((s / 3) * 4 + i) * NQ + (s % 3) * MQ + tid];   // LDS index, j = tid
+            for (int i = 0; i < 4; i++) a += red[((s / 3) * 4 + i) * NQ + (s % 3) * MQ + tid];
             v[s] = a;
         }
         const float scale = 1.f / sqrtf((float) D);
@@ -214,10 +212,10 @@ static __global__ __launch_bounds__(512) void k_mix(sptrs S, const float * qy, f
     d_mix_lds<MQ>(S, qy, out, threadIdx.x, true, mix_lds);
 }
 
-// ---- control(cur, msg): g = [rms(cur); rms(msg)] . down; out = (1 - tanh(g.forget)) * cur + tanh(g.gain) * msg
-// wgt / wft: gain / forget transposed to [GRANK][D] (the persistent kernel's coalesced copy)
+// ---- control(cur, msg): g = [rms(cur); rms(msg)] . down, and the result is
+// (1 - tanh(g.forget)) * cur + tanh(g.gain) * msg. wgt / wft are gain / forget transposed
+// to [GRANK][D], which the persistent kernel copies coalesced.
 struct cjob { const float * cur, * msg, * wd, * wg, * wf; float * g, * out; const float * wgt, * wft; };
-// [D][GRANK] -> [GRANK][D]
 static __global__ void k_ctrl_t(const float * s, float * d) {
     const int i = blockIdx.x * 256 + threadIdx.x;
     if (i >= D) return;
@@ -251,8 +249,8 @@ __device__ __forceinline__ void d_norm_quant(const njob & a, float eps, int tid,
 }
 static __global__ __launch_bounds__(256) void k_norm_quant(njobs J, float eps) { d_norm_quant(J.j[blockIdx.x], eps, threadIdx.x, true); }
 
-// ---- several Q8 GEMVs in one launch: y[N] = W[N][K] . a; 32 rows per 512-thread block
-// (yp: optional second copy of the outputs, the TP2 peer inbox)
+// ---- several Q8 GEMVs in one launch: y[N] = W[N][K] . a, 32 rows per 512-thread block.
+// yp, when given, takes a second copy of the outputs for the TP2 peer inbox.
 struct gjob { const char * wv; const __half * ws; const unsigned char * av; const float * as; float * y; int N, K, g1; };
 struct gjobs { gjob j[8]; int n; };
 __device__ __forceinline__ void d_gemv(const gjobs & J, int b, float * yp) {
@@ -270,8 +268,8 @@ __device__ __forceinline__ void d_gemv(const gjobs & J, int b, float * yp) {
 }
 static __global__ __launch_bounds__(512) void k_gemv(gjobs J) { d_gemv(J, blockIdx.x, nullptr); }
 
-// ---- per local head, after the projections: Q / R clip and tau, the bias table, K / V conv + clip / norm into the cache
-// (NT 128, virtual blocks HQL + 2 HKVL)
+// ---- per local head, after the projections: Q / R clip and tau, the bias table, then
+// K / V conv with clip and norm into the cache (NT 128, virtual blocks HQL + 2 HKVL).
 struct hpost {
     const float * qr, * rr, * sk, * kr, * vr, * dk, * dv;     // raw projections (dk / dv null on SWA layers)
     const float * qclip, * rclip, * relb, * kconv, * vconv;
@@ -280,7 +278,7 @@ struct hpost {
     __half * kc, * vc;                                       // the cache rows to write
     float tau, qk_clip, rel_clip, eps;
 };
-// dmax: the table entries computed (TBW; the persistent kernel: the ones pos can read)
+// dmax: the table entries computed (TBW, or min(TBW, pos + 1) in the persistent kernel)
 __device__ __forceinline__ void d_head_post(const hpost & a, int b, int t, bool act, int dmax = TBW) {
     __shared__ float red[2 * 2];
     __shared__ float rv[DREL];
@@ -343,15 +341,14 @@ __device__ __forceinline__ void d_head_post(const hpost & a, int b, int t, bool 
     }
 }
 
-// ---- one query row: softmax(q.k / sqrt(HD) + table[d]) with a zero sink, times
-// sigmoid(gate), into int8 planes for attn_output. A local KV head's keys (and
-// its GQ query heads, which share them: K / V are read once) are split over
-// ATT_SPL virtual blocks of 8 waves (512 threads); a wave is 4 row groups of 16
-// lanes, a lane holding 8 dims (16-byte K / V loads). Group g of the ATT_G takes
-// keys lo + g, lo + g + ATT_G, ... two per step (online softmax per head). The
-// partials merge in a fixed order: the wave's 4 groups (xor 16, 32), the
-// block's 8 waves (LDS) into part, then the KV head's last block to finish
-// (cnt) merges the ATT_SPL block partials. Both paths run this body: the same bits.
+// ---- attention output for one query row: softmax(q.k / sqrt(HD) + table[d]) with a zero
+// sink, times sigmoid(gate), into int8 planes for attn_output. A local KV head's keys are
+// shared by its GQ query heads and read once, split over ATT_SPL virtual blocks of 8
+// waves (512 threads). A wave is 4 row groups of 16 lanes, a lane holding 8 dims. Group g
+// of the ATT_G takes keys lo + g, lo + g + ATT_G, ... two per step, with the online
+// softmax per head. Partials merge in a fixed order: the wave's 4 groups by xor 16 and
+// 32, the block's 8 waves in LDS into part, then the KV head's last block to finish
+// (cnt) merges the ATT_SPL block partials. Both paths run this body, so the bits match.
 constexpr int GQ = HQ / HKV, ATT_SPL = 15, ATT_G = ATT_SPL * 8 * 4, ATT_PW = HD + 2;
 struct attn_args {
     const float * q, * tb, * gate;
@@ -361,8 +358,8 @@ struct attn_args {
     float * part;                 // [HKVL][ATT_SPL][GQ][ATT_PW]
     int * cnt;                    // [HKVL], zero between uses (the merger resets it)
 };
-// a partial (m, l, o) absorbs another: the exponents against the joint max
-// (-inf on both sides: nothing yet)
+// A partial (m, l, o) absorbs another, both rescaled by the exponents against the joint
+// max. With m = m2 = -inf, nothing has been seen yet.
 __device__ __forceinline__ void att_join(float & m, float & l, float * o, float m2, float l2, const float * o2, int n) {
     const float M = fmaxf(m, m2);
     const float a = m == -INFINITY ? 0.f : expf(m - M), b = m2 == -INFINITY ? 0.f : expf(m2 - M);
@@ -507,9 +504,9 @@ __device__ __forceinline__ void d_attn(const attn_args & a, int kvh, int sp, int
 }
 // grid HKVL * ATT_SPL
 
-// ---- the TP2 sum of the two cards' partials, then a short conv (no dynamic taps) with its history;
-// blk null: x += a; else blk = x, x = a (a new residual block). One block, elements t, t + NT, ...,
-// all loads first (latency bound)
+// ---- the TP2 sum of the two cards' partials, then a short conv with its history and no
+// dynamic taps. blk null: x += a. Otherwise blk = x and x = a, a new residual block. One
+// block covers t, t + NT, ... and issues all loads first, since it is latency bound.
 template <int NT>
 __device__ __forceinline__ void d_xconv_blk(const float * own, const float * peer, const float * w, float * hs,
                                             float * x, float * blk, int t) {
@@ -537,8 +534,8 @@ __device__ __forceinline__ void d_xconv_blk(const float * own, const float * pee
     }
 }
 
-// ---- router: sigmoid(f . W), top NE_USED by p + bias, weights p / sum(p) * scale
-// one wave per expert (the 64-lane strided sum + xor tree); ps[e] = p, ps[NE + e] = p + bias
+// ---- router: sigmoid(f . W), the top NE_USED by p + bias, weights p / sum(p) * scale. A
+// wave per expert (64-lane strided sum, xor tree). ps[e] = p, ps[NE + e] = p + bias.
 static_assert(D / 64 % 12 == 0, "router chunks");
 __device__ __forceinline__ void d_router(const float * f, const float * wr, const float * bias, float * ps, int e, int lane) {
     // the loads 12 + 12 at a time, the same sum order
@@ -555,8 +552,8 @@ __device__ __forceinline__ void d_router(const float * f, const float * wr, cons
     for (int off = 32; off > 0; off >>= 1) s += __shfl_xor(s, off, 64);
     if (lane == 0) { const float p = sigm(s); ps[e] = p; ps[NE + e] = p + bias[e]; }
 }
-// gate_up rows are interleaved per 32 at load (gu_interleave): tile T of 64 rows holds
-// gate rows 32T..32T+31 then the matching up rows; gate row j sits at gu_row(j), its up row 32 later
+// gate_up rows are interleaved in 32s at load (k_gu_interleave): tile T of 64 rows holds
+// gate rows 32T..32T+31 then the matching up rows, so gate row j has its up row 32 later.
 __device__ __host__ __forceinline__ int gu_row(int j) { return (j / 32) * 64 + j % 32; }
 static __global__ __launch_bounds__(256) void k_gu_interleave(const char * sv, const __half * ss, char * dv, __half * ds) {
     const int p = blockIdx.x, e = blockIdx.y, r = p % 64;

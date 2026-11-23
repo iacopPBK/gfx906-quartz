@@ -1,3 +1,6 @@
+// DSpine drafter: the draft model's kernels, the TG / TSV tables built at load and the
+// greedy chain, with qz_ds_block_round2 running one round of DS_T rows over both cards.
+// Included by qwen35_model.cpp in namespace q35.
 #pragma once
 
 #include "dspine.h"
@@ -13,7 +16,7 @@
 #define DS_TOPK 16              // candidates per row
 
 // ------------------------------------------------------------ kernels ----
-// dequantize `nrows` Q8 rows to f32, gathered by ids when not null
+// dequantize nrows Q8 rows to f32; with ids set, output row r reads source row ids[r]
 __global__ void __launch_bounds__(256) ds_deq_rows(const unsigned char * qv, const unsigned short * qs,
                                                    const int * ids, float * y, int nrows, int n) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -24,7 +27,7 @@ __global__ void __launch_bounds__(256) ds_deq_rows(const unsigned char * qv, con
            __half2float(__ushort_as_half(qs[(size_t) sr * (n / 32) + e / 32]));
 }
 
-// per-head RMSNorm + rope at position p0 + r; one block of 128 per (row, head)
+// per-head RMSNorm then rope at position p0 + r, one 128-thread block per (row, head)
 __global__ void __launch_bounds__(128) ds_norm_rope(float * x, const float * nw, const float * inv,
                                                     int hcount, int nrows, int p0) {
     const int h = blockIdx.x % hcount, r = blockIdx.x / hcount;
@@ -52,8 +55,7 @@ __global__ void __launch_bounds__(128) ds_norm_rope(float * x, const float * nw,
     }
 }
 
-// msg_t = sigmoid(q_t + s_{t-1} + b) * v_{t-1} for t >= 1 (row 0 stays zero);
-// packed rows are [q | s | v]
+// msg_t = sigmoid(q_t + s_{t-1} + b) * v_{t-1}, for t >= 1; packed rows are [q | s | v]
 __global__ void __launch_bounds__(256) ds_gate_msg(const float * packed, const float * b,
                                                    float * msg, int nrows) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -65,7 +67,7 @@ __global__ void __launch_bounds__(256) ds_gate_msg(const float * packed, const f
     msg[(size_t) r * DS_R + e] = g * prev[2 * DS_R + e];
 }
 
-// out' = raw + rms * delta for rows t >= 1 (the anchor row is unchanged)
+// out = raw + rms * delta for rows t >= 1; the anchor row (0) is unchanged
 __global__ void __launch_bounds__(256) ds_out_add(float * raw, const float * delta, const float * rms,
                                                   int nrows, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -74,7 +76,7 @@ __global__ void __launch_bounds__(256) ds_out_add(float * raw, const float * del
     raw[i] = raw[i] + (r > 0 ? rms[r] : 0.f) * delta[i];
 }
 
-// silu(gate) * up, elementwise (gate is replaced in place)
+// silu(gate) * up elementwise, written back over gate
 __global__ void __launch_bounds__(256) ds_silu_mul(float * g, const float * u, int tot) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if ((size_t) i >= (size_t) tot) return;
@@ -83,7 +85,7 @@ __global__ void __launch_bounds__(256) ds_silu_mul(float * g, const float * u, i
 }
 
 // ------------------------------------------------- fast draft kernels ----
-// top-16 (value desc, ties -> lower id): stage A per chunk, stage B merges
+// top-16 by value, ties to the lower id. Stage A runs per chunk, stage B merges.
 #define DS_TK_CH 1024
 __device__ __forceinline__ bool ds_tk_better(float av, int ai, float bv, int bi) {
     return av > bv || (av == bv && ai < bi);
@@ -96,8 +98,7 @@ __device__ __forceinline__ void ds_tk_wave_best(float & v, int & i) {
         if (ds_tk_better(ov, oi, v, i)) { v = ov; i = oi; }
     }
 }
-// NV values per thread held in registers (ids base + t + j * 256), 16
-// rounds of block argmax; the winner's owner retires it
+// NV candidates per thread held in registers; each block-argmax round retires its winner
 template <int NV> __device__ __forceinline__ void ds_tk_select(float (&v)[NV], int (&id)[NV],
                                                                 float * outv, int * outi) {
     __shared__ float wv[4];
@@ -160,8 +161,7 @@ __global__ void __launch_bounds__(256) ds_top16_b(const float * pv, const int * 
     if (outv && t < DS_TOPK) outv[(size_t) r * DS_TOPK + t] = ov[t];
 }
 
-// the same with float4 loads (K % 1024 == 0 per wave quarter not needed:
-// lanes walk float4 groups of the wave's K quarter, K % 16 == 0)
+// f32 T-row GEMV with float4 loads, K % 16 == 0; lanes walk float4 groups of a K quarter
 template <int T>
 __global__ void __launch_bounds__(256) ds_fgemvK4(const float * x, const float * w, float * y, int N, int K) {
     __shared__ float red[4][T][4];
@@ -202,7 +202,7 @@ __global__ void __launch_bounds__(256) ds_fgemvK4(const float * x, const float *
     }
 }
 
-// block-wide sum over 256 threads (4 waves); every thread gets the total
+// block-wide sum over the 256 threads (4 waves), returned to every thread
 __device__ __forceinline__ float ds_bsum(float v) {
     __shared__ float r4[4];
     v = qz_wsum(v);
@@ -247,11 +247,11 @@ __global__ void __launch_bounds__(256) ds_code_b(float * proj, const unsigned ch
     for (int i = threadIdx.x; i < n; i += 256) pr[i] *= inv;
 }
 
-// block attention, split over positions: one block per (split, kv head),
-// partials merged by ds_attn_comb3; sliding window W, causal within the block
+// block attention split over positions: one block per (split, kv head), partials merged
+// by ds_attn_comb3. Sliding window DS_W, causal.
 
-// ds_gemvR: T-row GEMV for T <= 12, activations in LDS, up to 4 weight
-// segments per launch; nkc K chunks write partials at y + c ystr
+// ds_gemvR: T-row GEMV, T <= 12, activations in LDS, up to 4 weight segments per launch.
+// nkc K chunks write partials at y + kc * ystr.
 struct ds_seg { const char * w; const __half * ws; int N; float * y; int b0; };
 struct ds_segs { ds_seg s[4]; int n; };
 #ifndef DS_RS
@@ -367,7 +367,7 @@ __global__ void __launch_bounds__(64 * NW) ds_gemvR(const unsigned char * a_vals
                     if (r0 + s < N) y[(size_t) t * N + r0 + s] = acc[t][s];
     }
 }
-// launch: segments {w, ws, N, y}, K activation width (= units staged), ldw weight row stride
+// launch: segments {w, ws, N, y}; K is the activation width, ldw the weight row stride
 template <int T>
 inline void ds_gemvR_launchT(hipStream_t st, const unsigned char * a, const float * as, int K, int ldw,
                              std::initializer_list<ds_seg> segs, int nkc, size_t ystr) {
@@ -381,14 +381,13 @@ inline void ds_gemvR_launchT(hipStream_t st, const unsigned char * a, const floa
     if (!attr[dev]) { DS_CHECK(hipFuncSetAttribute((const void *) ds_gemvR<T, DS_RS, DS_RW, DS_RL>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536)); attr[dev] = true; }
     ds_gemvR<T, DS_RS, DS_RW, DS_RL><<<dim3(60), dim3(64 * DS_RW), 65536, st>>>(a, as, K, ldw, G, b, nkc, ystr);
 }
-// nt: the round's live rows (8 or DS_T); rows past nt keep stale values that
-// no live row reads (the block attention is causal)
+// nt: the round's live rows, 8 or DS_T. Rows past nt are stale and never read (causal).
 inline void ds_gemvR_launch(int nt, hipStream_t st, const unsigned char * a, const float * as, int K, int ldw,
                             std::initializer_list<ds_seg> segs, int nkc = 1, size_t ystr = 0) {
     if (nt <= 8) ds_gemvR_launchT<8>(st, a, as, K, ldw, segs, nkc, ystr);
     else ds_gemvR_launchT<DS_T>(st, a, as, K, ldw, segs, nkc, ystr);
 }
-// y[i] += y[i + n] (the K-chunk partial fold before an exchange)
+// y[i] += y[i + n], folding the K-chunk partials before an exchange
 __global__ void ds_fold2(float * y, int n) {
     const int i = blockIdx.x * 256 + threadIdx.x;
     if (i < n) y[i] = y[i] + y[i + n];
@@ -397,10 +396,10 @@ __global__ void ds_fold2(float * y, int n) {
 #ifndef DS_AT_PS
 #define DS_AT_PS 128             // positions per split (4 tiles: a 4x shorter combine)
 #endif
-// ps (positions per split, a multiple of DS_A3_TL) is a runtime choice.
+// ps, the positions per split, is a runtime choice and a multiple of DS_A3_TL.
 #define DS_A3_TL 16
 #ifndef DS_A3_W
-#define DS_A3_W 3                // waves per SIMD the registers are fitted to
+#define DS_A3_W 3                // waves per SIMD the register budget is fitted to
 #endif
 __global__ void __launch_bounds__(256, DS_A3_W) ds_attn_split3(const float * q, const float * kc, const float * vc,
                                                       int n_ctx, const float * kb, const float * vb,
@@ -410,7 +409,7 @@ __global__ void __launch_bounds__(256, DS_A3_W) ds_attn_split3(const float * q, 
     __shared__ float4 vs[DS_A3_TL][DS_HD / 4];
     const int sp = blockIdx.x, h = blockIdx.y, th = threadIdx.x;
     const int qi = th >> 3, g = th & 7;
-    const int qt_raw = blockIdx.z * 8 + (qi >> 2), qt = min(qt_raw, DS_T - 1), qj = qi & 3, hq = h * 4 + qj;   // blockIdx.z: group of 8 rows (rows past DS_T mirror the last)
+    const int qt_raw = blockIdx.z * 8 + (qi >> 2), qt = min(qt_raw, DS_T - 1), qj = qi & 3, hq = h * 4 + qj;   // blockIdx.z: group of 8 rows; rows past DS_T mirror the last
     const int ncl = n_ctx - wbase;
     const float4 * qrow = (const float4 *) (q + (size_t) qt * (nql * DS_HD) + (size_t) hq * DS_HD);
     float4 qr[4], acc[4];
@@ -452,8 +451,8 @@ __global__ void __launch_bounds__(256, DS_A3_W) ds_attn_split3(const float * q, 
             vs[i >> 5][i & 31] = pv[r];
         }
         __syncthreads();
-        // positions k and 8 + k together, folded at once by the first
-        // reduce-scatter step (lanes g & 4 keep 8 + k): 8 live partials
+        // positions k and 8 + k are summed together by the first reduce-scatter step,
+        // with lanes g & 4 keeping 8 + k; 8 live partials remain
         float v8[8], v4[4], v2[2];
         #pragma unroll
         for (int k = 0; k < 8; k++) {
@@ -525,8 +524,7 @@ __global__ void __launch_bounds__(256, DS_A3_W) ds_attn_split3(const float * q, 
         part_ml[((size_t) sp * (DS_T * nql) + qrw) * 2 + 1] = l;
     }
 }
-// merge for ds_attn_split3's partials: the split weights in parallel
-// (one thread per split into LDS), then independent part_o loads
+// merges ds_attn_split3's partials (a thread per split, then independent part_o loads)
 __global__ void __launch_bounds__(128) ds_attn_comb3(const float * part_o, const float * part_ml, float * o, int nsp,
                                                      int nql = DS_NQ) {
     __shared__ float ws[128], red[2];
@@ -554,8 +552,7 @@ __global__ void __launch_bounds__(128) ds_attn_comb3(const float * part_o, const
     for (int s = 0; s < nsp; s++) acc += ws[s] * part_o[((size_t) s * st + qrow) * DS_HD + e];
     o[(size_t) qrow * DS_HD + e] = L > 0.f ? acc / L : 0.f;
 }
-// positions per split for ds_attn_split3: ~3 blocks per CU over the grid
-// (60 CUs), at least 2 tiles; never more splits than the at_o allocation
+// ps for ds_attn_split3: ~3 blocks per CU over 60 CUs, at least 2 tiles, capped by at_o
 static inline int ds_a3_ps(int S, int heads) {
     const int target = (180 + heads - 1) / heads;
     int ps = (S + target - 1) / target;
@@ -564,13 +561,12 @@ static inline int ds_a3_ps(int S, int heads) {
 }
 
 // ------------------------------------------------ the two-card round ----
-// x += a + b (the two cards' partials, card 0's first on both cards)
+// x += a + b: the two cards' partials, bit-identical on both cards
 __global__ void __launch_bounds__(256) ds_add2(float * x, const float * a, const float * b, int tot) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < tot) x[i] = x[i] + (a[i] + b[i]);
 }
-// the global top-16 from the two vocab halves' top-16s (the same total
-// order: value desc, ties -> lower id; the halves partition the ids)
+// global top-16 merge of the two vocab halves, ordered by value, ties to the lower id
 __global__ void __launch_bounds__(256) ds_top16_m(const float * av, const int * ai, const float * bv, const int * bi,
                                                   int * out) {
     const int r = blockIdx.x, t = threadIdx.x;
@@ -584,8 +580,7 @@ __global__ void __launch_bounds__(256) ds_top16_m(const float * av, const int * 
     if (t < DS_TOPK) out[r * DS_TOPK + t] = oi[t];
 }
 
-// the chain's bas for one candidate: <raw_{i+1} * onorm, deq(head row)>, one
-// wave, double accumulation
+// a candidate's bas: <raw_{i+1} * onorm, deq(head row)>, one wave, double accumulation
 __device__ __forceinline__ float ds_bas_dot(const float * rr, const float * onorm, const unsigned char * hv,
                                             const unsigned short * hs, int lane) {
     double acc = 0.0;
@@ -598,7 +593,7 @@ __device__ __forceinline__ float ds_bas_dot(const float * rr, const float * onor
     for (int off = 32; off > 0; off >>= 1) acc += __shfl_down(acc, off, 64);
     return (float) acc;                               // the host's sdot_s returns float
 }
-// each card's bas for its own vocab half's top-16 (ds_bas_pick merges)
+// each card's bas for the top-16 of its own vocab half; ds_bas_pick merges them
 __global__ void __launch_bounds__(256) ds_chain_bas_l(const float * raw, const float * onorm, const int * ids, int id0,
                                                       const unsigned char * hv, const unsigned short * hs, float * bas) {
     const int w = blockIdx.x * 4 + (threadIdx.x >> 6), lane = threadIdx.x & 63;
@@ -608,8 +603,7 @@ __global__ void __launch_bounds__(256) ds_chain_bas_l(const float * raw, const f
     const float b = ds_bas_dot(raw + (size_t) (i + 1) * DS_H, onorm, hv + r * DS_H, hs + r * (DS_H / 32), lane);
     if (lane == 0) bas[w] = b;
 }
-// this card's TG / TSV rows of its own top-16 (and the anchor's TSV row if in
-// its half); ds_rows_pick stages them on card 0
+// this card's top-16 TG / TSV rows, and the anchor's TSV row when its id is in its half
 __global__ void __launch_bounds__(256) ds_rows_l(const float * TG, const float * TSV, const int * ids, int id0, int anchor,
                                                  float * tg, float * tsv, float * tsva) {
     const int w = blockIdx.x, t = threadIdx.x;
@@ -624,11 +618,11 @@ __global__ void __launch_bounds__(256) ds_rows_l(const float * TG, const float *
 }
 
 // ----------------------------------------------------------------- host ----
-// the block-pass state on one device (context rings live in qz_ds_ctx)
+// the block-pass state on one card; the context rings live in qz_ds_ctx
 struct qz_ds_block {
     int dev = 0;
     hipStream_t st = nullptr;
-    qz_loader ld;                     // draft: block / bridge / codebook tensors
+    qz_loader ld;                     // the draft's block, bridge and codebook tensors
     // per-layer Q8 planes
     const unsigned char * q_v[DS_FL] = {}, * o_v[DS_FL] = {}, * g_v[DS_FL] = {}, * u_v[DS_FL] = {}, * d_v[DS_FL] = {};
     const unsigned short * q_s[DS_FL] = {}, * o_s[DS_FL] = {}, * g_s[DS_FL] = {}, * u_s[DS_FL] = {}, * d_s[DS_FL] = {};
@@ -645,10 +639,9 @@ struct qz_ds_block {
     float * bas_l = nullptr;                          // [T-1][16] bas of this card's half top-16 (tki)
     float * pbas = nullptr;                           // card 0: the peer half's
     float * TG = nullptr, * TSV = nullptr;             // this card's rows [dev V/2, (dev + 1) V/2) of [V][R], [V][2R]
-    float * tg_l = nullptr, * tsv_l = nullptr, * tsva_l = nullptr;   // ds_rows_l (this card's top-16 rows, the anchor's)
+    float * tg_l = nullptr, * tsv_l = nullptr, * tsva_l = nullptr;   // ds_rows_l's output: this card's top-16 rows and the anchor's
     float * ptg = nullptr, * ptsv = nullptr, * ptsva = nullptr;      // card 0: the peer's
     float * tg_s = nullptr, * tsv_s = nullptr, * tsva_s = nullptr;   // card 0: ds_rows_pick's staged rows
-    // work
     int ids[DS_T] = {};
     int * ids_d = nullptr;
     float * x = nullptr;                               // emb rows / resid stream [T][H]
@@ -670,7 +663,7 @@ struct qz_ds_block {
     float * msg = nullptr;                             // [T][R]
     float * delta = nullptr;                           // [T][H]
     float * rmsb = nullptr;                            // [T]
-    float * stash_raw = nullptr;                        // [T][H] u of the LAST layer (pre-bridge; the chain's stash raw)
+    float * stash_raw = nullptr;                        // [T][H] the last layer's u, copied before the bridge; the chain's raw input
     float * logits = nullptr;                          // [T][DS_V]
     int * cand = nullptr;                              // [T][DS_TOPK] rows 1..T-1 used
     float * hist_hdr = nullptr;                       // [T][DS_TOPK][H] dequanted cand head rows
@@ -686,8 +679,7 @@ struct qz_ds_block {
     int * tk_i = nullptr;
 };
 
-// read one whole draft tensor as f32 (dequantizing Q8_0 / converting
-// BF16 / copying F32); used for the bridge tensors and norms
+// read a draft tensor as f32 (BF16 converted, F32 copied); the bridge tensors and norms
 inline std::vector<float> ds_read_f32(qz_loader & ld, const qz_gguf & g, const char * path,
                                       const char * name, int64_t * out_ne0 = nullptr) {
     const int64_t i = ld.find(name);
@@ -719,7 +711,7 @@ inline std::vector<float> ds_read_f32(qz_loader & ld, const qz_gguf & g, const c
 }
 
 // ------------------------------------------------------------- tables ----
-// TG / TSV at load: out = alpha * deq(A) * ks @ B, A Q8_0, B f32 (M, N % 64, K % 32)
+// builds TG / TSV: out = alpha * (deq(A) * ks) @ B, A Q8_0, B f32; N % 64, K % 32
 __global__ void __launch_bounds__(256) ds_tab_gemm(const unsigned char * av, const unsigned short * as, int64_t lda,
                                                    const float * ks, const float * B, float * out,
                                                    int N, int K, float alpha) {
@@ -765,7 +757,7 @@ __global__ void __launch_bounds__(256) ds_tab_gemm(const unsigned char * av, con
 }
 
 // --------------------------------------------------------- load / free ----
-// block-pass tensors from the draft GGUF + this card's half of TG / TSV
+// loads the block-pass tensors from the draft GGUF, then this card's half of TG / TSV
 inline int qz_ds_block_load(qz_ds_block & d, qz_ds_ctx & cx, const char * draft,
                             const qz_dev_tensor * emb, const qz_dev_tensor * head_half) {
     d.dev = cx.dev;
@@ -860,7 +852,7 @@ inline int qz_ds_block_load(qz_ds_block & d, qz_ds_ctx & cx, const char * draft,
     d.hh_v = (const unsigned char *) head_half->vals;
     d.hh_s = (const unsigned short *) head_half->scal;
 
-    // TG / TSV: this card's vocab half of each table (rows [dev V/2, (dev + 1) V/2)),
+    // TG / TSV: this card's vocab half of each table, rows [dev V/2, (dev + 1) V/2),
     // computed here from the head half, the codebook and the bridge weights
     {
         const int64_t wne0 = fd("blk.4.dspine_write.weight").ne0;
@@ -884,7 +876,7 @@ inline int qz_ds_block_load(qz_ds_block & d, qz_ds_ctx & cx, const char * draft,
     auto fz = [&](void ** p, size_t b) { DS_CHECK(qz_dmalloc(p, b)); DS_CHECK(hipMemset(*p, 0, b)); };
     fz((void **) &d.ids_d, DS_T * 4);
     fz((void **) &d.x, (size_t) DS_T * DS_H * 4);
-    fz((void **) &d.t1, (size_t) 2 * DS_T * DS_H * 4);       // [2]: ds_gemvR down K-chunk partials
+    fz((void **) &d.t1, (size_t) 2 * DS_T * DS_H * 4);       // [2][T][H], the second plane holds the down gemv's K-chunk partials
     fz((void **) &d.t2, (size_t) DS_T * DS_H * 4);
     fz((void **) &d.q1, (size_t) DS_T * DS_H);
     fz((void **) &d.s1, (size_t) DS_T * (DS_H / 32) * 4);
@@ -936,8 +928,8 @@ inline int qz_ds_block_load(qz_ds_block & d, qz_ds_ctx & cx, const char * draft,
     return 0;
 }
 
-// the two-card block round: card c owns half the heads, FFN rows and head rows;
-// o / down partials are summed on both cards; the chain inputs end on card 0
+// the two-card block round. Card c owns half the heads, FFN rows and head rows; the
+// o / down partials are summed on both cards and the chain inputs end on card 0.
 inline void qz_ds_block_round2(qz_ds_block * D, qz_ds_ctx * CX, int anchor, int p0, int wbase, int nt = DS_T) {
     const int S = p0 - wbase + DS_T;
     const int H = DS_H, FF2 = DS_FF / 2, QWl = DS_NQ / 2 * DS_HD, KVl = DS_NKV / 2 * DS_HD, V2 = DS_V / 2;
@@ -946,7 +938,7 @@ inline void qz_ds_block_round2(qz_ds_block * D, qz_ds_ctx * CX, int anchor, int 
     auto each = [&](auto && fn) {
         for (int c = 0; c < 2; c++) { DS_CHECK(hipSetDevice(D[c].dev)); fn(c, D[c], CX[c], D[c].st); }
     };
-    auto exchange = [&]() {          // the partials in t1 -> x += p0 + p1 on both cards
+    auto exchange = [&]() {          // ship the partials in t1, then x += own + peer on both cards
         each([&](int c, qz_ds_block & d, qz_ds_ctx &, hipStream_t s) {
             DS_CHECK(hipMemcpyPeerAsync(D[1 - c].xin[xk], D[1 - c].dev, d.t1, d.dev, (size_t) DS_T * H * 4, s));
             DS_CHECK(hipEventRecord(d.ev, s));
@@ -1016,7 +1008,7 @@ inline void qz_ds_block_round2(qz_ds_block * D, qz_ds_ctx * CX, int anchor, int 
             ds_qrows<<<(DS_T * H / 32 + 7) / 8, 256, 0, s>>>(d.t2, d.q1, d.s1, DS_T, H);
         });
     }
-    // head halves -> each card's top-16 -> card 0 merges
+    // each card's head half gives its top-16; card 0 merges the two lists
     const int nch = (V2 + DS_TK_CH - 1) / DS_TK_CH;
     each([&](int c, qz_ds_block & d, qz_ds_ctx &, hipStream_t s) {
         ds_gemvR_launch(nt, s, d.q1, d.s1, H, H, { { (const char *) d.hh_v, (const __half *) d.hh_s, V2, d.logits, 0 } });
@@ -1056,8 +1048,7 @@ __global__ void __launch_bounds__(64) ds_cand_sort(int * cand) {
         c[b + 1] = v;
     }
 }
-// after qz_ds_block_round2 + ds_cand_sort: each candidate's bas from the
-// half that holds it (card 0's list, or card 1's copied with its top-16)
+// each candidate's bas from the half that holds it; card 1's list is copied to card 0
 __global__ void __launch_bounds__(128) ds_bas_pick(const int * cand, const int * ai, const float * ab,
                                                    const int * bi, const float * bb, float * bas) {
     const int w = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1070,8 +1061,7 @@ __global__ void __launch_bounds__(128) ds_bas_pick(const int * cand, const int *
     }
     bas[w] = v;
 }
-// TG / TSV rows in sorted-candidate order (+ the anchor's TSV row) for
-// ds_chain_walk
+// TG / TSV rows in sorted-candidate order, plus the anchor's TSV row, for ds_chain_walk
 __global__ void __launch_bounds__(256) ds_rows_pick(const int * cand, int anchor,
                                                     const int * ai, const float * atg, const float * atsv, const float * atsva,
                                                     const int * bi, const float * btg, const float * btsv, const float * btsva,
@@ -1093,16 +1083,15 @@ __global__ void __launch_bounds__(256) ds_rows_pick(const int * cand, int anchor
         for (int e = t; e < 2 * DS_R; e += 256) tsva[e] = sa[e];
     }
 }
-// TG / TSV are ds_rows_pick's tables in candidate order and tsva the
-// anchor's TSV row (the same row values as the full tables)
+// TG / TSV are ds_rows_pick's tables in candidate order and tsva the anchor's TSV row
 __global__ void __launch_bounds__(512) ds_chain_walk(const float * bas, const int * cand, const float * rmsb,
                                                      const float * packed, const float * bg, const float * TG,
                                                      const float * TSV, int anchor, int * drafts,
                                                      const float * u = nullptr, float invT = 1.f,
                                                      float * qall = nullptr,
                                                      const float * tsva = nullptr) {
-    // u set: position i samples from softmax(sc / T) with u[i] (q to qall);
-    // u == nullptr: greedy argmax
+    // with u set, position i samples from softmax(sc / T) with u[i] and writes q to qall;
+    // with u == nullptr it takes the greedy argmax.
     __shared__ float m[DS_R];
     __shared__ float sc[DS_TOPK];
     __shared__ int jsel;
@@ -1144,8 +1133,7 @@ __global__ void __launch_bounds__(512) ds_chain_walk(const float * bas, const in
     }
 }
 
-// the chain walk on card 0 (b = block 0, after ds_cand_sort and the bas):
-// stage the candidates' table rows (ds_rows_pick), then walk
+// the chain walk on card 0, after ds_cand_sort and the bas: stage table rows, then walk
 inline void ds_walk(qz_ds_block & b, const float * bas, int anchor, int * drafts, const float * u = nullptr,
                     float invT = 1.f, float * qall = nullptr) {
     ds_rows_pick<<<(DS_T - 1) * DS_TOPK + 1, 256, 0, b.st>>>(b.cand, anchor, b.tki, b.tg_l, b.tsv_l, b.tsva_l,

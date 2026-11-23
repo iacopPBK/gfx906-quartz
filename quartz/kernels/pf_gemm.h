@@ -1,7 +1,6 @@
-// Non-template kernels in kernels/ are static: every arch TU gets its own copy.
-// Prefill GEMM over int8 row tiles (W . A with per-32 scales), and the
-// row norm / quant kernels that feed it. Rows are padded to PF_MT tokens;
-// pf_addnorm_quant<DM> needs DM % 256 == 0.
+// Prefill GEMM over int8 row tiles (W . A with per-32 scales) and the row norm /
+// quant kernels that feed it. Kernels here are static, so every arch TU gets its own
+// copy. Rows are padded to PF_MT tokens and pf_addnorm_quant<DM> wants DM % 256 == 0.
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -9,15 +8,15 @@
 #include <cstdint>
 
 constexpr int PF_MT = 128;
-constexpr int PF_GG = 4;    // pf_gemm: token tiles per dispatch group
+constexpr int PF_GG = 4;    // token tiles per pf_gemm dispatch group
 
 // ---------------------------------------------------------------- GEMM ----
-// C[m][n] = A[m] . W[n] with per-32 scales; block 64 rows x 128 tokens
+// C[m][n] = A[m] . W[n] with per-32 scales, in blocks of 64 rows x 128 tokens
 typedef unsigned int pf_u32x4 __attribute__((ext_vector_type(4)));
 struct pf_xrow { pf_u32x4 q[4][2]; pf_u32x4 pad; };
 
-// SWI = 1: gate (W) and up (W2) in one GEMM, the epilogue writes the quantized
-// silu(g) * u for the down projection
+// SWI = 1 runs the gate (W) and the up (W2) in one GEMM, and the epilogue writes
+// the quantized silu(g) * u for the down projection.
 template <int SWI>
 __global__ void __launch_bounds__(256, 2) pf_gemm(
         const int8_t * __restrict__ Ag, const float * __restrict__ sag, int Mp,
@@ -30,8 +29,8 @@ __global__ void __launch_bounds__(256, 2) pf_gemm(
     __shared__ pf_xrow sX[128];
     __shared__ float sXd[128][5];
     const int t = threadIdx.x, tx = t & 63, ty = t >> 6;
-    // grouped dispatch order: consecutive blocks cover PF_GG token tiles x successive row blocks, so the
-    // blocks in flight share both weight rows and activation tiles in L2 (same work per block: exact)
+    // Grouped dispatch order: consecutive blocks cover PF_GG token tiles across
+    // successive row blocks, so blocks in flight share weights and X tiles in L2.
     int bx, by;
     {
         const int gx = gridDim.x, lin = blockIdx.y * gx + blockIdx.x, per = PF_GG * gx, fy = lin / per * PF_GG;
@@ -49,7 +48,7 @@ __global__ void __launch_bounds__(256, 2) pf_gemm(
         wrow = (unsigned) (bx * 32 + ((t / 4) & 31));
         if (t / 4 >= 32) { W = W2; sw = sw2; }
     } else {
-        wrow = (unsigned) min(row0 + t / 4, N - 1);   // rows past N: clamped, outputs dropped
+        wrow = (unsigned) min(row0 + t / 4, N - 1);   // rows past N clamp, their outputs drop
     }
     const unsigned w_off = wrow * (unsigned) ldw + (t % 4) * 32u;
     const unsigned wd_off = wrow * (unsigned) nkb + t % 4;
@@ -127,7 +126,7 @@ __global__ void __launch_bounds__(256, 2) pf_gemm(
         __syncthreads();
     }
     if (SWI) {
-        // two passes of 64 tokens through LDS (the X tile's space): sAcc[row][token]
+        // two passes of 64 tokens through the X tile's LDS, as sAcc[row][token]
         float (*sAcc)[65] = (float (*)[65]) &sX[0];
         static_assert(sizeof(sX) >= 64 * 65 * 4, "epilogue tile");
 #pragma unroll
@@ -136,7 +135,7 @@ __global__ void __launch_bounds__(256, 2) pf_gemm(
 #pragma unroll
             for (int g = 0; g < 16; g++) sAcc[ty * 16 + g][tx] = acc[g][n];
             __syncthreads();
-            // thread: token tt, dims part * 8 .. + 7 of the block's 32; amax over the 32 by a 4-lane shuffle
+            // token tt and dims part * 8 .. + 7, amax over the 32 by a 4-lane shuffle
             const int tt = t >> 2, part = t & 3, m = tok0 + 64 * n + tt;
             float h[8], ax = 0.f;
 #pragma unroll
@@ -162,8 +161,9 @@ __global__ void __launch_bounds__(256, 2) pf_gemm(
         }
         return;
     }
-    if (obf16) {   // row-parallel partials for the cross-card sum: bf16 (round to nearest even), as llama's all-reduce;
-                   // C2: the same 32 B also stored straight into the peer card's memory (P2P write, overlapped with the GEMM)
+    if (obf16) {   // row-parallel partials for the cross-card sum, bf16 rounded to
+                   // nearest even like llama's all-reduce. C2 takes the same 32 B straight
+                   // into the peer card's memory, overlapped with the GEMM
 #pragma unroll
         for (int n = 0; n < 2; n++) {
             unsigned b[8];
@@ -189,7 +189,7 @@ __global__ void __launch_bounds__(256, 2) pf_gemm(
 #pragma unroll
             for (int g = 0; g < 16; g += 4)
                 *(float4 *) (dst + g) = make_float4(acc[g][n], acc[g + 1][n], acc[g + 2][n], acc[g + 3][n]);
-            if (C2) {   // f32 partial also straight into the peer card's memory
+            if (C2) {   // the f32 partial also goes straight into the peer card's memory
                 float * d2 = (float *) C2 + (size_t) (tok0 + tx + 64 * n) * ldc + row0 + ty * 16;
 #pragma unroll
                 for (int g = 0; g < 16; g += 4)
@@ -204,7 +204,7 @@ __global__ void __launch_bounds__(256, 2) pf_gemm(
 }
 
 // ------------------------------------------------------- quantization ----
-// int8 per 32 values (f16-rounded scale), grouped [K/128][Mp][128]
+// int8 with one f16-rounded scale per 32 values, laid out [K/128][Mp][128]
 __device__ __forceinline__ void pf_quant_unit(float v, int k, int m, int Mp, int8_t * Ag, float * sag, int lane32) {
     float ax = fabsf(v);
 #pragma unroll
@@ -217,8 +217,8 @@ __device__ __forceinline__ void pf_quant_unit(float v, int k, int m, int Mp, int
     if (lane32 == 0) sag[((size_t) g * Mp + m) * 4 + sub / 32] = qz_q8_scale(d);
 }
 
-// one block per row: y = x * rsqrt(mean(x^2) + eps) * w, quantized (and
-// optionally kept in f32 for the MTP hidden input)
+// one block per row: y = x * rsqrt(mean(x^2) + eps) * w, then quantized, and
+// optionally also kept in f32 for the MTP hidden input
 static __global__ void __launch_bounds__(256) pf_norm_quant(
         const float * __restrict__ x, int ldx, const float * __restrict__ w, float eps, int K,
         int8_t * Ag, float * sag, int Mp, float * outf, int m0 = 0) {
@@ -239,7 +239,7 @@ static __global__ void __launch_bounds__(256) pf_norm_quant(
     }
 }
 
-// the cross-card sum x += p0 + p1 (bf16 partials) fused into the next RMS norm
+// the cross-card sum x += p0 + p1 over bf16 partials, fused into the next RMS norm
 __device__ __forceinline__ float pf_ld_part(const unsigned short * p, size_t i) { return __uint_as_float((unsigned) p[i] << 16); }
 template <int DM>
 __global__ void __launch_bounds__(256) pf_addnorm_quant(
@@ -249,7 +249,7 @@ __global__ void __launch_bounds__(256) pf_addnorm_quant(
     const int m = m0 + blockIdx.x, t = threadIdx.x;
     float * xr = x + (size_t) m * DM;
     constexpr int NE = DM / 256;
-    float xv[NE];                     // the row stays in registers between the add and the norm
+    float xv[NE];                     // the row stays in registers across add and norm
     float ss = 0.f;
     if (m < n) {
         const unsigned short * a = p0 + (size_t) m * DM, * b = p1 + (size_t) m * DM;
@@ -279,7 +279,7 @@ __global__ void __launch_bounds__(256) pf_addnorm_quant(
     }
 }
 
-// quantize rows of y (row stride ldy) as they are
+// quantizes rows of y, which has row stride ldy
 static __global__ void __launch_bounds__(256) pf_quant(const float * __restrict__ y, int ldy, int K, int8_t * Ag, float * sag, int Mp, int m0 = 0) {
     const int m = m0 + blockIdx.x;
     for (int k = threadIdx.x; k < K; k += 256) pf_quant_unit(y[(size_t) m * ldy + k], k, m, Mp, Ag, sag, threadIdx.x & 31);

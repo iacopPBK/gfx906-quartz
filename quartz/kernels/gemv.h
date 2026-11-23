@@ -1,17 +1,17 @@
-// T-row int8 GEMV over the Q8_0 planes (quartz/repack.h): the core and the
+// T-row int8 GEMV over the Q8_0 planes of quartz/repack.h, with the core and the
 // row / slice walkers every decode phase is built from.
 #pragma once
 
 #include "kernels/dev.h"
 
-// T-row GEMV core: acc[t][s] = row r0+s (clamped to N-1) . activation row t,
-// in lane 0; BUF: buffer loads (default for T <= QZ_GEMV_BUF_TMAX), else plain
-// global loads (bit-identical either way)
+// T-row GEMV core. acc[t][s] = row r0+s (clamped to N-1) . activation row t, with the
+// result in lane 0. BUF selects buffer loads, the default for T <= QZ_GEMV_BUF_TMAX;
+// plain global loads give the same bits.
 #ifndef QZ_GEMV_BUF_TMAX
 #define QZ_GEMV_BUF_TMAX 3
 #endif
 #define QZ_GEMV_INL __forceinline__
-// RS > 0: rows r0 .. r0 + S/2 - 1 then r0 + RS .. r0 + RS + S/2 - 1 (two row groups)
+// RS > 0 takes rows r0 .. r0 + S/2 - 1 and then r0 + RS .. r0 + RS + S/2 - 1
 template <int T, int S, int RS = 0, bool BUF = (T <= QZ_GEMV_BUF_TMAX)> __device__ QZ_GEMV_INL void qz_gemv_core(
         const unsigned char * a_vals, const float * a_scal, int lda, int lsa, int n_u,
         const char * w_vals, const __half * w_scal, int ldw, int lsw, int N, int r0, int lane, float (&acc)[T][S]) {
@@ -80,7 +80,7 @@ template <int T, int S, int RS = 0, bool BUF = (T <= QZ_GEMV_BUF_TMAX)> __device
         #pragma unroll
         for (int s = 0; s < S; s++)
 #ifdef QZ_GEMV_WSUM
-            QZ_GEMV_WSUM(acc[t][s]);          // an arch's equivalent wave sum (lane 0 the same value)
+            QZ_GEMV_WSUM(acc[t][s]);          // an arch's equivalent wave sum, same lane 0 value
 #else
             #pragma unroll
             for (int off = 32; off > 0; off >>= 1) acc[t][s] += __shfl_down(acc[t][s], off, 64);
@@ -93,7 +93,7 @@ template <int T, int S, int RS = 0> __device__ __forceinline__ void qz_gemv_rows
     qz_gemv_core<T, S, RS>(a_vals, a_scal, K, K / 32, K / 32, w_vals, w_scal, K, K / 32, N, r0, lane, acc);
 }
 
-// T-row phase GEMV, y is [T][N]; off rotates the slab walk
+// T-row phase GEMV into y, which is [T][N]. off rotates the slab walk
 template <int T> __device__ __forceinline__ void qz_gemv_slice_t(
         const unsigned char * a_vals, const float * a_scal, int K,
         const char * w_vals, const __half * w_scal, int N, float * y, int off = 0) {
@@ -114,7 +114,7 @@ template <int T> __device__ __forceinline__ void qz_gemv_slice_t(
     }
 }
 
-// qz_gemv_rows_t over n_uh units of a K slice (pointers at the slice start)
+// qz_gemv_rows_t over n_uh units of a K slice, with pointers at the slice start
 template <int T, int S> __device__ __forceinline__ void qz_gemv_rows_tk(
         const unsigned char * a_vals, const float * a_scal, int lda, int n_uh,
         const char * w_vals, const __half * w_scal, int ldw, int N, int r0, int lane, float (&acc)[T][S]) {

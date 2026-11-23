@@ -1,10 +1,10 @@
-// inkling2 start-up memory check, before the weight load (as qwen35_preflight.h):
-// the memory each card needs for the requested context against what it has free.
-// Included inside namespace ink2, after ink2_kernels.h and ink2_dspark.h.
+// inkling2 start-up memory check, run before the weight load (as qwen35_preflight.h). It
+// compares the memory each card needs for the requested context with what the card has
+// free. Included inside namespace ink2, after ink2_kernels.h and ink2_dspark.h.
 
-// what grows with the context, per card: the 8 full-attention slots' f16 K / V
-// (ctx rows), the 40 SWA slots' rings (PF_RING rows) and the conv histories;
-// with the drafter, its 3 layers' f16 context K / V of the card's 4 kv heads
+// what grows with the context, per card: the 8 full-attention slots' f16 K / V (ctx rows),
+// the 40 SWA slots' rings (PF_RING rows) and the conv histories. With the drafter, also its
+// 3 layers' f16 context K / V for the card's 4 kv heads.
 inline double ink2_ctx_bytes(int ctx, int card, bool ds) {
     double b = 0;
     for (int s = 0; s < NAPP; s++) b += 2.0 * (is_full(slot_phys(s)) ? ctx : PF_RING) * KVL * 2;
@@ -12,14 +12,14 @@ inline double ink2_ctx_bytes(int ctx, int card, bool ds) {
     if (ds) b += 2.0 * DS_NL * ctx * DS_KVL * 2;
     return b;
 }
-// the rest: the activations (VR rows), the batched prefill's buffers, the HIP runtime's
-// share; the drafter's weight slices (planned from its GGUF) and work buffers (the head
-// fold on both cards, the Markov chain on card 0); 256 MB left free on top. Measured
-// 2026-11-23 at 262144: 20.6 GB per card (this estimate: 20.9)
+// the fixed part: the activations (VR rows), the batched prefill's buffers and the HIP
+// runtime's share. INK_PF_DS0 / DS1 cover the drafter's work buffers (the head fold on both
+// cards, the Markov chain on card 0); its weight slices are sized from the GGUF instead.
+// 256 MB of headroom on top. Measured at ctx 262144: 20.6 GB per card, this estimate 20.9.
 constexpr double INK_PF_FIXED = 1.5e9, INK_PF_DS0 = 0.25e9, INK_PF_DS1 = 0.2e9, INK_PF_HEADROOM = 0.25e9;
 
-// the vision encoder (QZ_MMPROJ, set by the server's --mmproj) on card 0: its weights (the
-// file) and its activations at the 4096-token image limit
+// the vision encoder (QZ_MMPROJ, set by the server's --mmproj) on card 0. Covers the weight
+// file and its activations at the 4096-token image limit.
 constexpr double INK_PF_VIS = 1.15e9;
 inline double ink2_vis_bytes() {
     const char * p = getenv("QZ_MMPROJ");
@@ -32,7 +32,7 @@ inline double ink2_vis_bytes() {
     return b + INK_PF_VIS;
 }
 
-// the drafter's weights on card c (its TP2 slices; the Markov chain's tensors on card 0), 0 if unreadable
+// the drafter's weights on card c (TP2 slices, the Markov chain on card 0), 0 if unreadable
 inline double ink2_ds_weight_bytes(const char * path, int c) {
     qz_gguf g;
     if (!path || !g.open(path)) return 0;
@@ -42,7 +42,7 @@ inline double ink2_ds_weight_bytes(const char * path, int c) {
     return L.plan(g, c) ? (double) L.need_bytes : 0;
 }
 
-// 0: fits (or cannot be sized here: the load reports the model problem); 1: refused
+// 0 when it fits or cannot be sized here (the load reports the problem), 1 when refused
 inline int ink2_vram_check(const qz_gguf & g, int ctx, const char * dspark) {
     const bool ds = dspark != nullptr;
     double need[2], free_b[2], total_b[2], w[2];

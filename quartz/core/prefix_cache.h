@@ -1,7 +1,7 @@
-// Prefix cache: snapshots of an arch's fixed-size state at prompt positions,
-// in pinned host memory. The arch names that state as blobs (a live buffer and
-// a mid-chunk staging buffer per card); positional state (KV arenas) is not
-// copied: rows below the restored position are still valid in the arena.
+// Prefix cache: snapshots of an arch's fixed-size state at prompt positions, in pinned
+// host memory. An arch names the state as blobs, a live and a mid-chunk staging buffer
+// per card. KV arenas are positional and not copied: rows below the restored position
+// are still valid in the arena.
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -44,8 +44,8 @@ public:
         for (auto & sn : slots) alloc(sn);
     }
 
-    // the deepest slot whose keys 0 .. pos match `k` (pos <= n - 1); slots past
-    // the matching prefix, or that `valid` rejects, are dropped
+    // The deepest slot whose keys 0 .. pos match k, with pos <= n - 1. Slots past the
+    // matching prefix, and slots that `valid` rejects, are dropped.
     slot * match(const std::vector<uint64_t> & k, int n, const std::function<bool(int)> & valid = {}) {
         int L = 0;
         while (L < (int) keys.size() && L < n && keys[L] == k[L]) L++;
@@ -72,7 +72,7 @@ public:
         best->pos = -1;
         return best;
     }
-    // live state -> a slot for pos (async on the cards' streams)
+    // Live state into a new slot for pos, async on the cards' streams.
     void take(int pos, const slot * keep = nullptr) {
         slot * best = pick(pos, keep);
         for (int i = 0; i < ncard; i++) {
@@ -84,7 +84,7 @@ public:
         best->pos = pos;
         best->use = ++clock;
     }
-    // staged mid-chunk state -> slot sn (picked before the chunk ran), for pos
+    // Staged mid-chunk state into slot sn, picked before the chunk ran.
     void take_staged(slot * sn, int pos) {
         for (int i = 0; i < ncard; i++) {
             chk(hipSetDevice(qz_dev_of(i)));
@@ -95,7 +95,7 @@ public:
         sn->pos = pos;
         sn->use = ++clock;
     }
-    // slot -> live state (async); the caller resets what else the arch needs and syncs
+    // Slot into live state, async. The caller resets the rest and syncs.
     void restore(slot & sn) {
         for (int i = 0; i < ncard; i++) {
             chk(hipSetDevice(qz_dev_of(i)));
@@ -109,19 +109,19 @@ public:
     // the arch's side of a cached prefill
     struct hooks {
         std::function<void()> reset;      // no snapshot matched: fresh state
-        std::function<void()> restored;   // a slot's blobs were queued back: reset the rest, sync
-        // prompt rows a .. b-1 (b: the next row); mid >= 0: stage the state after
-        // row a + mid - 1 into the blobs' stage buffers. nonzero: failed
+        std::function<void()> restored;   // blobs queued back: reset the rest, then sync
+        // Prompt rows a .. b-1, where b is the next row. With mid >= 0, also stage the
+        // state after row a + mid - 1 into the stage buffers. Nonzero: failed.
         std::function<int(int a, int b, int mid)> chunk;
         std::function<void()> sync;       // both cards idle (progress timing)
-        // optional: whether a snapshot at pos still fits the positional state
-        // (a ring-buffered window may have been overwritten since)
+        // Optional: whether a snapshot at pos still fits the positional state, since a
+        // ring-buffered window may have been overwritten.
         std::function<bool(int pos)> valid;
     };
-    // prefill prompt rows up to P - 2 from the deepest matching snapshot, in chunks,
-    // with a snapshot at each chunk end, at the first message's end (the second
-    // `boundary` token) and mid-chunk at the last boundary (else `tail` before the
-    // end). Returns the first row computed (the cached rows), -1 on failure.
+    // Prefill prompt rows up to P - 2 from the deepest matching snapshot, in chunks, with
+    // a snapshot at each chunk end, at the end of the first message (the second `boundary`
+    // token) and at the last boundary mid-chunk, or `tail` rows before the end when the
+    // chunk has no boundary. Returns the cached row count, -1 on failure.
     int prefill(const int32_t * p, int P, const std::vector<uint64_t> & k, int32_t boundary,
                 int chunk, int tail, const hooks & h) {
         using clk = std::chrono::steady_clock;
@@ -137,7 +137,6 @@ public:
         int cut = P - 1 - tail;
         for (int q = P - 2; q > start; q--)
             if (p[q] == boundary) { cut = q; break; }
-        // progress per chunk on stderr when the prefill spans more than one chunk
         const bool prog = P - 1 - start > chunk;
         auto tc = t0;
         for (int a = start; a < P - 1;) {
@@ -173,9 +172,9 @@ private:
                 chk(hipHostMalloc(&sn.host[i][j], blobs[j].bytes, hipHostMallocPortable));
         }
     }
-    // evict the snapshot whose loss costs least: the one with the smallest gap
-    // between its neighbours relative to the next position (never the newest
-    // two, `keep` or the head); else the least recently used
+    // Evict the snapshot whose loss costs least: the one with the smallest gap between its
+    // neighbours relative to the next position. Never the two newest, `keep` or the head.
+    // When no candidate is left, the least recently used.
     slot * victim(const slot * keep) {
         std::vector<slot *> live;
         for (auto & sn : slots) if (sn.pos >= 0) live.push_back(&sn);

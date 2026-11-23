@@ -7,8 +7,8 @@
 
 namespace qz_img {
 
-// Pillow-compatible separable resampling, bicubic (a = -0.5), 22-bit fixed
-// point: mtmd-image.cpp's img_tool::resize_pillow without its other filters
+// Pillow's separable bicubic resampling in 22-bit fixed point, the weights of
+// img_tool::resize_pillow in mtmd-image.cpp without its other filters.
 inline void resize_bicubic(const unsigned char * src, int sw, int sh, std::vector<unsigned char> & dst, int dw, int dh) {
     const int PB = 22;
     auto filt = [](double x) {

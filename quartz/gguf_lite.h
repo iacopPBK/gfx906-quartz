@@ -1,5 +1,5 @@
-// GGUF v3 metadata reader with ggml's gguf.h names and signatures; tensor
-// bytes are read by the loader. Header-only.
+// GGUF v3 metadata reader that mirrors ggml's gguf.h names and signatures. Tensor
+// bytes are left to the loader. Header-only.
 #pragma once
 
 #include <cstdint>
@@ -14,7 +14,7 @@
 
 #define GGML_MAX_DIMS 4
 
-// same numeric ids as ggml's ggml.h
+// numeric ids match ggml's ggml.h
 enum ggml_type {
     GGML_TYPE_F32     = 0,
     GGML_TYPE_F16     = 1,
@@ -79,7 +79,7 @@ struct gguf_init_params {
     struct ggml_context * ctx;
 };
 
-// block size / block bytes, same values as ggml's type traits table
+// block size in elements and block bytes, as in ggml's type traits table
 static inline int64_t ggml_blck_size(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32: case GGML_TYPE_F16: case GGML_TYPE_BF16:
@@ -100,7 +100,7 @@ static inline int64_t ggml_blck_size(enum ggml_type type) {
         case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ1_M:
             return 256;
-        default: return 0;   // id removed / unknown
+        default: return 0;   // unassigned id
     }
 }
 
@@ -143,21 +143,21 @@ static inline size_t ggml_type_size(enum ggml_type type) {
     }
 }
 
-// -- tensor info getters --
+// -- parsed metadata --
 struct gguf_kv {
     std::string key;
     enum gguf_type type = GGUF_TYPE_UINT32;
-    std::vector<uint8_t> data;      // scalar value, or array elements (non-string)
-    std::vector<std::string> strs;   // STRING value, or array elements
-    enum gguf_type arr_type = GGUF_TYPE_UINT32;   // when type == ARRAY
+    std::vector<uint8_t> data;      // scalar bytes, or a non-string array's elements
+    std::vector<std::string> strs;   // a STRING value, or a string array's elements
+    enum gguf_type arr_type = GGUF_TYPE_UINT32;   // element type, when type is ARRAY
 };
 
 struct gguf_tensor_info {
     std::string name;
     uint32_t n_dims = 0;
-    int64_t ne[GGML_MAX_DIMS] = {0, 0, 0, 0};   // 1 past n_dims for dim >= n_dims
+    int64_t ne[GGML_MAX_DIMS] = {0, 0, 0, 0};   // dims at index >= n_dims are 1
     enum ggml_type type = GGML_TYPE_F32;
-    uint64_t offset = 0;   // from data_offset
+    uint64_t offset = 0;   // byte offset from data_offset_
 };
 
 struct gguf_context {
@@ -224,7 +224,7 @@ static bool gguf_rd_value(FILE * f, enum gguf_type t, gguf_kv & kv) {
 }
 
 static inline struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_params params) {
-    (void) params;   // metadata only, no tensor data is ever read here
+    (void) params;   // metadata only, this never reads tensor bytes
     FILE * f = fopen(fname, "rb");
     if (!f) { fprintf(stderr, "gguf_init_from_file: cannot open %s\n", fname); return nullptr; }
     char magic[4];
@@ -301,7 +301,7 @@ static inline struct gguf_context * gguf_init_from_file(const char * fname, stru
         if (!gguf_rd(f, &ti.offset, sizeof(ti.offset))) { fclose(f); return nullptr; }
     }
 
-    // data starts at the end of the tensor infos, padded to the alignment
+    // tensor data starts after the infos, aligned up
     size_t pos = (size_t) ftell(f);
     if (n_tensors > 0)
         pos = (pos + ctx->alignment_ - 1) / ctx->alignment_ * ctx->alignment_;
@@ -313,7 +313,7 @@ static inline struct gguf_context * gguf_init_from_file(const char * fname, stru
 
 static inline void gguf_free(struct gguf_context * ctx) { delete ctx; }
 
-// -- kv getters (callers check gguf_find_key >= 0 first) --
+// -- kv getters, for keys already found with gguf_find_key --
 
 static inline size_t   gguf_get_data_offset(const struct gguf_context * ctx) { return ctx->data_offset_; }
 
@@ -327,7 +327,7 @@ static inline enum gguf_type gguf_get_kv_type(const struct gguf_context * ctx, i
     return key_id >= 0 && (size_t) key_id < ctx->kvs.size() ? ctx->kvs[(size_t) key_id].type : GGUF_TYPE_COUNT;
 }
 
-// integer value of any kv type that fits in u32 (i8/u16/u32/i32/u8/i16, u64/i64 in range)
+// any integer kv that fits in u32, including u64 and i64 in range
 static inline uint32_t gguf_get_val_u32(const struct gguf_context * ctx, int64_t key_id) {
     if (key_id < 0 || (size_t) key_id >= ctx->kvs.size()) return 0;
     const gguf_kv & kv = ctx->kvs[(size_t) key_id];

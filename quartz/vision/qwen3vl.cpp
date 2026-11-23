@@ -1,5 +1,4 @@
-// qwen3vl_merger image encoder (see qwen3vl.h): rocBLAS f16 GEMMs with f32
-// accumulation, v_flash attention.
+// qwen3vl_merger image encoder, see qwen3vl.h. rocBLAS f16 GEMMs, v_flash attention.
 #include "qwen3vl.h"
 #include "loader.h"
 #include "core/devices.h"
@@ -32,10 +31,9 @@ namespace qwen3vl {
 
 static constexpr int V_D = 1152, V_H = 16, V_HD = 72, V_PATCH = 16, V_GRID = 48, V_K = 3 * V_PATCH * V_PATCH;
 
-// ------------------------------------------------------------- kernels ----
+// ---- kernels ----
 
-// pixels -> patch rows [N][768] f16 in the 2x2 block order (ty, tx, dy, dx);
-// columns (c, ky, kx) as the conv kernel [1152][3][16][16]
+// Pixels to patch rows. P is [N][768] f16 with (c, ky, kx) columns and 2x2 block rows.
 __global__ void __launch_bounds__(256) v_patchify(const unsigned char * __restrict__ rgb, int W, __half * __restrict__ P) {
     const int n = blockIdx.x, bpr = W / 32;
     const int b = n >> 2, ty = b / bpr, tx = b % bpr;
@@ -47,8 +45,7 @@ __global__ void __launch_bounds__(256) v_patchify(const unsigned char * __restri
     }
 }
 
-// x[n] += patch bias + the 48 x 48 position grid, bilinear (align corners) at
-// the patch's (py, px) of a ph x pw patch grid
+// Adds the patch bias and the 48 x 48 position grid, bilinear with align corners.
 __global__ void __launch_bounds__(256) v_pos(float * __restrict__ x, const float * __restrict__ bias,
                                              const float * __restrict__ grid, int pw, int ph) {
     const int n = blockIdx.x, bpr = pw / 2;
@@ -68,7 +65,6 @@ __global__ void __launch_bounds__(256) v_pos(float * __restrict__ x, const float
     }
 }
 
-// LayerNorm (eps 1e-6, weight + bias) of one f32 row of V_D -> f16
 __global__ void __launch_bounds__(128) v_ln(const float * __restrict__ x, const float * __restrict__ w,
                                             const float * __restrict__ b, __half * __restrict__ out) {
     constexpr int PT = V_D / 128;
@@ -98,8 +94,7 @@ __global__ void __launch_bounds__(128) v_ln(const float * __restrict__ x, const 
     }
 }
 
-// qkv + bias -> Q, K (2D vision rope) as f16 [nh][N][V_HD], V as f16 key pairs
-// [nh][N / 2][V_HD][2]
+// Splits qkv + bias into Q, K (2D rope) f16 [nh][N][V_HD] and V pairs [nh][N/2][V_HD][2].
 __global__ void __launch_bounds__(256) v_qkv(const float * __restrict__ qkv, const float * __restrict__ bias,
                                              int N, int pw, int nh, __half * __restrict__ Q, __half * __restrict__ K,
                                              __half * __restrict__ V) {
@@ -130,13 +125,13 @@ __global__ void __launch_bounds__(256) v_qkv(const float * __restrict__ qkv, con
 }
 
 typedef _Float16 vf_h2 __attribute__((ext_vector_type(2)));
-#define VF_QKP 2                  // QK: K reads issued this many steps ahead
-// ViT flash attention: non-causal, head dim 72, f16 Q / K / V, f32 softmax;
-// block = 128 queries of one head, 4 waves, key tiles of 16.
+#define VF_QKP 2                  // K loads run this many steps ahead
+// ViT flash attention, non-causal, head dim 72, f16 Q / K / V, f32 softmax. A block is
+// VF_QB = 128 queries of one head, 4 waves, over key tiles of VF_KT = 16.
 #define VF_QB 128
 #define VF_KT 16
-#define VF_KS 40                  // K row stride, dwords (9 chunks of 8 halves + a zero chunk)
-#define VF_VS 96                  // V pair row stride, dwords: 8 dim groups of 12 (9 used: no bank conflicts)
+#define VF_KS 40                  // K row stride, dwords, with a zeroed padding chunk
+#define VF_VS 96                  // V pair row stride, dwords, bank-conflict free
 #define VF_PS (VF_QB + 4)         // P pair row stride, dwords
 
 __device__ __forceinline__ uint32_t vf_pack(float a, float b) {
@@ -164,18 +159,18 @@ __global__ void __launch_bounds__(256, 2) v_flash(const __half * __restrict__ Q,
 #pragma unroll
         for (int i = 0; i < 20; i++) {
             const int d2 = hf * 20 + i;
-            const uint32_t x = __builtin_nontemporal_load(src + (d2 < 36 ? d2 : 35));   // unconditional: no branch per element
+            // The load is unconditional, so there is no branch per element.
+            const uint32_t x = __builtin_nontemporal_load(src + (d2 < 36 ? d2 : 35));
             qv[r][i] = m < N && d2 < 36 ? x : 0u;
         }
     }
     const int qq = lane >> 3, dg = lane & 7;
-    float mx = -INFINITY, l = 0.f;   // query hf of the lane's pair
+    float mx = -INFINITY, l = 0.f;   // running max and sum of the lane's query hf
     float o[4][9];
 #pragma unroll
     for (int i = 0; i < 4; i++)
 #pragma unroll
         for (int d = 0; d < 9; d++) o[i][d] = 0.f;
-    // tile items: 144 K uint4 (16 rows x 9), then 144 V uint4 (8 pairs x 18); thread t: items t, t + 256
     uint4 nb[2];
     auto load = [&](int kt) {
 #pragma unroll
@@ -216,7 +211,7 @@ __global__ void __launch_bounds__(256, 2) v_flash(const __half * __restrict__ Q,
         for (int r = 0; r < 2; r++)
 #pragma unroll
             for (int j = 0; j < 8; j++) s[r][j] = 0.f;
-        {   // software-pipelined: step it = (key j, chunk c); the read of step it + VF_QKP is in flight
+        {   // software pipelined: K loads run VF_QKP steps ahead of their dots
             constexpr int NS = 40;
             auto kaddr = [&](int it) { return (const uint4 *) &Ks[(2 * (it / 5) + kg) * VF_KS + (hf * 5 + it % 5) * 4]; };
             uint4 kb[VF_QKP + 1];
@@ -234,10 +229,12 @@ __global__ void __launch_bounds__(256, 2) v_flash(const __half * __restrict__ Q,
                     s[0][j] = __builtin_amdgcn_fdot2(__builtin_bit_cast(vf_h2, qv[0][c * 4 + u]), k2, s[0][j], false);
                     s[1][j] = __builtin_amdgcn_fdot2(__builtin_bit_cast(vf_h2, qv[1][c * 4 + u]), k2, s[1][j], false);
                 }
-                asm volatile("" : "+v"(s[0][j]), "+v"(s[1][j]));   // both queries' dots of this step stay together
+                // Keeps both queries' dots of this step together.
+                asm volatile("" : "+v"(s[0][j]), "+v"(s[1][j]));
             }
         }
-        // softmax: after the dim-half sum, lane hf takes query hf (its 8 keys; the kg partner has the other 8)
+        // Softmax. The dim-half sum leaves each lane with the full dot of query hf over
+        // its 8 keys, 2j + kg; the kg partner lane has the other 8.
         uint32_t mh = 0u - (uint32_t) hf, msk = 0u - (uint32_t) kg;
         asm volatile("" : "+v"(mh), "+v"(msk));
         float x[8], tm = -INFINITY;
@@ -262,14 +259,15 @@ __global__ void __launch_bounds__(256, 2) v_flash(const __half * __restrict__ Q,
         mx = nm;
         if (kg == 0) cr[w * 32 + qp + 16 * hf] = corr;
 #pragma unroll
-        for (int i = 0; i < 4; i++) {   // pairs kg * 4 + i of query hf: keys 2j from the kg = 0 lane, 2j + 1 from kg = 1
+        // Pair kg * 4 + i: keys 2j and 2j + 1, from lanes kg = 0 and kg = 1.
+        for (int i = 0; i < 4; i++) {
             const uint32_t pi = __float_as_uint(p[i]), p4 = __float_as_uint(p[4 + i]);
             const uint32_t mine = (pi & ~msk) | (p4 & msk), send = (p4 & ~msk) | (pi & msk);
             const uint32_t recv = (uint32_t) __builtin_amdgcn_mov_dpp((int) send, 0x4E, 0xF, 0xF, false);
             const uint32_t lo = (mine & ~msk) | (recv & msk), hi = (recv & ~msk) | (mine & msk);
             Ps[(kg * 4 + i) * VF_PS + w * 32 + qp + 16 * hf] = vf_pack(__uint_as_float(lo), __uint_as_float(hi));
         }
-        // P and cr are this wave's own rows: a wave-level fence orders the LDS writes before the reads
+        // P and cr hold only this wave's rows, so wave fences order writes before reads
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
         __builtin_amdgcn_wave_barrier();
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
@@ -309,15 +307,13 @@ __global__ void __launch_bounds__(256, 2) v_flash(const __half * __restrict__ Q,
     }
 }
 
-// two-card sum: x += (p0 + p1) + b[i % V_D], p0 / p1 card 0's / card 1's partial
-// on both cards (the same order: the residual stays identical)
+// Two-card sum. Both cards add in the same order, so the residual stays identical.
 __global__ void __launch_bounds__(256) v_add2(float * __restrict__ x, const float * __restrict__ p0,
                                               const float * __restrict__ p1, const float * __restrict__ b, size_t n) {
     const size_t i = (size_t) blockIdx.x * 256 + threadIdx.x;
     if (i < n) x[i] = x[i] + ((p0[i] + p1[i]) + b[i % V_D]);
 }
 
-// out = gelu(y + b), tanh form, f16
 __global__ void __launch_bounds__(256) v_bias_gelu(const float * __restrict__ y, const float * __restrict__ b,
                                                    int d, __half * __restrict__ out) {
     const int i = blockIdx.x * 256 + threadIdx.x;
@@ -327,7 +323,7 @@ __global__ void __launch_bounds__(256) v_bias_gelu(const float * __restrict__ y,
     out[o] = __float2half(0.5f * v * (1.f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v))));
 }
 
-// --------------------------------------------------------------- host ----
+// ---- host ----
 
 namespace {
 
@@ -338,8 +334,8 @@ struct vlayer {
 
 } // namespace
 
-// one card's half: heads [8c, 8c + 8), FFN rows [c ff/2, (c + 1) ff/2); out /
-// down run over the matching input halves and the partials meet in an exchange
+// One card's half of the encoder: heads [8c, 8c + 8) and FFN rows [c ff/2, (c + 1) ff/2).
+// out / down take the matching input halves and an exchange sums their partials.
 struct vcard {
     int dev = -1;
     hipStream_t st = nullptr;
@@ -349,11 +345,11 @@ struct vcard {
     std::vector<void *> own;               // slices / copies this card allocated
     const __half * patch_w0 = nullptr, * patch_w1 = nullptr;
     const float * patch_b = nullptr, * pos = nullptr;
-    // scratch, sized for np_max patches
     unsigned char * rgb = nullptr;
     size_t rgb_cap = 0;
     __half * P = nullptr, * h = nullptr, * Q = nullptr, * K = nullptr, * V = nullptr, * O = nullptr, * G = nullptr;
-    float * x = nullptr, * y = nullptr, * part = nullptr, * inbox[2] = {};   // inbox: the peer's partials (uncached)
+    // inbox holds the peer's partials, allocated uncached
+    float * x = nullptr, * y = nullptr, * part = nullptr, * inbox[2] = {};
 };
 
 struct qz_vision {
@@ -361,7 +357,6 @@ struct qz_vision {
     vcard C[2];
     qz_loader ld;                          // the file's tensors on card 0
     int n_out = 0, min_tok = 8, max_tok = 4096, np_max = 0, ff = 0;
-    // merger (card 0)
     const __half * mm0_w = nullptr, * mm2_w = nullptr;
     const float * post_w = nullptr, * post_b = nullptr, * mm0_b = nullptr, * mm2_b = nullptr;
     float * out = nullptr;
@@ -370,7 +365,7 @@ struct qz_vision {
 };
 
 static void grid_of(const qz_vision * v, int w, int h, int * nx, int * ny) {
-    // calc_size_preserved_ratio (mtmd-image.cpp): align 32, round half even, min / max pixels
+    // Matches calc_size_preserved_ratio in mtmd-image.cpp.
     const int f = 32;
     const int minp = v->min_tok * 1024, maxp = v->max_tok * 1024;
     auto rnd = [&](float x) { return (int) std::nearbyint(x / (float) f) * f; };
@@ -406,7 +401,7 @@ qz_vision * qz_vision_load(const char * path) {
     if (getenv("QZ_IMG_MAX_TOKENS")) v->max_tok = std::max(v->min_tok, atoi(getenv("QZ_IMG_MAX_TOKENS")));
     v->np_max = v->max_tok * 4;
     auto fail = [&](const char * what) { fprintf(stderr, "quartz_vision: %s\n", what); qz_vision_free(v); return (qz_vision *) nullptr; };
-    // the layer matrices are sliced from the file (host) onto each card, not loaded whole
+    // The layer matrices are sliced from the file onto each card, not loaded whole.
     static const char * const BIG[6] = { "attn_qkv.weight", "attn_qkv.bias", "attn_out.weight", "ffn_up.weight", "ffn_up.bias", "ffn_down.weight" };
     v->ld.skip = [](const char * n) {
             if (strncmp(n, "v.blk.", 6)) return false;
@@ -446,7 +441,7 @@ qz_vision * qz_vision_load(const char * path) {
         c0.L.push_back(y);
     }
     {                                      // the per-card slices
-        for (int c = 0; c < 2; c++) {          // peer access both ways (the engine may have enabled it already)
+        for (int c = 0; c < 2; c++) {   // peer access both ways, already-enabled is fine
             if (hipSetDevice(v->C[c].dev) != hipSuccess) return fail("bad device");
             const hipError_t e = hipDeviceEnablePeerAccess(v->C[1 - c].dev, 0);
             if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled) return fail("no peer access between the cards");
@@ -468,7 +463,7 @@ qz_vision * qz_vision_load(const char * path) {
             ok = ok && hipMemcpy2D(d, dp, src, sp, w, rows, hipMemcpyDefault) == hipSuccess;
         };
         vcard & c1 = v->C[1];
-        auto dup = [&](const float * src, size_t n) -> const float * {   // a small f32 vector of card 0 on card 1
+        auto dup = [&](const float * src, size_t n) -> const float * {
             float * d = (float *) al(c1, n * 4);
             if (d) cp(d, src, n * 4);
             return d;
@@ -520,7 +515,7 @@ qz_vision * qz_vision_load(const char * path) {
         }
         if (!ok) return fail("weight slices failed");
     }
-    const size_t np = v->np_max, wide = std::max<size_t>(std::max<size_t>(3 * hd, ffc), V_D);   // merger: T x 4 V_D = np x V_D
+    const size_t np = v->np_max, wide = std::max<size_t>(std::max<size_t>(3 * hd, ffc), V_D);
     bool ok = true;
     for (int c = 0; c < nc && ok; c++) {
         vcard & C = v->C[c];
@@ -567,7 +562,8 @@ int qz_vision_encode_rgb(qz_vision * v, const unsigned char * rgb, int w, int h,
     if (W != w || H != h) qz_img::resize_bicubic(rgb, w, h, img, W, H);
     else img.assign(rgb, rgb + (size_t) w * h * 3);
     const int nc = 2, nh = V_H / nc, hd = nh * V_HD, ffc = v->ff / nc;
-    const float sl2 = 1.4426950408889634f / std::sqrt((float) V_HD);   // softmax scale, base 2
+    // Softmax scale 1/sqrt(V_HD), folded with log2(e) for the exp2 softmax.
+    const float sl2 = 1.4426950408889634f / std::sqrt((float) V_HD);
     int err = 0;
     auto each = [&](auto && fn) {
         for (int c = 0; c < nc && !err; c++) {
@@ -576,8 +572,7 @@ int qz_vision_encode_rgb(qz_vision * v, const unsigned char * rgb, int w, int h,
             err = fn(c, C, C.st);
         }
     };
-    // two cards: the partials in part -> x += (p0 + p1) + b on both
-    auto exchange = [&](auto bias) {
+    auto exchange = [&](auto bias) {   // part to the peer's inbox, then the two-card sum
         each([&](int c, vcard & C, hipStream_t s) {
             VCHK(hipMemcpyPeerAsync(v->C[1 - c].inbox[v->xk], v->C[1 - c].dev, C.part, C.dev, (size_t) N * V_D * 4, s));
             VCHK(hipEventRecord(C.ev, s));
@@ -599,7 +594,7 @@ int qz_vision_encode_rgb(qz_vision * v, const unsigned char * rgb, int w, int h,
             C.rgb_cap = img.size();
         }
         VCHK(hipMemcpyAsync(C.rgb, img.data(), img.size(), hipMemcpyHostToDevice, s));
-        // patch embedding (on each card): both temporal kernels see the still image
+        // Patch embedding on both cards; both temporal kernels see the still image
         v_patchify<<<N, 256, 0, s>>>(C.rgb, W, C.P);
         if (vgemm(C.blas, C.patch_w0, C.P, C.x, false, V_D, N, V_K, 0.f) || vgemm(C.blas, C.patch_w1, C.P, C.x, false, V_D, N, V_K, 1.f)) return -1;
         v_pos<<<N, 256, 0, s>>>(C.x, C.patch_b, C.pos, pw, ph);
@@ -627,7 +622,7 @@ int qz_vision_encode_rgb(qz_vision * v, const unsigned char * rgb, int w, int h,
         exchange([&](vcard & C) { return C.L[il].down_b; });
     }
     if (err) return -1;
-    // merger (card 0): post LN, 4 patches (one 2x2 block) per row, mm.0 + GELU, mm.2
+    // Merger on card 0: post LN, mm.0 + GELU, then mm.2, one 2x2 block per row
     vcard & C = v->C[0];
     hipStream_t s = C.st;
     VCHK(hipSetDevice(C.dev));

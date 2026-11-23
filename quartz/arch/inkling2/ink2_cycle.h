@@ -1,18 +1,17 @@
-// inkling2 persistent decode: one launch per card per token runs the embedding
-// and all 48 layer applications. One 512-thread block per
-// CU, software grid barriers (kernels/dev.h) between the phases, and the TP2
-// sums through the peer inbox and flags of kernels/xchg.h. The device bodies
-// are ink2_kernels.h's.
+// inkling2 persistent decode. One launch per card per token runs the embedding and
+// all 48 layer applications. One 512-thread block per CU, software grid barriers
+// (kernels/dev.h) between the phases, TP2 sums through the peer inbox and flags of
+// kernels/xchg.h. The device bodies live in ink2_kernels.h.
 #pragma once
 
 #include "kernels/xchg.h"
 
-// the cycle-only bodies round like ink2_kernels.h (fp contract on), restored at the end
+// fp contract(on) so these bodies round like ink2_kernels.h; contract(fast) again at the end
 #pragma clang fp contract(on)
 
-// the grid barrier: a flag per block (no atomic queue on one word). Block b
-// stores k to fl[b] (release); lanes 0 .. nb-1 of wave 0 each poll one block's
-// flag until it reaches k. fl: CYC_NBMAX words, zeroed per launch, k = 1, 2, ...
+// Grid barrier. Each block has its own flag, so no atomic queue on one word. Block b
+// stores k to fl[b] with release; lanes 0 .. nb-1 of wave 0 each poll one block's
+// flag until it reaches k. fl holds CYC_NBMAX words, zeroed per launch; k = 1, 2, ...
 constexpr int CYC_NBMAX = 64;
 __device__ __forceinline__ void cyc_barrier(unsigned int * fl, int k) {
     __syncthreads();
@@ -31,16 +30,16 @@ __device__ __forceinline__ void cyc_barrier(unsigned int * fl, int k) {
 // one layer application (built by ink2_engine::plan)
 struct appk {
     int slot, ip, full, msg;
-    int pre;                      // 1: P = X first; 2: OUT[ob] = X, X = P first (a loop pass starts)
+    int pre;                      // 1: P = X. 2: OUT[ob] = X, then X = P (a loop pass starts)
     float * pre_out;
     // attention half
     int has_res, mres_m;
     sptrs mres; const float * qres; float * res_out;
     sptrs mmsg; const float * qmsg; float * msg_out;
-    cjobs ca;                     // the q / k / v controllers (msg)
+    cjobs ca;                     // the q / k / v controllers, msg layers only
     njobs na; int nna;
     gjobs ga; int nga;            // nga: blocks
-    hpost hp;                     // kc / vc: the slot's cache base; tau 1
+    hpost hp;                     // kc / vc point at the slot's cache base; tau is 1
     attn_args at;                 // pos per token
     gjobs go; int ngo;            // attn_output -> PART[0]
     const float * pconv; float * hsa, * blk;
@@ -51,31 +50,31 @@ struct appk {
     const float * gin, * pb;
     const char * guv; const __half * gus; const char * dnv; const __half * dns;
     const float * fconv; float * hsf;
-    float * tap;                  // DSpark: X after this application's leading xconv (null: none)
+    float * tap;                  // DSpark: X after the application's leading xconv (null if none)
 };
 
-// static per card (device memory); the token's tok / pos / tau are kernel arguments
+// static per card in device memory; the token's tok / pos / tau are kernel arguments
 struct cyc_args {
     const appk * tab; int napp;
     const char * ev; const __half * es; const float * embd_norm; float eps;
     float * X, * P, * PART0, * PART1;
     float * F, * FN, * H, * WTS; int * IDS;
-    float * GU;                   // the SITU values (f32, NE_USED FFL; the head's logit buffer)
-    int * gcnt;                   // per quant group: tasks done (NE_USED FFL / 32, zero between uses)
+    float * GU;                   // the SITU values, NE_USED * FFL; also the head's logit buffer
+    int * gcnt;                   // tasks done per quant group (NE_USED * FFL / 32), reset to 0
     unsigned char * aq3, * hq; float * as3, * hs;
     float route_scale, beta, lb;
-    // the head (head launch arg): mix -> F, norm -> aq3 / as3 (block 0), then the vocab GEMV
-    // into hg.y with the softcap on the first nvalid rows (d_gemv + k_softcap's values)
+    // the head launch: mix into F, norm into aq3 / as3 (block 0), then the vocab GEMV
+    // into hg.y, with the softcap on the first nvalid rows
     sptrs hmix; const float * hq_out; njob hn; gjob hg; int nvalid; float softcap;
-    float * cpart;                // the chain groups' partial sums (2 CP_SZ)
+    float * cpart;                // the chain groups' partial sums, CP_SZ per group
     // TP2 exchange (the names kernels/xchg.h expects)
     float * xin_mine, * xin_peer;
     unsigned int * xflag_mine, * xflag_peer, * xseq;
     int * xerr;
 };
 
-// the card's partial is in the peer inbox (pushed, fenced, grid barrier passed): the
-// calling block flags (block 0 only) and waits for the peer's
+// The card's partial is in the peer inbox: pushed, fenced, grid barrier passed. The
+// calling block raises its flag (block 0 only) and waits for the peer's.
 template <class XA> __device__ __forceinline__ void cyc_xwait(const XA & A, unsigned int tok) {
     if (threadIdx.x == 0) {
         if (blockIdx.x == 0) qz_xflag(A, tok);
@@ -84,16 +83,15 @@ template <class XA> __device__ __forceinline__ void cyc_xwait(const XA & A, unsi
     __syncthreads();
 }
 
-// The phase wrappers. Pointers the kernel loads from the table are generic to the
-// compiler, so the wrappers pass them through qz_gp() (kernels/dev.h): global
-// loads / stores, inferred through the inlined bodies.
-// the table and args are read through the constant address space: scalar loads
+// Phase wrappers. The compiler sees the table's pointers as generic, so these pass them
+// through qz_gp() (kernels/dev.h); the inlined bodies infer global loads and stores. The
+// table and args are read through the constant address space, as scalar loads.
 #ifdef __HIP_DEVICE_COMPILE__
 #define CK const __attribute__((address_space(4)))
 #else
 #define CK const
 #endif
-constexpr int CYC_LDS = 6 * D * 4;           // dynamic LDS: the mix states (attention partials between mixes)
+constexpr int CYC_LDS = 6 * D * 4;           // dynamic LDS: the mix states, also the attention scratch
 static_assert(ATT_LDS <= CYC_LDS, "attention scratch fits the dynamic LDS");
 extern __shared__ float cyc_lds[];
 #define CYC_NI __device__ __forceinline__
@@ -106,7 +104,7 @@ template <int MQ> CYC_NI void c_mix(CK sptrs * S, const float * q, float * o, in
     d_mix_lds<MQ>(L, qz_gp(q), qz_gp(o), tid, tid < 256, cyc_lds);
 }
 CYC_NI void c_mix1(CK sptrs * S, const float * q, float * o, int tid) { c_mix<1>(S, q, o, tid); }
-// bsum<N>(v, red, 4) for each 256-thread half of the block on its own (red: 2 * 4 * N)
+// bsum<N>(v, red, 4) for each 256-thread half of the block separately (red: 2 * 4 * N)
 template <int N> CYC_NI void hsum(float (&v)[N], float * red) {
     #pragma unroll
     for (int k = 0; k < N; k++) v[k] = qz_wsum_dpp(v[k]);
@@ -123,15 +121,15 @@ template <int N> CYC_NI void hsum(float (&v)[N], float * red) {
         v[k] = s;
     }
 }
-// the control-down rows in one pass per block: the blocks split into NJ groups
-// (one job each: its rms once), each half block takes 2 rows: 256-thread
-// strided sums, then 4-wave reductions
+// The control-down rows, one pass per block. The blocks split into NJ groups, one job
+// each, so every rms runs once. A half block takes 2 rows, with 256-thread strided sums
+// and then a 4-wave reduction.
 template <int NJ> CYC_NI void c_ctrl_down_all(CK cjob * cj, int tid) {
     asm volatile ("" : "+v"(tid));
     __shared__ float red[2 * 4 * 2];
     constexpr int NV = D / 256, MR = 2;
     const int bpj = gridDim.x / NJ, j = blockIdx.x / bpj, bj = blockIdx.x % bpj, h = tid >> 8, t = tid & 255;
-    if (j >= NJ) return;                                   // the leftover blocks (block-uniform)
+    if (j >= NJ) return;                                   // leftover blocks, block-uniform
     const float * cur = qz_gp(cj[j].cur), * msg = qz_gp(cj[j].msg), * wd = qz_gp(cj[j].wd);
     float * g = qz_gp(cj[j].g);
     for (int r0 = bj; r0 < GRANK; r0 += 2 * MR * bpj) {
@@ -168,9 +166,9 @@ template <int NJ> CYC_NI void c_ctrl_down_all(CK cjob * cj, int tid) {
     }
     __syncthreads();
 }
-// the control-up rows for the NJ jobs' D rows each, over all blocks, from the transposed
-// weights (wgt / wft [GRANK][D]: lanes on consecutive rows, coalesced): item =
-// (row, sum), each sum in sequential k order; the forget sums via LDS
+// The control-up rows: NJ * D rows spread over all blocks, from the transposed weights
+// (wgt / wft [GRANK][D], with lanes on consecutive rows, coalesced). Each item is a row
+// and a sum, and every sum runs in sequential k order. The forget sums go through LDS.
 template <int NJ> CYC_NI void c_ctrl_up_all(CK cjob * cj, int tid) {
     asm volatile ("" : "+v"(tid));
     __shared__ float g[NJ][GRANK], sf[256];
@@ -208,8 +206,8 @@ CYC_NI void c_norm(CK njob * j, float eps, int tid) {
     n.x = qz_gp(j->x); n.w = qz_gp(j->w); n.y = j->y ? qz_gp(j->y) : nullptr; n.q = qz_gp(j->q); n.qs = qz_gp(j->qs);
     d_norm_quant(n, eps, tid, tid < 256);
 }
-// half a 32-row virtual block (16 rows, S = 2 per wave): the same rows with the
-// same per-row code, only finer so that a small job list balances over the grid
+// Half a 32-row virtual block: 16 rows, S = 2 per wave, same rows and per-row code as
+// d_gemv, split finer so a small job list balances over the grid.
 CYC_NI void c_gemv2(CK gjobs * J, int hb, float * yp) {
     const int wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
     const int b = hb >> 1, half = hb & 1;
@@ -226,8 +224,8 @@ CYC_NI void c_gemv2(CK gjobs * J, int hb, float * yp) {
         #pragma unroll
         for (int s = 0; s < 2; s++) if (r0 + s < N) { y[r0 + s] = acc[0][s]; if (yp) qz_gp(yp)[r0 + s] = acc[0][s]; }
 }
-// the vocab GEMV: 32-row units over the grid (d_gemv's rows), the softcap applied
-// to the stored value on rows < nv (k_softcap's expression)
+// The vocab GEMV: 32-row units spread over the grid, as d_gemv's rows. Rows < nv are
+// stored with the softcap applied.
 CYC_NI void c_head_gemv(CK gjob * J, int nv, float cap) {
     const int wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
     const int N = J->N;
@@ -246,23 +244,23 @@ CYC_NI void c_head_gemv(CK gjob * J, int nv, float cap) {
     }
 }
 
-// ---- the chain group: CG blocks share block 0's serial work (xconv, the pass
-// copies, a mix and its norms). Block w owns the columns 64 w + l + 256 k
-// (l < 64, k < D / 256): exactly wave w's share of every full-row sum in
-// d_mix_lds / d_norm_quant (per-lane sum over k, qz_wsum_dpp, waves 0 .. 3 added in
-// order), so each block publishes its wave-w partials, the group syncs on flags,
-// and every block adds the CG partials in that order: the same bits. The
-// element-wise parts (output pass, y / quant, xconv, copies) take the owned
-// columns, the same thread for the same column throughout (no barrier between).
+// ---- the chain group. CG blocks share block 0's serial work: xconv, the pass copies, a
+// mix and its norms. Block w owns columns 64 w + l + 256 k, with l < 64 and k < D / 256.
+// That is exactly wave w's share of every full-row sum in d_mix_lds / d_norm_quant, where
+// each lane sums over k, qz_wsum_dpp reduces, and waves 0 .. 3 are added in order. Each
+// block publishes its wave-w partials, the group syncs on flags, and every block adds the
+// CG partials in that order, so the bits match. The element-wise parts (output pass,
+// y / quant, xconv, copies) work on the owned columns with the same thread for the same
+// column throughout, so they need no barrier.
 constexpr int CG = 4, CQ = D / CG, CNK = D / 256;
 static_assert(CQ == 64 * CNK && CNK * 256 == D, "chain group columns");
 constexpr int CYC_NBX = CYC_NBMAX + 2 * CG;      // bst words: the grid barrier's, then the chain groups'
 constexpr int CP_1 = 0, CP_2 = CP_1 + CG * 6, CP_N = CP_2 + CG * 6 * 4, CP_SZ = CP_N + CG * 4;   // partial slots per group
 __device__ __forceinline__ int ccol(int w, int q) { return 64 * w + (q & 63) + 256 * (q >> 6); }
-// a partial after cg_sync: plain loads (the sync's acquire fence invalidated the CU's L1), all in flight at once
+// After cg_sync a plain load suffices, because the sync's fence dropped the CU's L1.
 __device__ __forceinline__ float cld(const float * p) { return *p; }
-struct cgrp { unsigned int * fl; float * cp; int w; };     // the group's CG flags, its partial slots, this block's index
-// the partials stored (each by its writer, fenced) -> all CG blocks have published epoch e
+struct cgrp { unsigned int * fl; float * cp; int w; };     // w is this block's index within the group
+// Returns once every CG block has published epoch e, each partial fenced by its writer.
 CYC_NI void cg_sync(const cgrp & g, unsigned int e) {
     __syncthreads();
     if (threadIdx.x == 0) __hip_atomic_store(&g.fl[g.w], e, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
@@ -273,8 +271,8 @@ CYC_NI void cg_sync(const cgrp & g, unsigned int e) {
     __syncthreads();
 }
 __device__ __forceinline__ void cg_put(float * p, float v) { *p = v; __threadfence(); }
-// d_xconv_blk's values on the owned columns (thread q = tid, tid + 512)
-// tap: also the new x (the DSpark drafter's feature: the residual entering the next application)
+// d_xconv_blk's values on the owned columns, thread q = tid and tid + 512. With tap, it
+// also takes the new x: the DSpark feature, the residual entering the next application.
 CYC_NI void c_cxconv(const float * own, const float * peer, const float * w, float * hs, float * x, float * blk, int cw, int tid,
                      float * tap = nullptr) {
     own = qz_gp(own); peer = qz_gp(peer); w = qz_gp(w); hs = qz_gp(hs); x = qz_gp(x); blk = blk ? qz_gp(blk) : nullptr; tap = tap ? qz_gp(tap) : nullptr;
@@ -309,7 +307,7 @@ CYC_NI void c_cpre(int pre, float * P, float * X, float * po, int cw, int tid) {
         }
     }
 }
-// d_norm_quant of NJ rows held in LDS v[j][CQ] (owned columns): wave j < NJ
+// d_norm_quant of NJ rows held in LDS v[j][CQ], owned columns; wave j handles row j
 CYC_NI void c_cnorm_tail(int NJ, const float * v, CK njob * nj, float eps, const cgrp & g, unsigned int & ce, int tid) {
     const int wave = tid >> 6, lane = tid & 63;
     float wv[CNK];                       // the norm weights in flight over the sync
@@ -361,7 +359,7 @@ template <int NJ> CYC_NI void c_cnorm(CK njob * nj, float eps, const cgrp & g, u
     c_cnorm_tail(NJ, v, nj, eps, g, ce, tid);
     __syncthreads();
 }
-// d_mix_lds<MQ> (two-pass order) on the owned columns; NRM: then the norms nj[j] of output j
+// d_mix_lds<MQ> in two-pass order, on the owned columns. With NRM, also the norm nj[j].
 template <int MQ, bool NRM> CYC_NI void c_cmix(CK sptrs * S, const float * qy, float * out, CK njob * nj, float eps,
                                               const cgrp & g, unsigned int & ce, int tid) {
     asm volatile ("" : "+v"(tid));
@@ -384,7 +382,7 @@ template <int MQ, bool NRM> CYC_NI void c_cmix(CK sptrs * S, const float * qy, f
         }
     }
     __syncthreads();
-    // pass 1: wave s the sum of squares of state s
+    // pass 1: wave s sums the squares of state s
     {
         float r = 0.f;
         if (wave < 6)
@@ -404,7 +402,7 @@ template <int MQ, bool NRM> CYC_NI void c_cmix(CK sptrs * S, const float * qy, f
         crs[tid] = rsqrtf(a / D + 1e-6f);
     }
     __syncthreads();
-    // pass 2: wave s the dots of rms(state s) with the queries
+    // pass 2: wave s takes the dots of rms(state s) with the queries
     if (wave < 6) {
         const float rh = crs[wave];
         float r[MQ];
@@ -424,7 +422,7 @@ template <int MQ, bool NRM> CYC_NI void c_cmix(CK sptrs * S, const float * qy, f
     }
     cg_sync(g, ++ce);
     __shared__ float cpl[CG * 6 * 4];
-    if (tid < CG * 6 * 4) cpl[tid] = cld(&g.cp[CP_2 + tid]);   // the partials, one load per thread
+    if (tid < CG * 6 * 4) cpl[tid] = cld(&g.cp[CP_2 + tid]);
     __syncthreads();
     if (tid < MQ) {                        // d_mix_lds's softmax, query j = tid
         float v[6];
@@ -496,9 +494,9 @@ CYC_NI void c_xconv_b0(const float * own, const float * peer, const float * w, f
     d_xconv_blk<512>(qz_gp(own), qz_gp(peer), qz_gp(w), qz_gp(hs), qz_gp(x), blk ? qz_gp(blk) : nullptr, tid);
 }
 CYC_NI void c_router(const float * f, const float * wr, const float * bias, float * ps, int e, int lane) { d_router(qz_gp(f), qz_gp(wr), qz_gp(bias), qz_gp(ps), e, lane); }
-// the router's top NE_USED by rank: candidate i's place = #{j : s_j > s_i or (s_j == s_i and j < i)}
-// (selection order: max first, ties to the lower id); the weights p / sum(p) * scale
-// with the sum in that order. The whole block calls it.
+// The router's top NE_USED by rank. Candidate i's place is #{j : s_j > s_i, or s_j == s_i
+// and j < i}, so ties go to the lower id and the larger scores come first. The weights
+// are p / sum(p) * scale, with the sum taken in that order. The whole block calls it.
 CYC_NI void c_pick_rank(const float * ps, float scale, int * sids, float * swts, int tid) {
     __shared__ float lv[NE], lp[NE_USED];
     asm volatile ("" : "+v"(tid));
@@ -523,11 +521,11 @@ CYC_NI void c_pick_rank(const float * ps, float scale, int * sids, float * swts,
     }
     __syncthreads();
 }
-// the experts' gate | up GEMV, SITU and quant: task = 2 activations (their 2
-// gate rows and the 2 up rows 32 later, gu_row) in one 4-row GEMV (qz_gemv_rows_t's
-// value per row), dealt round-robin over all the grid's waves; the SITU
-// values go to sv (f32) and the wave finishing a 32-activation group (gcnt)
-// quantizes it (quant32) and resets the count
+// The experts' gate | up GEMV, SITU and quant. A task is 2 activations: their 2 gate rows
+// and the 2 up rows 32 later (gu_row), in one 4-row GEMV with qz_gemv_rows_t's value per
+// row. Tasks go round-robin over all the grid's waves. The SITU values land in sv as f32,
+// and the wave that finishes a 32-activation group (gcnt) quantizes it and resets the
+// count.
 constexpr int UP_A = 2, UP_TG = 32 / UP_A;       // activations per task, tasks per quant group
 CYC_NI void c_up_situ_w(const char * wv, const __half * ws, const int * sids, const unsigned char * av, const float * as,
                         float beta, float lb, float * sv, int * gcnt, unsigned char * hq, float * hs, int tid) {
@@ -562,18 +560,18 @@ CYC_NI void c_up_situ_w(const char * wv, const __half * ws, const int * sids, co
         }
     }
 }
-// the experts' down rows, the grid's row quads split evenly over the blocks;
-// task (quad, expert pair): lanes 0..31 expert 2p, 32..63 expert 2p+1. With
-// K = FFL (18 units) a lane holds at most one unit, so qz_gemv_rows_t's per-row
-// value is this tree: the unit products, the shfl_down levels 16..1 (its
-// level 32 adds zeros); then the same k-order fold of wk * acc (from LDS)
+// The experts' down rows. The grid's row quads split evenly over the blocks, and a task
+// is a quad with an expert pair: lanes 0..31 take expert 2p, lanes 32..63 expert 2p+1.
+// K = FFL is 18 units, so a lane holds at most one unit and the per-row value is the unit
+// products reduced by shfl_down levels 16..1 (level 32 would only add zeros), then the
+// same k-order fold of wk * acc from LDS.
 constexpr int MD_Q = 16;                         // quads per LDS chunk
 CYC_NI void c_moe_down_q(const char * wv, const __half * ws, const int * sids, const float * swts,
                          const unsigned char * aq, const float * as, float * y, float * yp, int tid, float * lacc) {
     static_assert(FFL / 32 <= 32, "one unit per lane");
     asm volatile ("" : "+v"(tid));
     constexpr int NU = FFL / 32, NQ = D / 4;
-    y = qz_gp(y); yp = yp ? qz_gp(yp) : nullptr;          // aq / as: LDS
+    y = qz_gp(y); yp = yp ? qz_gp(yp) : nullptr;          // aq / as are LDS pointers
     const int wave = tid >> 6, lane = tid & 63, h = lane >> 5, l = lane & 31;
     const int q0 = blockIdx.x * NQ / gridDim.x, q1 = (blockIdx.x + 1) * NQ / gridDim.x;
     for (int c0 = q0; c0 < q1; c0 += MD_Q) {
@@ -625,10 +623,10 @@ CYC_NI void c_moe_down_q(const char * wv, const __half * ws, const int * sids, c
     }
 }
 
-// the token. Per application: block 0 alone runs the serial chain (exchange wait,
-// post conv, the next mix and norm); the grid shares the GEMVs, the head posts,
-// attention, the router and the experts. Each block repeats the router's top-8
-// (into LDS), and gate_up tiles carry their SITU.
+// The token. Per application, block 0 alone runs the serial chain: the exchange wait, the
+// post conv, the next mix and norm. The grid shares the GEMVs, the head posts, attention,
+// the router and the experts. Every block repeats the router's top-8 into its own LDS;
+// the gate_up tiles carry their SITU value.
 __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_args * Ag, int tok, int pos, float tau, int head) {
     __shared__ int sids[NE_USED];
     __shared__ float swts[NE_USED];
@@ -640,14 +638,14 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
     unsigned int xs = *Ag->xseq;
     if (b0) d_embed(Ag->ev, Ag->es, tok, Ag->embd_norm, Ag->eps, Ag->X, tid_k, tid_k < 256);
     const int napp = Ag->napp;
-    // the chain groups: blocks 0 .. CG-1 and CG .. 2 CG-1 (flags after the grid barrier's, zeroed per launch)
+    // the chain groups: blocks 0 .. CG-1 and CG .. 2 CG-1, with flags zeroed per launch
     const cgrp g1 = {bst + CYC_NBMAX, Ag->cpart, (int) blockIdx.x};
     const cgrp g2 = {bst + CYC_NBMAX + CG, Ag->cpart + CP_SZ, (int) blockIdx.x - CG};
     unsigned int ce1 = 0, ce2 = 0;
     if (blockIdx.x < CG) cg_sync(g1, ++ce1);          // block 0's embedding (X) before the group reads its columns
     for (int ai = 0; ai < napp; ai++) {
-        // the args / table pointers opaque per application: their fields are
-        // reloaded (scalar) where used instead of held live across the loop
+        // The args and table pointers stay opaque per application, so their fields are
+        // reloaded as scalars where used instead of living across the loop.
         CK cyc_args * Ap = (CK cyc_args *) Ag;
         asm volatile ("" : "+s"(Ap));
         CK cyc_args & A = *Ap;
@@ -658,8 +656,8 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
         const int wave = tid >> 6, lane = tid & 63;
         const int pre = e->pre, msg = e->msg;
 
-        // ---- P0, chain group 1 (blocks 0 .. CG-1): the previous ffn sum + conv, the pass
-        // copies, the mixes, the norms; the msg mix that needs none of it on group 2
+        // ---- P0, chain group 1 (blocks 0 .. CG-1): previous ffn sum and conv, the pass
+        // copies, the mixes, the norms. The msg mix needs none of it, so group 2 runs it.
         if (blockIdx.x < CG) {
             if (ai > 0) {
                 CK appk * ep = e - 1;
@@ -719,7 +717,7 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
             BAR();
         }
         // ---- experts
-        for (int x = blockIdx.x + nb * wave; x < NE; x += 8 * nb) c_router(A.FN, e->gin, e->pb, A.H, x, lane);   // spread: few waves per block
+        for (int x = blockIdx.x + nb * wave; x < NE; x += 8 * nb) c_router(A.FN, e->gin, e->pb, A.H, x, lane);   // few waves per block
         BAR();
         c_pick_rank(A.H, A.route_scale, sids, swts, tid);
         if (b0 && tid < NE_USED) { qz_gp(A.IDS)[tid] = sids[tid]; qz_gp(A.WTS)[tid] = swts[tid]; }
@@ -730,7 +728,7 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
         __threadfence_system();
         BAR();
     }
-    if (b0) {        // the last ffn sum + conv
+    if (b0) {        // the last ffn sum and conv
         CK cyc_args & A = *(CK cyc_args *) Ag;
         CK appk * ep = (CK appk *) A.tab + napp - 1;
         cyc_xwait(A, xs);

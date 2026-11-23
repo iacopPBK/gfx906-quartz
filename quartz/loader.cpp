@@ -1,3 +1,4 @@
+// Model loader: plans placement, allocates, then streams and repacks each tensor.
 #include "loader.h"
 #include "repack.h"
 
@@ -26,7 +27,7 @@ bool qz_loader::plan(const qz_gguf & g, int card) {
         const int64_t * ne = gguf_get_tensor_ne(g.ctx, t);
         for (int d = 0; d < GGML_MAX_DIMS; d++) ts[t].ne[d] = ne[d] > 0 ? ne[d] : 1;
         ts[t].ne0 = ne[0];
-        ts[t].ne1 = 1;                      // rows: every dim past ne0 (4-D conv kernels too)
+        ts[t].ne1 = 1;                      // rows: dims past ne0, conv weights are 4-D
         for (int d = 1; d < GGML_MAX_DIMS; d++) ts[t].ne1 *= ne[d] > 0 ? ne[d] : 1;
         raw_off[t] = data_off + gguf_get_tensor_offset(g.ctx, t);
         ts[t].src_ne0 = ts[t].ne0;
@@ -58,7 +59,7 @@ bool qz_loader::load(const char * path, const qz_gguf & g, int dev, int card) {
 
     FILE * f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "qz_loader: cannot open %s\n", path); return false; }
-    {   // every tensor's data inside the file (a truncated download fails here, not in the map)
+    {   // every tensor must end inside the file, so a truncated download fails here
         fseek(f, 0, SEEK_END);
         const uint64_t flen = (uint64_t) ftell(f);
         for (int64_t t = 0; t < nt; t++) {
@@ -71,7 +72,7 @@ bool qz_loader::load(const char * path, const qz_gguf & g, int dev, int card) {
             }
         }
     }
-    // sliced tensors gather rows/blocks straight from a read-only map
+    // sliced tensors gather their rows and blocks from a read-only map
     const uint8_t * map = nullptr;
     size_t map_len = 0;
     if (card >= 0) {
@@ -101,8 +102,8 @@ bool qz_loader::load(const char * path, const qz_gguf & g, int dev, int card) {
         }
     }
 
-    // stream + repack through two pinned buffers: repack into one while the
-    // other's async copy runs (pinned: no small pageable copies)
+    // Stream and repack through two pinned buffers. A chunk is repacked into one
+    // buffer while the other's async copy runs, which avoids small pageable copies.
     const auto t0 = std::chrono::steady_clock::now();
     const size_t CHUNK = (size_t) 64 << 20;
     uint8_t * pin[2] = { nullptr, nullptr };
@@ -115,7 +116,7 @@ bool qz_loader::load(const char * path, const qz_gguf & g, int dev, int card) {
     CHECK(hipStreamCreateWithFlags(&st, hipStreamNonBlocking));
     bool ok = true;
     int cur = 0;
-    // next free pinned buffer: wait for its previous copy, then hand it out
+    // hand out the next pinned buffer once its previous copy has landed
     auto take = [&]() -> uint8_t * {
         cur ^= 1;
         if (hipEventSynchronize(ev[cur]) != hipSuccess) ok = false;
@@ -124,7 +125,7 @@ bool qz_loader::load(const char * path, const qz_gguf & g, int dev, int card) {
     auto submit = [&](void * dev_dst, const void * src, size_t n) {
         if (n && hipMemcpyAsync(dev_dst, src, n, hipMemcpyHostToDevice, st) != hipSuccess) ok = false;
     };
-    // both events start signaled
+    // both events start signaled, so the first take() does not wait
     CHECK(hipEventRecord(ev[0], st));
     CHECK(hipEventRecord(ev[1], st));
 
@@ -135,7 +136,7 @@ bool qz_loader::load(const char * path, const qz_gguf & g, int dev, int card) {
         const int64_t K = d.ne0, N = d.ne1, VS = d.vstride;
         const bool sliced = !d.slice.rows.empty() || !d.slice.cols.empty();
         if (sliced && d.type == GGML_TYPE_F32) {
-            // small (conv1d, dt_bias, ssm_a): one staging buffer
+            // small tensors (conv1d, dt_bias, ssm_a): one staging buffer
             const float * src = (const float *)(map + raw_off[t]);
             if ((size_t) d.bytes() > CHUNK) { fprintf(stderr, "f32 slice too big %s\n", d.name.c_str()); ok = false; break; }
             float * buf = (float *) take();
@@ -151,8 +152,8 @@ bool qz_loader::load(const char * path, const qz_gguf & g, int dev, int card) {
             continue;
         }
         if (sliced) {
-            // Q8_0: gather the selected raw blocks of each selected row, then
-            // the same repack as the whole-model path
+            // Q8_0: gather the selected 34-byte blocks of each selected row, then
+            // repack exactly as the whole-model path does
             const int64_t src_raw = (d.src_ne0 / 32) * 34;
             const int64_t row_raw = (K / 32) * 34;
             const int64_t batch = std::max<int64_t>(1, std::min<int64_t>(N, (int64_t)(CHUNK / (size_t)(VS + K / 16))));
@@ -192,7 +193,7 @@ bool qz_loader::load(const char * path, const qz_gguf & g, int dev, int card) {
             }
             continue;
         }
-        // Q8_0: values plane K bytes/row + scale plane K/16 bytes/row per chunk
+        // Q8_0: K bytes per row in the values plane, K/16 in the scale plane
         const int64_t row_raw = (K / 32) * 34;
         const int64_t batch = std::max<int64_t>(1, std::min<int64_t>(N, (int64_t)(CHUNK / (size_t)(VS + K / 16))));
         raw.resize((size_t)(batch * row_raw));

@@ -1,5 +1,5 @@
-// Thin wrapper over the gguf C API. No new reader code is written;
-// this only wraps key lookup with defaults for the engine's loader.
+// Typed key lookup with defaults for the engine's loader, on top of the GGUF C
+// API in gguf_lite.h. This adds no reader code of its own.
 #pragma once
 
 #include <cinttypes>
@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "gguf_lite.h"   // quartz's own reader (was ggml include)
+#include "gguf_lite.h"   // quartz's own reader
 
 static inline const char * qz_type_name(ggml_type t) {
     switch (t) {
@@ -24,7 +24,7 @@ struct qz_gguf {
 
     ~qz_gguf() { if (ctx) gguf_free(ctx); }
 
-    // metadata + tensor map only, no tensor data is read
+    // opens the metadata and the tensor map only. No tensor data is read.
     bool open(const char * path) {
         gguf_init_params p = {};
         p.no_alloc = true;
@@ -55,14 +55,14 @@ struct qz_gguf {
         return id < 0 ? def : gguf_get_val_bool(ctx, id);
     }
 
-    int64_t tensor(const char * name) const {   // tensor index, -1 if absent
+    int64_t tensor(const char * name) const {   // tensor index, -1 when absent
         for (int64_t i = 0; i < gguf_get_n_tensors(ctx); i++)
             if (strcmp(gguf_get_tensor_name(ctx, i), name) == 0) return i;
         return -1;
     }
 
-    // tensor `name` has exactly the file dims `dims` (ggml order, trailing 1s implied)
-    // and, unless type is GGML_TYPE_COUNT, that type; false with a message otherwise
+    // checks tensor `name` against `dims` in ggml order (trailing dims are 1) and
+    // against `type` unless it is GGML_TYPE_COUNT. A mismatch prints and returns false.
     bool shape(const char * name, std::initializer_list<int64_t> dims, ggml_type type = GGML_TYPE_COUNT) const {
         const int64_t t = tensor(name);
         if (t < 0) { fprintf(stderr, "quartz: missing tensor %s\n", name); return false; }
@@ -81,7 +81,7 @@ struct qz_gguf {
         return ok;
     }
 
-    // an integer or bool array as int64 (empty when absent or of another type)
+    // an integer or bool array widened to int64, empty when absent or of another type
     std::vector<int64_t> ints(const char * k) const {
         std::vector<int64_t> v;
         int64_t id = key(k);

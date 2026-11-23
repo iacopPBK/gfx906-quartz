@@ -1,9 +1,8 @@
-// inkling2 engine: weights, buffers and the per-token tables of the forward
-// pass of docs/inkling2.md on both cards; decode runs in the persistent kernel
-// (ink2_cycle.h), one launch per card per token. TP2: each card runs its
-// q / kv heads and its half of every expert's FF; the attention output and
-// the expert down projection are summed across the cards (each reads the
-// peer's partial over P2P after a cross-stream event wait).
+// inkling2 engine: weights, buffers and the per-token tables of the forward pass of
+// docs/inkling2.md, on both cards. Decode runs in the persistent kernel (ink2_cycle.h),
+// one launch per card per token. TP2: each card runs its q / kv heads and half of every
+// expert's FF. The attention output and the expert down projection are summed across the
+// cards, each card reading the peer's partial over P2P after a cross-stream event wait.
 #pragma once
 
 #include "ink2_verify.h"     // the speculative round's VR-row kernel (after ink2_cycle.h)
@@ -34,7 +33,7 @@ struct ink2_card {
     float * X, * P, * OUT[2], * BLK[8], * IN[3], * MSG[NCTRL], * CT[NCTRL], * F, * FN, * G;
     float * QR, * GR, * RR, * SK, * KR, * VR, * DK, * DV, * Q, * TB, * PART[2], * H, * WTS, * LOG;
     int * IDS;
-    unsigned char * aq[4]; float * as[4];      // input planes: Q | K | V inputs, ffn / head input
+    unsigned char * aq[4]; float * as[4];      // input planes: Q, K, V, then the ffn / head input
     unsigned char * oq; float * os;           // attention output planes [QL]
     float * apart = nullptr; int * acnt = nullptr;   // attention split partials / counters
     unsigned char * hq; float * hs;           // expert activation planes [NE_USED][FFL]
@@ -42,7 +41,7 @@ struct ink2_card {
     __half * kc[NAPP], * vc[NAPP];            // per slot: full [ctx][KVL], SWA ring [WIN][KVL]
     float * hist;                             // [NAPP][3][CHL]
     int nvalid = 0, id0 = 0;                  // head rows that are real vocab ids, the first id
-    // verify (ink2_verify.h): VR row replicas of the activations, at stride rs bytes
+    // verify (ink2_verify.h): the VR row replicas of the activations, rs bytes apart
     size_t rs = 0;                            // one activation row's stride (bytes, 256-aligned)
     size_t apsz = 0;                          // attention partials per row (floats)
     float * uh = nullptr;                     // [NAPP][VR][CHL]: each row's conv input
@@ -128,7 +127,7 @@ struct ink2_engine {
                 }
             }
         }
-        {   // gate_up rows interleaved per 32 (gu_row): the prefill GEMM's 64-row tiles pair them for SITU
+        {   // gate_up rows interleaved per 32 (gu_row), so the prefill GEMM's 64-row tiles pair for SITU
             const size_t nv = (size_t) NE * FFE * D, ns = (size_t) NE * FFE * (D / 32);
             char * tv; __half * ts;
             ICHECK(hipMalloc(&tv, nv)); ICHECK(hipMalloc(&ts, ns * 2));
@@ -164,8 +163,8 @@ struct ink2_engine {
         add(f32(QL / 4)); add(f32(QL / 32));
         add(f32(NE_USED * FFL / 4)); add(f32(NE_USED * FFL / 32));
         add(f32(QZ_TOPK_NB * QZ_TOPK * 2));
-        // the per-token activations above are replicated VR times: row r of any of them
-        // is (char *) p + r * rs, row 0 being the decode's buffers (ink2_verify.h)
+        // the per-token activations above are replicated VR times. Row r of any of them is
+        // (char *) p + r * rs, and row 0 is the decode's buffers (ink2_verify.h).
         const size_t aneed = need;
         K.rs = (aneed + 255) & ~(size_t) 255;
         size_t cneed = 0;
@@ -265,14 +264,14 @@ struct ink2_engine {
         else if (m == 3) k_mix<3><<<1, 512, MIX_LDS, C[c].st>>>(S, q, out);
         else k_mix<4><<<1, 512, MIX_LDS, C[c].st>>>(S, q, out);
     }
-    // both cards' partials written: each waits for the other's, then reads it
+    // record each card's partials, then let each wait for the peer's event before reading
     void exchange() {
         for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipEventRecord(C[c].ev, C[c].st)); }
         for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamWaitEvent(C[c].st, C[1 - c].ev, 0)); }
     }
 
-    // ---- the token's 48 layer applications as a table (appk, ink2_cycle.h),
-    // built once per card; the persistent kernel walks it. Only pos / tau / the cache row vary per token.
+    // ---- the token's 48 layer applications as a table of appk (ink2_cycle.h), built once
+    // per card and walked by the persistent kernel. Only pos, tau and the cache row vary.
     struct seq {           // the host-side lists of block buffers (per card the same indices)
         std::vector<int> blocks;      // indices into BLK
         int nblk = 0;                 // BLK buffers used
@@ -362,7 +361,7 @@ struct ink2_engine {
         e.fconv = L.fconv; e.hsf = K.hist + (size_t) slot * 3 * CHL + H_F;
         return e;
     }
-    // the step() order of applications, slots and residual-block lists (as the host loop had it)
+    // plan the applications, slots and residual-block lists in the order a step() runs them
     void plan(int c) {
         std::vector<appk> & T = tab[c];
         T.clear();
@@ -392,8 +391,8 @@ struct ink2_engine {
         head_mix[c] = sp(bl, C[c].X);
     }
     bool planned = false;
-    // DSpark (set before the first step, card 0): the residual entering applications
-    // DSPARK_VISIT[k] -> dtap + k D, the head's normed input -> dtap_head
+    // DSpark (set before the first step, card 0): the residual entering the application
+    // DSPARK_VISIT[k] goes to dtap + k D, the head's normed input to dtap_head.
     static constexpr int DSPARK_VISIT[3] = {5, 23, 41};
     float * dtap = nullptr, * dtap_head = nullptr;
     void plan_all() {
@@ -420,7 +419,7 @@ struct ink2_engine {
         planned = true;
     }
     float tau_at(int pos) const { return 1.f + hp.tau_alpha * logf(fmaxf(1.f, (float) (pos + 1) / (float) hp.tau_floor)); }
-    // the persistent path: embed + all applications in one launch per card
+    // the persistent path: embed and all applications in one launch per card
     long long n_cyc = 0;
     void run_cycle(int32_t tok, int pos, bool head) {
         for (int c = 0; c < 2; c++) {
@@ -434,11 +433,11 @@ struct ink2_engine {
     }
 
     // ---- verify (ink2_verify.h): the speculative round's VR rows in one launch per card.
-    // The per-row tables (every per-token activation pointer + r * rs, the attention
-    // partials / counters on their own strides) are built once from the decode table.
+    // The per-row tables are built once from the decode table: every per-token activation
+    // pointer plus r * rs, and the attention partials and counters on their own strides.
     std::vector<appk> vtab[2];
     appk * vtab_d[2] = {nullptr, nullptr};
-    float * vtap = nullptr;                        // card 0: the rows' [4][D] drafter features (the drafter's)
+    float * vtap = nullptr;                        // card 0: the rows' [4][D] drafter features
     bool vplanned = false;
     template <class T> static T * shp(T * p, size_t o) { return p ? (T *) ((char *) p + o) : nullptr; }
     static void sh_sptrs(sptrs & S, size_t o) { for (int i = 0; i < 6; i++) S.p[i] = shp(S.p[i], o); }
@@ -451,7 +450,7 @@ struct ink2_engine {
     static void sh_gjobs(gjobs & J, size_t o) {
         for (int i = 0; i < J.n; i++) { J.j[i].av = shp(J.j[i].av, o); J.j[i].as = shp(J.j[i].as, o); J.j[i].y = shp(J.j[i].y, o); }
     }
-    // row r's entry: activations + r * rs; weights, the KV caches and the histories stay
+    // row r's entry: activations plus r * rs. Weights, KV caches and histories stay shared.
     void shift_appk(appk & e, int r, size_t o) {
         e.pre_out = shp(e.pre_out, o);
         sh_sptrs(e.mres, o); e.res_out = shp(e.res_out, o);
@@ -504,7 +503,7 @@ struct ink2_engine {
         }
         ICHECK(hipSetDevice(qz_dev_of(0)));
     }
-    // the round: launch both cards, then each card's top-K of the VR logit rows; synced
+    // the round: launch both cards, then each card's top-K of the VR logit rows, then sync
     long long n_ver = 0;
     void verify(const int * toks, int pos) {
         vplan();
@@ -526,7 +525,7 @@ struct ink2_engine {
             qz_xerr_check_h(c, (const int *) (vtkp[c] + (size_t) VR * QZ_TOPK_NB * QZ_TOPK), n_ver);
         n_ver++;
     }
-    // the row's greedy pick (the same tie rule as greedy(): the lower id on equal logits)
+    // the row's greedy pick, with the same tie rule as greedy(): on a tie the lower id wins
     int greedy_row(int r) const {
         float bv = -INFINITY;
         int bi = -1;
@@ -549,7 +548,7 @@ struct ink2_engine {
         }
     }
 
-    // the whole forward for one token; logits: also run the head and leave the top-K on the host
+    // one token's whole forward. With logits, also run the head and copy the top-K out.
     void step(int32_t tok, int pos, bool logits) {
         plan_all();
         run_cycle(tok, pos, logits);

@@ -7,8 +7,8 @@ namespace q35 {
 #include "core/devices.h"
 #include "engine.h"
 #include "prefill.h"
-// the verify at two widths (8: the bit-exact production rows; 12: copy-heavy
-// rounds), one TU each in its own namespace over shared 12-row replay rings
+// the verify at two widths, MV_T 8 for the bit-exact production rows and 12 for the
+// copy-heavy rounds. One TU each, in its own namespace over shared 12-row replay rings.
 #undef D
 #undef FF
 #undef G
@@ -47,16 +47,16 @@ namespace mv12 {
 
 constexpr int32_t QZ_IM_START = 248045;   
 constexpr int32_t QZ_IMG_PAD = 248056;
-// qwen35 (Qwen3.8-27B Q8_0, TP2): the engine, batched prefill, prefix cache, DSpine, vision
+// Qwen3.8-27B Q8_0 on TP2: engine, batched prefill, prefix cache, DSpine and vision
 struct q35_ctx : qz_ctx {
     qz_engine eng;
     std::string name;             // GGUF general.name
     qz_prefill pf;
     bool pf_ok = false;
-    static constexpr int pf_min = 16;   // shorter prompts decode on the cycle's forced rows
+    static constexpr int pf_min = 16;   // prompts shorter than this decode on the cycle's forced rows
     static constexpr int tail = 64;
     qz_pcache pc;                 // blobs: the GDN state dn, the conv state cs
-    float * sdn[2] = {}, * scs[2] = {};   // mid-chunk staging of dn / cs
+    float * sdn[2] = {}, * scs[2] = {};   // mid-chunk staging of dn and cs
     int last_cached = 0;
     struct img { uint64_t hash = 0; int id = 0, nx = 0, ny = 0; unsigned long use = 0; std::vector<float> rows; };
     qwen3vl::qz_vision * vis = nullptr;
@@ -67,11 +67,11 @@ struct q35_ctx : qz_ctx {
     size_t img_cap = 0;
 
     qz_dsrun ds;
-    // drafter switch (on with DSpine unless QZ_NO_SWITCH): DSpine <-> MTP mid-answer on the rounds' acceptance
+    // drafter switch, on with DSpine unless QZ_NO_SWITCH: DSpine or MTP, mid-answer
     struct {
         bool on = false;
         float lo = 3.8f, hi = 3.4f;       // leave DSpine below lo tok/round, MTP at hi and above
-        int win = 128, flush = 512;       // window tokens; MTP feature rows per DSpine ring fill
+        int win = 128, flush = 512;       // window tokens, and MTP feature rows per DSpine ring fill
         int cap = 1024;                   // staged MTP entries per flush
         float * hn[2] = {};               // staged entry inputs [cap + 12][QZ_D] per card
         std::vector<int32_t> tok;         // staged entry j: position p0 + j
@@ -92,10 +92,10 @@ struct q35_ctx : qz_ctx {
 
 static size_t qz_dn_bytes(const qz_engine & e) { return (size_t) e.hp.n_recr * g2_HV * QZ_S * QZ_S * 4; }
 static size_t qz_cs_bytes(const qz_engine & e) { return (size_t) e.hp.n_recr * 3 * g2_CCH * 4; }
-static void qz_cache_drop(q35_ctx * c) { c->pc.drop(); }   // the engine state no longer matches any snapshot's K / V
+static void qz_cache_drop(q35_ctx * c) { c->pc.drop(); }   // the engine state has left every snapshot behind, so drop the cache
 
 static void qz_pf_setup(q35_ctx * c) {
-    // + headroom; the buffers themselves come from the engine's scratch when it holds them
+    // plus headroom; the buffers come from the engine's scratch when it holds them
     const size_t need = (c->eng.C[0].scr_bytes >= qz_prefill::bytes(2048) ? 0 : qz_prefill::bytes(2048)) + ((size_t) 256 << 20);
     for (int i = 0; i < 2; i++) {
         size_t fr = 0, tot = 0;
@@ -109,9 +109,8 @@ static void qz_pf_setup(q35_ctx * c) {
     }
     CHECK(hipSetDevice(qz_dev_of(0)));
     c->pf_ok = c->pf.init(c->eng, 2048) == 0;
-    // the snapshots up front in pinned host memory (~75 MB per slot per card),
-    // the mid-chunk staging on each card; one slot cannot hold a chunk's
-    // mid-chunk snapshot and its end one at once
+    // the snapshots sit in pinned host memory up front, about 75 MB per slot per card.
+    // One slot cannot hold a chunk's mid-chunk snapshot and its end snapshot at once.
     qz_mem_scope mem("snapshot staging");
     if (c->pf_ok) {
         qz_blob dn, cs;
@@ -128,8 +127,8 @@ static void qz_pf_setup(q35_ctx * c) {
     CHECK(hipSetDevice(qz_dev_of(0)));
 }
 
-// a prompt position's prefix-cache key: its token, or for an image row the
-// image's content hash and the row (the image tokens all share one id)
+// a prompt position's prefix-cache key: its token, or for an image row the image's
+// content hash mixed with the row, since the image tokens all share one id
 static std::vector<uint64_t> qz_keys(const std::vector<int32_t> & p, const qz_mm_view * mm, const std::vector<uint64_t> * row_hash) {
     std::vector<uint64_t> k(p.size());
     for (size_t q = 0; q < p.size(); q++) {
@@ -139,7 +138,7 @@ static std::vector<uint64_t> qz_keys(const std::vector<int32_t> & p, const qz_mm
     return k;
 }
 
-// per-round tokens over the last `win` tokens of a segment
+// per-round tokens over the last win tokens of a segment
 struct qz_win {
     std::deque<int> r;
     int sum = 0, seg = 0;
@@ -147,9 +146,8 @@ struct qz_win {
     float avg() const { return (float) sum / (float) r.size(); }
 };
 
-// decode from pos (anchor at pos) switching drafters: DSpine segments
-// stage MTP entries, MTP segments capture DSpine features; each switch
-// recomputes the uncommitted rows on the new path
+// decode from pos, the anchor, switching drafters. DSpine segments stage MTP entries,
+// MTP segments capture DSpine features. A switch recomputes the uncommitted rows.
 static int qz_switch_run(q35_ctx * c, int pos, int32_t anchor, int max_new, const std::vector<int32_t> & s,
                          qz_emit_cb cb, void * user, qz_gen_stats * st) {
     auto & w = c->sw;
@@ -180,7 +178,7 @@ static int qz_switch_run(q35_ctx * c, int pos, int32_t anchor, int max_new, cons
     };
     ds.sw_hook = [&](int p, int n, int W, const int32_t * toks, const int * out) {
         if (w.tok.empty()) w.p0 = p + 1;
-        for (int i = 0; i < 2; i++) {   // entries p+1 .. p+n: the token there, row j's normed hidden
+        for (int i = 0; i < 2; i++) {   // entries p+1 .. p+n: the token there and row j's normed hidden
             CHECK(hipSetDevice(qz_dev_of(i)));
             const float * h = W > 8 ? ds.mw[i].Ah.h_nextn : ds.mv[i].Ah.h_nextn;
             CHECK(hipMemcpy(w.hn[i] + w.tok.size() * QZ_D, h, (size_t) n * QZ_D * 4, hipMemcpyDeviceToDevice));
@@ -208,18 +206,18 @@ static int qz_switch_run(q35_ctx * c, int pos, int32_t anchor, int max_new, cons
         } else {
             for (int i = 0; i < 2; i++) { CHECK(hipSetDevice(qz_dev_of(i))); CHECK(hipMemset(e.C[i].ctl_d, 0, 8 * sizeof(int))); }
             CHECK(hipSetDevice(qz_dev_of(0)));
-            r = e.generate(pend, left, s, (qz_emit_fn) cb, user, &g, pc);   // <= 3 rows: one forced chunk, as a request's first
+            r = e.generate(pend, left, s, (qz_emit_fn) cb, user, &g, pc);   // <= 3 rows: one forced chunk, like a request's first
         }
         tot.n_gen += g.n_gen; tot.decode_ms += g.decode_ms + (on_ds ? 0 : g.prefill_ms);
         tot.decode_cycles += g.decode_cycles; tot.decode_tok += g.decode_tok; tot.wide_cycles += g.wide_cycles;
         left -= g.n_gen;
         if (r < 0 || g.stop != 4) { tot.stop = g.stop; rc = r; break; }
         const auto t = clk::now();
-        if (on_ds) {   // -> MTP: entries up to the uncommitted rows, which are redone
+        if (on_ds) {   // to MTP: entries up to the uncommitted rows, which are redone
             pend = ds.sw_pend; pc = ds.sw_pc;
             stage_flush();
             fl = pc;
-        } else {       // -> DSpine: its context up to the anchor, then the uncommitted rows forced
+        } else {       // to DSpine: context to the anchor, then the uncommitted rows forced
             pend = e.sw_pend; pc = e.sw_pc;
             feat_fill(fl, pc + (int) pend.size() - 1);
             ds.forced = pend;
@@ -240,8 +238,8 @@ static int qz_switch_run(q35_ctx * c, int pos, int32_t anchor, int max_new, cons
     return rc;
 }
 
-// prompt through the batched prefill + decode, or the engine's own path; rc as
-// generate. mm / row_hash: the prompt's images (null: text only)
+// prompt through the batched prefill and decode, or the engine's own path. rc as in
+// generate. mm and row_hash carry the prompt's images; null means text only.
 static int qz_run(q35_ctx * c, const std::vector<int32_t> & p, int max_new, const std::vector<int32_t> & s,
                   qz_emit_cb cb, void * user, qz_gen_stats * st,
                   const qz_mm_view * mm = nullptr, const std::vector<uint64_t> * row_hash = nullptr) {
@@ -255,8 +253,8 @@ static int qz_run(q35_ctx * c, const std::vector<int32_t> & p, int max_new, cons
         return c->eng.generate(p, max_new, s, (qz_emit_fn) cb, user, st);
     }
     const auto t0 = std::chrono::steady_clock::now();
-    // prompts with images decode on MTP (DSpine is exact there too, but it
-    // accepts too little on image descriptions to beat MTP)
+    // prompts with images decode on MTP. DSpine is exact there too, but it accepts too
+    // little on image descriptions to beat MTP.
     const bool ds_on = c->ds.on && !mm;
     qz_pcache::hooks h;
     h.reset = [&] { c->eng.reset_state(); };
@@ -282,8 +280,8 @@ static int qz_run(q35_ctx * c, const std::vector<int32_t> & p, int max_new, cons
     if (start < 0) { if (st) st->stop = -1; return -1; }
     c->last_cached = start;
     const double pf_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    // greedy and sampled requests alike on DSpine (sampled: drafts from the
-    // drafter's calibrated q, exact accept / residual)
+    // greedy and sampled requests both run on DSpine. A sampled one drafts from the
+    // drafter's calibrated q, with exact accept and residual.
     const int rc = ds_on && c->sw.on
         ? qz_switch_run(c, P - 1, p[P - 1], max_new, s, cb, user, st)
         : ds_on
@@ -464,9 +462,9 @@ static qz_ctx * create(const char * model, const qz_create_opts & o) {
     if ( max_ctx < 1024 || (slot_t != 0 && slot_t != 3 && slot_t != 4) || adapt_slack < 0) return nullptr;
     qz_mem_scope mem("engine");
     qz_mem_baseline(2);
-    // steps = arena positions: prompt + generated + the cycle / MTP overhang
+    // steps, the arena positions: prompt, generated tokens and the cycle / MTP overhang
     const int steps = max_ctx + 2 * QZ_TMAX;
-    // the scratch the cycle's partials share with the batched prefill and the DSpine verify's partials
+    // the scratch the cycle's partials share with batched prefill and the DSpine verify
     const size_t scratch = std::max(qz_prefill::bytes(2048), mv12::mv_partial_bytes());
     // before the weights: memory for this context on both cards, then the peer link
     if (qz_vram_check(model, max_ctx, steps, scratch, getenv("QZ_DSPINE"), getenv("QZ_MMPROJ")) || qz_p2p_check())
@@ -502,7 +500,7 @@ static qz_ctx * create(const char * model, const qz_create_opts & o) {
         w.on = true;
         fprintf(stderr, "quartz: drafter switch on: leave DSpine < %.2f, MTP >= %.2f tok/round, window %d\n", w.lo, w.hi, w.win);
     }
-    // per card: used / free, the ledger's tags, what the runtime holds beyond them
+    // per card: used and free, the ledger's tags, what the runtime holds beyond them
     qz_mem_report(stderr, 2);
     return c;
 }

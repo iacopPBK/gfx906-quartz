@@ -1,5 +1,5 @@
-// TP2 per-card weight slices: card c owns v heads (j/8)*16 + 8c + j%8, q heads
-// 12c.., kv heads 2c, 2c+1, FFN rows [8704c, +8704), head rows [V/2 c, +V/2).
+// TP2 per-card weight slices. Card c owns v heads (j/8)*16 + 8c + j%8, q heads from
+// 12c, kv heads 2c and 2c+1, FFN rows [8704c, +8704) and head rows [V/2 c, +V/2).
 #pragma once
 
 #include <cstdint>
@@ -15,7 +15,7 @@ static inline void qz_tp2_range(std::vector<int32_t> & v, int a, int n) {
     for (int i = 0; i < n; i++) v.push_back(a + i);
 }
 
-// slice of tensor `name` for card; returns false for a replicated tensor
+// slice of tensor `name` for card. Returns false for a replicated tensor
 static inline bool qz_tp2_spec(const char * name, int card, int64_t ne1, qz_slice & s) {
     s.rows.clear();
     s.cols.clear();

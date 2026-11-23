@@ -1,5 +1,5 @@
-// Engine spec for Qwen3.8-27B (Q8_0): one sequence, TP2 over two cards,
-// persistent-kernel phases. Model-hardcoded by design.
+// Engine spec for Qwen3.8-27B (Q8_0): one sequence, TP2 over two cards, persistent
+// kernel phases. Model-hardcoded by design.
 #pragma once
 
 #include <cstdint>
@@ -8,8 +8,8 @@
 
 #include "gguf.h"
 
-// attention cache layout: f16 element offset of position p, kv head kh of
-// hkv per card, head dim 256, in pages of 64 positions per head ([page][hkv][64][256])
+// Attention cache layout: f16 element offset of position p, kv head kh of hkv per
+// card, head dim 256, in pages of 64 positions per head, [page][hkv][64][256].
 #if defined(__HIPCC__)
 __host__ __device__
 #endif
@@ -17,8 +17,8 @@ static inline constexpr size_t qz_kv_row(int p, int hkv, int kh) {
     return ((size_t) (p >> 6) * hkv + kh) * (64 * 256) + (size_t) (p & 63) * 256;
 }
 
-// Layer classes in the trunk. Attention layers are (i+1) % attn_interval == 0,
-// else gated delta net. Mirrors src/models/qwen35.cpp.
+// Layer classes in the trunk. Attention layers are (i+1) % attn_interval == 0, the
+// rest are gated delta net. Mirrors src/models/qwen35.cpp.
 enum qz_layer_kind {
     QZ_LAYER_ATTN = 0,
     QZ_LAYER_RECR = 1,

@@ -1,5 +1,5 @@
-// fl9c: fl9's split-K attention as a phase of the persistent T-row cycle
-// (block = kvh * FL9_NS + split, one partial per query per split).
+// fl9c: fl9's split-K attention as a phase of the persistent T-row cycle. A block is
+// kvh * FL9_NS + split and produces one partial per query per split.
 #pragma once
 #include "flash9.h"
 
@@ -12,9 +12,8 @@ __device__ __forceinline__ void qz_fl9c_flash(const __half * __restrict__ kv_k, 
                                               int pos, __half * buf, __half * pw, int tid) {
     constexpr int GQA = HQ / HKV, NT = T * GQA, QW = qz_fl9c_qw<T>(), NS = FL9_NS;
     static_assert(GQA == 6, "fl9c: 6 q heads per kv head");
-    if (blockIdx.x >= HKV * NS) return;                   // block-uniform (the cycle runs 60)
-    // q comes through scalar loads: the grid barriers do not invalidate the
-    // scalar cache
+    if (blockIdx.x >= HKV * NS) return;                   // block-uniform, the cycle runs 60
+    // scalar q loads: the grid barriers do not invalidate the scalar cache
     __builtin_amdgcn_s_dcache_inv();
     const int w = tid >> 6, lane = tid & 63;
     const int kvh = blockIdx.x / NS, sp = blockIdx.x % NS;
@@ -23,7 +22,7 @@ __device__ __forceinline__ void qz_fl9c_flash(const __half * __restrict__ kv_k, 
     const int tl0 = sp * per, tl1 = min(ntile, tl0 + per);
     const int d0 = lane * 4;
     constexpr float SC = 0.0625f * 1.4426950408889634f;   // 1/sqrt(256), log2 units
-    // this wave's queries (wave-uniform)
+    // this wave's queries, the same for the whole wave
     const int nq = w < NT ? (NT - w + 7) / 8 : 0;
     int np[QW];
     const __half * qrow[QW];
@@ -172,7 +171,7 @@ __device__ __forceinline__ void qz_fl9c_flash(const __half * __restrict__ kv_k, 
 #undef FL9C_LOAD_V
 #undef FL9C_STORE_V
     }
-    // one partial per query: slot (t HQ + kvh 6 + hl) NS + sp
+    // one partial per query
     #pragma unroll
     for (int j = 0; j < QW; j++) {
         if (j < nq) {
@@ -186,8 +185,8 @@ __device__ __forceinline__ void qz_fl9c_flash(const __half * __restrict__ kv_k, 
     __syncthreads();                                      // buf / pw are the cycle's scratch again
 }
 
-// merge the FL9_NS partials of (row t, head h) + the gate sigmoid / requant;
-// ws: 33 floats of LDS, called by every thread of the block
+// Merges the FL9_NS partials of (row t, head h) and applies the gate sigmoid and the
+// requant. ws is 33 floats of LDS, and the whole block calls this.
 template <int T, int HQ>
 __device__ __forceinline__ void qz_fl9c_reduce(const float * __restrict__ pm, const float * __restrict__ pl,
                                                const float * __restrict__ pacc,

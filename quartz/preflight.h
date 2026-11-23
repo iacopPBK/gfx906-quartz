@@ -1,6 +1,6 @@
-// Start-up check that fails in seconds instead of minutes into the weight load:
-// a write-and-read-back across the peer link in both directions. The memory
-// check is per architecture (arch/<arch>/*_preflight.h).
+// Start-up peer link check, so a broken link fails in seconds instead of minutes
+// into the weight load. Writes cross the link in both directions, then the words
+// are read back. The per-architecture memory check lives in arch/<arch>/*_preflight.h.
 #pragma once
 #include <hip/hip_runtime.h>
 
@@ -18,9 +18,9 @@ static __global__ void qz_p2p_fill(unsigned * __restrict__ dst, size_t n, unsign
         dst[i] = seed ^ (unsigned) (i * 2654435761u);
 }
 
-// one card's kernel writes into the other card's memory (the uncached pages
-// the engine's exchange uses), then the words are read back from the owner.
-// 0: both directions intact; 1: refused (the reason printed)
+// One card's kernel writes into the other card's memory, on the uncached pages
+// the engine's exchange uses, and the words are read back from the owner. Returns
+// 0 when both directions are intact, 1 on refusal with the reason printed.
 inline int qz_p2p_check() {
     const size_t n = (size_t) 16 << 20;              // 64 MB of words
     const double timeout_s = 10.0;
@@ -51,7 +51,7 @@ inline int qz_p2p_check() {
         (void) hipSetDevice(src);
         (void) hipStreamCreateWithFlags(&st, hipStreamNonBlocking);
         (void) hipEventCreate(&e0); (void) hipEventCreate(&e1);
-        for (int rep = 0; rep < 2 && !rc; rep++) {       // the first pass warms up, the second is timed
+        for (int rep = 0; rep < 2 && !rc; rep++) {       // first pass warms up, second is timed
             (void) hipEventRecord(e0, st);
             hipLaunchKernelGGL(qz_p2p_fill, dim3(1024), dim3(256), 0, st, buf, n, seed);
             (void) hipEventRecord(e1, st);
@@ -61,7 +61,7 @@ inline int qz_p2p_check() {
                 if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > timeout_s) {
                     fprintf(stderr, "quartz: peer check: HIP %d writing into HIP %d did not finish in %.0f s: the peer link hangs\n",
                             src, dst, timeout_s);
-                    return 1;      // the kernel may still be stuck: nothing more can be freed safely
+                    return 1;      // the kernel may still be stuck, nothing can be freed safely
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }

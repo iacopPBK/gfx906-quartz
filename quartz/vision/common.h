@@ -1,7 +1,6 @@
-// What both image encoders share, included inside each encoder's namespace right
-// after its API header (the including file has the HIP, rocBLAS, stb and C
-// headers): the error checks, the f16 GEMM, the bias add, and the encoded-image
-// entry point over the encoder's qz_vision_encode_rgb.
+// Code the two image encoders share: VCHK / VBLAS, the f16 GEMM, the bias add, and an
+// image entry point over qz_vision_encode_rgb. Included inside each encoder's namespace.
+// HIP, rocBLAS, stb and the C headers come from the including file.
 #pragma once
 
 #define VCHK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { \
@@ -9,7 +8,7 @@
 #define VBLAS(x) do { rocblas_status s_ = (x); if (s_ != rocblas_status_success) { \
     fprintf(stderr, "quartz_vision: rocBLAS error %s at %s:%d\n", rocblas_status_to_string(s_), __FILE__, __LINE__); return -1; } } while (0)
 
-// Y[n][m] (+)= X[n][k] . W[m][k]^T, W f16 [m][k], X f16, Y f32 or f16
+// Y[n][m] = X[n][k] . W[m][k]^T, X and W f16, Y f32 or f16; beta adds onto Y.
 static int vgemm(rocblas_handle blas, const __half * W, const __half * X, void * Y, bool y16, int m, int n, int k, float beta = 0.f) {
     const float alpha = 1.f;
     const rocblas_datatype yt = y16 ? rocblas_datatype_f16_r : rocblas_datatype_f32_r;
@@ -19,13 +18,13 @@ static int vgemm(rocblas_handle blas, const __half * W, const __half * X, void *
     return 0;
 }
 
-// x[row][i] += b[i]; grid (d / 256, rows)
+// x[row][i] += b[i], launched as grid (d / 256, rows).
 __global__ void __launch_bounds__(256) v_bias(float * __restrict__ x, const float * __restrict__ b, int d) {
     const int i = blockIdx.x * 256 + threadIdx.x;
     if (i < d) x[(size_t) blockIdx.y * d + i] += b[i];
 }
 
-// an encoded image (any format stb_image reads) -> RGB -> qz_vision_encode_rgb
+// Decodes an image in any format stb_image reads to RGB, then calls qz_vision_encode_rgb.
 int qz_vision_encode(qz_vision * v, const void * bytes, size_t n, int * nx, int * ny) {
     int w = 0, h = 0, c = 0;
     unsigned char * px = stbi_load_from_memory((const stbi_uc *) bytes, (int) n, &w, &h, &c, 3);

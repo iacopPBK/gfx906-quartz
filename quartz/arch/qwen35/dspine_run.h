@@ -1,3 +1,4 @@
+// DSpine decode: the context fill, the draft chain, sampled verify and the round loop.
 #pragma once
 #include <chrono>
 
@@ -5,8 +6,7 @@
 #include <random>
 #include <vector>
 
-// prefill context fill input: a chunk's 5 feature layers per row, quantized
-// per 32 into pf_gemm's grouped layout
+// context fill input: a chunk's 5 feature layers per row, in pf_gemm's grouped layout
 __global__ void __launch_bounds__(256) ds_feat_quant(const float * __restrict__ src, size_t lstr, int8_t * Ag, float * sag, int Mp) {
     const int m = blockIdx.x;
     for (int k = threadIdx.x; k < 5 * QZ_D; k += 256)
@@ -15,8 +15,7 @@ __global__ void __launch_bounds__(256) ds_feat_quant(const float * __restrict__ 
 
 struct qz_dsrun {
     bool on = false;
-    // the two verify widths (mv8, mv12) share one 12-row replay ring, so either
-    // width replays the previous round's rows
+    // mv8 and mv12 share a 12-row replay ring, so either replays the last round's rows
     static constexpr int MVW = 12;
     mv8::mv_ctx mv[2];
     mv12::mv_ctx mw[2];
@@ -24,8 +23,8 @@ struct qz_dsrun {
     qz_ds_block blk[2];
     float * feat[2] = {};       // mv12's per-round capture [12][5][QZ_D], per card
     float * feat8[2] = {};      // mv8's [8][5][QZ_D]
-    // prefill context fill (GEMMs over up to DS_FR rows), per card: quantized
-    // features, fc out, its quantized norm, k / v out
+    // prefill context fill, GEMMs over up to DS_FR rows, per card: quantized features,
+    // fc out, its quantized norm, k and v out
     static constexpr int DS_FR = 2048;
     int8_t * fa[2] = {}, * fca[2] = {};
     float * fas[2] = {}, * fcas[2] = {}, * fco[2] = {}, * fkv[2] = {};
@@ -51,8 +50,8 @@ struct qz_dsrun {
         feat[1] = mv12::mv_feat_cap1();
         feat8[0] = mv8::mv_feat_cap(eng);
         feat8[1] = mv8::mv_feat_cap1();
-        // the drafter embeds with the engine's token_embd and reads its head
-        // half on each card; TG / TSV are built per vocab half too
+        // the drafter embeds with the engine's token_embd and reads its half of the head
+        // on each card; TG and TSV are built per vocab half too
         auto emb = [&](int c) { return &eng.C[c].ld.ts[eng.C[c].ld.find("token_embd.weight")]; };
         auto hh = [&](int c) { return &eng.C[c].ld.ts[eng.C[c].ld.find("output.weight")]; };
         if (qz_ds_ctx_load(cx[0], draft, qz_dev_of(0), 0, DS_NKV / 2)) return 1;
@@ -67,7 +66,7 @@ struct qz_dsrun {
             DS_CHECK(qz_dmalloc(&fca[c], (size_t) DS_FR * QZ_D));
             DS_CHECK(qz_dmalloc(&fcas[c], (size_t) DS_FR * QZ_D / 32 * 4));
             DS_CHECK(qz_dmalloc(&fkv[c], (size_t) DS_FR * (DS_NKV / 2) * DS_HD * 4));
-            // stale rows past a block's n (up to its 128-row tile) are read by the GEMMs, outputs dropped: keep them finite
+            // rows past n are read by the GEMMs, outputs dropped, so keep them finite
             DS_CHECK(hipMemset(fa[c], 0, (size_t) DS_FR * 5 * QZ_D));
             DS_CHECK(hipMemset(fas[c], 0, (size_t) DS_FR * 5 * QZ_D / 32 * 4));
             DS_CHECK(hipMemset(fca[c], 0, (size_t) DS_FR * QZ_D));
@@ -86,11 +85,11 @@ struct qz_dsrun {
         return 0;
     }
 
-    // a prefill chunk's features ([5][Mmax][QZ_D] on card 0, row r =
-    // position p0 + r) into both cards' context rings
-    void set_rope_shift(int s) { for (auto & m : mv) m.Ah.rope_shift = s; for (auto & m : mw) m.Ah.rope_shift = s; }   // the target's rope = KV row + s (images)
-    // batched qz_ds_ctx_rows: card 0 quantizes, card 1 gets a copy; each card
-    // runs fc -> norm -> its kv heads' k / v GEMMs
+    // a prefill chunk's features, [5][Mmax][QZ_D] on card 0 with row r at position
+    // p0 + r, into both cards' context rings
+    void set_rope_shift(int s) { for (auto & m : mv) m.Ah.rope_shift = s; for (auto & m : mw) m.Ah.rope_shift = s; }   // the target's rope is the KV row + s, which images shift
+    // batched qz_ds_ctx_rows: card 0 quantizes and card 1 gets a copy, then each card
+    // runs fc, norm and the k / v GEMMs of its kv heads
     void fill_prefill(const float * pf_feat, int Mmax, int p0, int n) {
         constexpr int KF = 5 * QZ_D;
         for (int b0 = 0; b0 < n; b0 += DS_FR) {
@@ -138,7 +137,7 @@ struct qz_dsrun {
         return std::min(q + 1, std::max(lo, p0 - 1));   // keep one row: the kernels' tested range
     }
 
-    // the drafter: block pass over both cards + the device chain -> drafts[0 .. DS_T-2]
+    // the drafter: block pass on both cards, then the device chain -> drafts[0 .. DS_T-2]
     void draft(int anchor, int p0, int32_t * drafts, float invT = 0.f, int nt = DS_T) {
         const int wbase = window_base(p0);
         qz_ds_block_round2(blk, cx, anchor, p0, wbase, nt);
@@ -171,8 +170,8 @@ struct qz_dsrun {
         DS_CHECK(hipSetDevice(qz_dev_of(0)));
     }
 
-    // the sampled walk over the round's 8 head rows (both cards' halves);
-    // out[0 .. n-1] = the accepted drafts then the sampled bonus, returns n
+    // the sampled walk over the round's 8 head rows, both cards' halves. out[0 .. n-1]
+    // gets the accepted drafts and then the sampled bonus; returns n
     void topk_rows(qz_engine & eng, int W) {
         for (int c = 0; c < 2; c++) {
             DS_CHECK(hipSetDevice(qz_dev_of(c)));
@@ -245,9 +244,9 @@ struct qz_dsrun {
         return W;
     }
 
-    // drafter switch: forced = rows already emitted from pos0 (the
-    // last one the anchor); sw_hook after each round (pos, rows, W, toks, out),
-    // true ends generate() with stop 4, sw_pc / sw_pend as qz_engine's
+    // Drafter switch. forced holds the rows already emitted from pos0, the last one the
+    // anchor. sw_hook runs after each round with (pos, rows, W, toks, out); true ends
+    // generate() with stop 4, sw_pc / sw_pend as in qz_engine.
     std::vector<int32_t> forced;
     std::function<bool(int, int, int, const int32_t *, const int *)> sw_hook;
     int sw_pc = 0;
@@ -278,12 +277,12 @@ struct qz_dsrun {
         int pos = pos0, n_rep = 0, cyc = 0;
         int32_t toks[MVW > DS_T ? MVW : DS_T];
         int ctl[2][8], out_tok[MVW];
-        // verify 12 rows after wk rounds in a row accepted >= wth, else 8; 12-row
-        // rounds sum in another order (near-tie flips only)
+        // verify 12 rows after wk rounds in a row accepted >= wth, else 8 rows. 12-row
+        // rounds sum in another order, which can flip near ties.
         constexpr int wth = 8, wk = 3;
         int W = 8, nw12 = 0, streak = 0;
         bool done = max_new == 0;
-        bool fin = false;   // a switch's last round: <= 2 rows kept, so the next path redoes them in one cycle
+        bool fin = false;   // a switch's last round: at most 2 rows kept, so the next path redoes them in one go
         while (!done) {
             if (eng.abort_flag) { st.stop = 2; break; }
             if (pos + W > eng.steps) W = 8;
@@ -311,7 +310,7 @@ struct qz_dsrun {
             CHECK(hipSetDevice(qz_dev_of(0)));
             int n_acc = ctl[0][0];
             if (n_acc < 1 || n_acc > W || ctl[0][2] != pos + n_acc || memcmp(ctl[0], ctl[1], 8 * 4)) { st.stop = -1; break; }
-            if (nf) {   // forced rows stand; acceptance from the last one (sampled: drafts kept iff they equal the sample)
+            if (nf) {   // forced rows stand; acceptance from the last one (a sampled run keeps a draft only if equal)
                 int n = nf - 1;
                 if (eng.sam.smp) {
                     topk_rows(eng, W);

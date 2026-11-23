@@ -1,12 +1,12 @@
-// Row ops of the qwen35 persistent cycle: RMS norm + int8 requant split over
-// the grid, and copying the published plane rows into LDS. DM: the row width,
-// a multiple of 32; blocks of 512 threads.
+// Row ops of the qwen35 persistent cycle: the RMS norm with the int8 requant split
+// over the grid, and the copy of the published plane rows into LDS. DM is the row
+// width, a multiple of 32. Blocks run 512 threads.
 #pragma once
 
 #include "kernels/dev.h"
 
-// qz_norm_requant_row split across the grid: every block reduces the full row,
-// then requants only its own units into gq / gs (bit-equal)
+// qz_norm_requant_row split across the grid. Every block reduces the full row, then
+// requants only its own units into gq and gs, so the result is bit-equal.
 template <int DM> __device__ __forceinline__ void qz_norm_requant_slice(
         const float * xn, const float * nw, float ss, float eps,
         unsigned char * gq, float * gs, float * red, int tid) {
@@ -36,7 +36,7 @@ template <int DM> __device__ __forceinline__ void qz_norm_requant_slice(
     __syncthreads();                 // xn / red are reused by the next row
 }
 
-// after the grid barrier: the T published plane rows into this block's LDS
+// after the grid barrier, copy the T published plane rows into this block's LDS
 template <int T, int DM> __device__ __forceinline__ void qz_planes_to_lds(
         const unsigned char * gq, const float * gs, unsigned char * act_vals, float * act_scales, int tid) {
     for (int i = tid; i < T * DM / 16; i += 512) ((uint4 *) act_vals)[i] = ((const uint4 *) gq)[i];

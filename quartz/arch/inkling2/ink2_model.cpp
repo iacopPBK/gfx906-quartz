@@ -1,6 +1,6 @@
-// inkling2_loop: the C API model (ink2_ctx). Prefill runs batched in chunks
-// (ink2_pf.h) from the deepest prefix-cache snapshot
-// (quartz/core/prefix_cache.h); decode is one step() per token.
+// inkling2_loop, the C API model (ink2_ctx). Prefill runs in batched chunks
+// (ink2_pf.h) from the deepest prefix-cache snapshot (quartz/core/prefix_cache.h).
+// Decode is one step() per token.
 #include "ink2_prelude.h"
 #include "core/prefix_cache.h"
 
@@ -24,19 +24,19 @@ struct ink2_ctx : qz_ctx {
     ink2_engine E;
     ink2_pf EPF;
     std::atomic<bool> abort_flag{false};
-    // prefix cache: the conv history is the snapshot (KV rows are positional);
-    // hi = the highest position written since the last reset, so a snapshot at s
-    // is restorable while hi < s - WIN + 1 + PF_RING (its SWA window not overwritten)
+    // Prefix cache: the snapshot is the conv history, KV rows are positional in the
+    // arena. hi is the highest position written since the last reset, so the snapshot
+    // at s is restorable while hi < s - WIN + 1 + PF_RING (its SWA window is intact).
     qz_pcache pc;
     float * shist[2] = {};
     int hi = -1;
-    // DSpark drafter (QZ_DSPINE=<drafter gguf>): speculative rounds (the
-    // anchor and the 7 drafts are the verify kernel's 8 rows, ink2_verify.h)
+    // DSpark drafter (QZ_DSPINE=<drafter gguf>) for speculative rounds. The anchor and
+    // the 7 drafts are the 8 rows of the verify kernel (ink2_verify.h).
     ink2_dspark DS;
     bool ds_on = false;
     static constexpr int tail = 64;
-    // images (--mmproj, inkling2v): encoded rows cached by content (host), each card's
-    // copy of the current prompt's rows
+    // Images (--mmproj, inkling2v): encoded rows cached by content on the host, plus
+    // each card's copy of the current prompt's rows.
     struct img { uint64_t hash = 0; int id = 0, nx = 0, ny = 0; unsigned long use = 0; std::vector<float> rows; };
     inkling2v::qz_vision * vis = nullptr;
     std::vector<img> imgs;
@@ -45,7 +45,7 @@ struct ink2_ctx : qz_ctx {
     float * img_dev[2] = {};
     size_t img_cap = 0;
 
-    ~ink2_ctx() override { if (vis) inkling2v::qz_vision_free(vis); }   // device memory is released at process exit
+    ~ink2_ctx() override { if (vis) inkling2v::qz_vision_free(vis); }   // device memory is freed at exit
     int vision_attach(const char * mmproj) override {
         if (vis) return -1;
         if (!inkling2v::qz_vision_is(mmproj)) { fprintf(stderr, "inkling2: %s is not an inkling2v projector\n", mmproj); return -1; }
@@ -88,9 +88,10 @@ struct ink2_ctx : qz_ctx {
         return imgs.back().id;
     }
     double image_last_ms() const override { return vis ? inkling2v::qz_vision_last_ms(vis) : 0.0; }
-    // the prompt's image rows: each run of IMG_PAD takes the next image, nx * ny long. irow per
-    // position (-1: a token), keys: the prefix-cache key per position (an image row's: its image's
-    // content hash and the row); the rows uploaded to both cards. false: the runs do not match
+    // The prompt's image rows. Each IMG_PAD run takes the next image, nx * ny long.
+    // irow is the image row per position (-1 for a token). keys is the prefix-cache key
+    // per position, for an image row its content hash mixed with the row. Uploads the
+    // rows to both cards; false when a run does not match the images.
     bool image_rows(const int32_t * p, int P, const int * ids, int n_images, std::vector<int> & irow, std::vector<uint64_t> & keys) {
         std::vector<const img *> im(n_images);
         size_t R = 0;
@@ -207,7 +208,7 @@ struct ink2_ctx : qz_ctx {
         if (start < 0) { st.stop = abort_flag ? 2 : -1; return fin(0); }
         st.n_cached = start;
         hi = std::max(hi, n_prompt - 1);
-        // the last row (and the logits) through the same batched path
+        // The last row and its logits go through the same batched path.
         if (!EPF.prefill(prompt, n_prompt - 1, n_prompt, true)) { pc.drop(); st.stop = 2; return fin(0); }
         st.prefill_cycles = n_prompt - start;
         const auto t1 = clk::now();
@@ -216,7 +217,7 @@ struct ink2_ctx : qz_ctx {
         const bool dsr = ds_on;
         int dr[DS_BS - 1];
         const long r0 = DS.rounds, a0 = DS.accepted;
-        // one token: 0 = the generation goes on, 1 = it ends here (the token was emitted)
+        // One token. Returns 0 to go on, 1 to end here (the token was emitted).
         auto emit = [&](int32_t t) {
             for (int k = 0; k < n_stop; k++) if (stop[k] == t) { st.stop = 1; return 1; }
             if (cb && !cb(user, &t, 1)) { st.n_gen++; st.stop = 3; return 1; }
@@ -225,31 +226,29 @@ struct ink2_ctx : qz_ctx {
             if (abort_flag) { st.stop = 2; return 1; }
             return 0;
         };
-        // DSpark rounds: the anchor t0 at pos is verify row 0, the drafter's 7 greedy
-        // drafts rows 1 .. 7. Row r's pick is the target's own: greedy, or sampled from
-        // the row with the request's sampler (one draw per row, as one plain step takes
-        // per token, so the output is the plain decode's). n leading drafts equal their
-        // row's pick, so rows 0 .. n commit, d[0 .. n-1] are emitted, and the row-n pick g[n] at pos + n + 1
-        // is the next anchor (emitted at the top of the next round). Without the drafter (or when the 8 rows do
-        // not fit) this is one step per token, as before.
+        // DSpark rounds. The anchor anc at pos is verify row 0, the drafter's 7 greedy
+        // drafts are rows 1 .. 7. Each row's pick is the target's own, greedy or one draw
+        // from the row with the request's sampler as a plain step would sample, so the
+        // output matches plain decode. If the n leading drafts are their rows' picks, rows
+        // 0 .. n commit, dr[0 .. n-1] are emitted, and the row-n pick g[n] at pos + n + 1
+        // becomes the next anchor (emitted at the top of the next round). Without the
+        // drafter, or when the 8 rows do not fit, decode is one step per token.
         bool anchor = false;
         int32_t anc = 0;
-        // the drafter switch (as qwen35's; QZ_NO_SWITCH=1: off): the speculative rounds' rate
-        // over a window of the last sw_win tokens (wall time per loop iteration) against the
-        // plain step's rate; below SW_MARGIN of it decode goes plain, then back to the rounds
-        // after SW_PROBE tokens (doubled while the rounds fail again within 4 windows, up to SW_CAP).
-        // The plain step is timed by a few plain steps whenever no timing is within 2048
-        // positions (kept across requests); without one, the window's tok / round against
-        // sw_lo. Both paths give the same tokens and the plain path fills the drafter's
-        // context, so a switch costs nothing.
+        // Drafter switch, off with QZ_NO_SWITCH=1. The rounds' rate over the last sw_win
+        // tokens is compared with the plain step's rate. Below SW_MARGIN of it, decode
+        // runs SW_PROBE plain steps, then tries the rounds again; the probe doubles on
+        // a relapse within 4 windows, up to SW_CAP. The plain step is timed by SW_MEAS
+        // steps when no timing is within SW_REMEAS positions; the timing is kept across
+        // requests. Without one, rounds under sw_lo tokens count as slow. Both paths
+        // give the same tokens, and the plain path fills the drafter's context.
         static const bool sw_on = [] { const char * v = getenv("QZ_NO_SWITCH"); return !(v && *v && strcmp(v, "0") != 0); }();
         static const float sw_lo = getenv("QZ_SW_LO") ? (float) atof(getenv("QZ_SW_LO")) : 2.7f;
         static const int sw_win = getenv("QZ_SW_WIN") ? atoi(getenv("QZ_SW_WIN")) : 16;
-        static double step_ms = 0.0;                            // the plain step's time (EMA) at step_pos
+        static double step_ms = 0.0;                            // plain step time (EMA) at step_pos
         static int step_pos = -(1 << 30);
-        // tuned 2026-11-23 on 16 sampled prompts (code, structured, prose, mixed; 400 / 800 tokens)
         constexpr int SW_MEAS = 6, SW_REMEAS = 2048, SW_PROBE = 64, SW_CAP = 2048;
-        constexpr double SW_MARGIN = 0.85;                      // plain only below 85% of the plain rate
+        constexpr double SW_MARGIN = 0.85;                      // plain mode below 85% of the plain step's rate
         bool spec = true, meas = false;
         int plain_left = 0, probe = SW_PROBE, seg = 0, nsw = 0, ntok_plain = 0;
         std::deque<std::pair<int, double>> wq;                  // (tokens, ms) per round in the window
@@ -288,7 +287,7 @@ struct ink2_ctx : qz_ctx {
                 st.decode_cycles++; st.decode_tok++;
                 if (dsr && !spec) {
                     last_kind = 1; ntok_plain++;
-                    if (--plain_left <= 0) {                    // back to the rounds (after a timing: the same window)
+                    if (--plain_left <= 0) {                    // back to the rounds; a timing keeps the window
                         if (!meas) { seg = 0; wq.clear(); wtok = 0; wms = 0.0; nsw++; }
                         spec = true; meas = false;
                     }
@@ -344,7 +343,7 @@ static qz_ctx * create(const char * path, const qz_create_opts & o) {
     hparams hp;
     if (!parse(g, hp) || !check_tensors(g)) { fprintf(stderr, "inkling2: %s is not a supported Inkling-2-Mini GGUF\n", path); return nullptr; }
     const int ctx = std::min(o.max_ctx > 0 ? o.max_ctx : 32768, 262144);
-    // the memory and the peer link both ways, before the weights
+    // Check memory and the peer link both ways before the weights.
     if (ink2_vram_check(g, ctx, getenv("QZ_DSPINE")) || qz_p2p_check()) return nullptr;
     ink2_ctx * c = new ink2_ctx();
     c->name = g.str("general.name");
@@ -377,7 +376,7 @@ static qz_ctx * create(const char * path, const qz_create_opts & o) {
         }
         c->pc.init({ hb }, 16, c->E.C[0].st, c->E.C[1].st);
     }
-    if (const char * dp = getenv("QZ_DSPINE")) {   // the server's drafter flag: a DSpark GGUF here
+    if (const char * dp = getenv("QZ_DSPINE")) {   // QZ_DSPINE from the server, a DSpark GGUF
         c->DS.E = &c->E;
         if (!c->DS.load(dp, c->E.ctx)) { delete c; return nullptr; }
         ICHECK(hipSetDevice(qz_dev_of(0)));

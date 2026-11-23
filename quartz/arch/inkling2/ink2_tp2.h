@@ -1,6 +1,6 @@
-// TP2 per-card weight slices: card c owns q heads 12c.. and kv heads 4c.. (whole
-// GQA groups), half of every expert's FF (gate rows 576c.., up rows 1152 + 576c..,
-// down contraction blocks 18c..) and head rows [V/2 c, +V/2); the rest is replicated.
+// TP2 weight slices. Card c owns the q heads from 12c, the kv heads from 4c, as whole
+// GQA groups, half of every expert's FF (gate rows 576c.., up rows 1152 + 576c.., down
+// contraction blocks 18c..) and the head rows [V/2 c, +V/2). The rest is replicated.
 #pragma once
 
 #include <cstdint>
@@ -13,7 +13,7 @@ static inline void ink2_range(std::vector<int32_t> & v, int a, int n) {
     for (int i = 0; i < n; i++) v.push_back(a + i);
 }
 
-// slice of tensor `name` for card; false: replicated. ne1: every dim past ne0, flattened
+// the tensor `name`'s slice for card, false when replicated. ne1 flattens dims past ne0
 static inline bool ink2_tp2_spec(const char * name, int card, int64_t ne1, qz_slice & s) {
     s.rows.clear();
     s.cols.clear();
@@ -54,9 +54,9 @@ static inline bool ink2_tp2_spec(const char * name, int card, int64_t ne1, qz_sl
     return true;
 }
 
-// the DSpark drafter's TP2 slices (ink2_dspark.h): card c owns q heads 12c.., kv heads
-// 4c.. (attention and context K / V), FFN rows 4608c.. and the matching contraction
-// halves of attn_output (48 of 96 blocks) and ffn_down (144 of 288); the rest is replicated
+// The DSpark drafter's TP2 slices (ink2_dspark.h). Card c owns q heads 12c.., kv heads
+// 4c.. for attention and context K / V, FFN rows 4608c.. and the contraction halves
+// halves of attn_output (48 of 96) and ffn_down (144 of 288); the rest is replicated.
 static inline bool ink2_ds_tp2_spec(const char * name, int card, int64_t, qz_slice & s) {
     s.rows.clear();
     s.cols.clear();

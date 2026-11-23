@@ -1,19 +1,19 @@
-// Exact per-row top-K of the lm_head logits by radix select (sampled verify).
+// Exact per-row top-K of the lm_head logits by radix select, for the sampled verify.
 #pragma once
 
 #include <hip/hip_runtime.h>
 #include <cmath>
 
-// ---- sampled verify (temperature > 0): exact per-row top-K of the lm_head
-// logits the cycle leaves in y_head, sampled on the host (qz_engine::sample_row)
-#define QZ_TOPK 64        // candidates per row: covers top_k 1 .. 64 exactly
-#define QZ_TOPK_NB 16     // blocks per row (chunks); the host merges NB x TOPK per card
+// ---- sampled verify, temperature > 0: the exact per-row top-K of the lm_head
+// logits that the cycle leaves in y_head, sampled on the host by qz_engine::sample_row
+#define QZ_TOPK 64        // candidates per row, covering top_k 1 .. 64 exactly
+#define QZ_TOPK_NB 16     // blocks per row; the host merges NB x TOPK per card
 __device__ __forceinline__ unsigned qz_fkey(float v) {   // float order as unsigned order
     const unsigned u = __float_as_uint(v);
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
-// block (b, t): the exact top QZ_TOPK of chunk b of row t as (logit, id) by
-// radix select (id -1 pads a short chunk)
+// block (b, t) writes the exact top QZ_TOPK of chunk b of row t as logit / id
+// pairs, by radix select. The id -1 pads a short chunk.
 static __global__ void qz_topk_rows(const float * y, int n, int id0, float2 * out) {
     __shared__ unsigned hist[256];
     __shared__ unsigned s_prefix, s_need;

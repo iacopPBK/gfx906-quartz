@@ -1,6 +1,6 @@
-// Two-card (TP2) plumbing shared by the archs: peer access, each card's
-// exchange buffers, the exchange error words, and the residency check that
-// keeps a persistent grid-barrier kernel from hanging.
+// Two-card (TP2) plumbing shared by the archs: peer access, each card's exchange
+// buffers, the exchange error words, and the residency check that keeps a persistent
+// grid-barrier kernel from hanging.
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -11,7 +11,7 @@
 #include "core/devices.h"
 #include "mem.h"
 
-// peer access both ways between the two chosen cards (devices.h); false (message printed) without it
+// Peer access both ways between the two chosen cards (devices.h); false, with a message.
 inline bool qz_peer_enable() {
     for (int c = 0; c < 2; c++) {
         if (hipSetDevice(qz_dev_of(c)) != hipSuccess) return false;
@@ -25,9 +25,9 @@ inline bool qz_peer_enable() {
     return true;
 }
 
-// one card's exchange buffers (kernels/xchg.h): the uncached inbox [2][rows][dm]
-// + checksums [2][rows][dm/32], head-merge pairs [2][rows][2] {value, id bits},
-// flags (own line), the exchange counter, error words [8]
+// One card's exchange buffers (kernels/xchg.h): the uncached inbox [2][rows][dm] with
+// its checksums [2][rows][dm/32], the head-merge pairs [2][rows][2] of {value, id bits},
+// the flags in their own allocation, the exchange counter and the error words [8].
 struct qz_xbufs {
     float * xin = nullptr, * xhm = nullptr;
     unsigned int * xflag = nullptr, * xseq = nullptr;
@@ -47,8 +47,7 @@ struct qz_xbufs {
     }
 };
 
-// after a sync: the card's exchange error words must be 0, else report and exit
-// the error words already on the host (e: 8 ints)
+// The host-side error words of a card must be 0 after a sync, else report and exit.
 inline void qz_xerr_check_h(int card, const int * e, long long n_launch) {
     if (e[0] || e[1]) {
         fprintf(stderr, "exchange error card %d after launch %lld: chk mismatches %d (first tok %d slab %d row %d), "
@@ -62,8 +61,8 @@ inline void qz_xerr_check(int card, const int * xerr, long long n_launch) {
     qz_xerr_check_h(card, e, n_launch);
 }
 
-// a persistent kernel's grid must be resident at once (its grid barrier spins);
-// false (message printed) if `grid` blocks of `threads` with `smem` bytes do not fit
+// A persistent kernel's grid must be resident at once: its grid barrier spins. False,
+// with a message, if `grid` blocks of `threads` and `smem` bytes do not fit.
 struct qz_resident_kernel { const void * f; int smem; const char * name; };
 inline bool qz_resident(int dev, const qz_resident_kernel * ks, int n, int grid, int threads) {
     int cu = 0;

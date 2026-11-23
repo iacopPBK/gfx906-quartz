@@ -1,5 +1,5 @@
-// Tokenizer: byte-level BPE + the GGUF's pre-tokenizer (tokenizer.ggml.pre),
-// mirroring llama.cpp's BPE path; C entry points for ctypes.
+// Tokenizer: byte-level BPE with the GGUF's pre-tokenizer (tokenizer.ggml.pre),
+// following llama.cpp's BPE path. The C entry points are called over ctypes.
 #include "gguf_lite.h"
 #include "unicode.h"
 
@@ -33,9 +33,9 @@ struct tok_data {
     uint32_t attr = 0;
 };
 
-// pre-tokenizers by tokenizer.ggml.pre: llama.cpp's regex lists for those pre
-// types, exact strings (qwen35 dispatches to unicode.cpp's custom splitter;
-// gpt-4o is the lookahead form llama.cpp runs on std::regex)
+// Pre-tokenizer regex lists, keyed by tokenizer.ggml.pre and copied verbatim from
+// llama.cpp. qwen35 splits through unicode.cpp's custom splitter; gpt-4o is the
+// lookahead form, which llama.cpp runs on std::regex.
 const char * const QWEN35_RE =
     "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 const char * const GPT4O_RE =
@@ -59,7 +59,7 @@ struct tok_vocab {
     bool add_bos = false;
     bool add_eos = false;
     int32_t bos_id = -1, eos_id = -1;
-    std::vector<int32_t> special;   // CONTROL|USER_DEFINED|UNKNOWN, text len desc
+    std::vector<int32_t> special;   // CONTROL|USER_DEFINED|UNKNOWN, longest text first
     std::vector<int32_t> eog;       // ascending
     std::string chat_template;      // tokenizer.chat_template, empty when absent
     std::vector<std::string> pre_re;   // the pre-tokenizer's regexes
@@ -96,8 +96,8 @@ static int32_t find_by_texts(const std::vector<int32_t> & order, const tok_vocab
     return -1;
 }
 
-// llama.cpp EOG text list entry "<｜end▁of▁sentence｜>" (deepseek-ocr), built
-// from codepoints so this file stays pure ASCII
+// The deepseek-ocr entry of llama.cpp's EOG text list, written as codepoints so
+// this file stays pure ASCII.
 static const std::string & deepseek_eog_text() {
     static const std::string s = "<" + unicode_cpt_to_utf8(0xFF5C) + "end" +
         unicode_cpt_to_utf8(0x2581) + "of" + unicode_cpt_to_utf8(0x2581) +
@@ -105,8 +105,8 @@ static const std::string & deepseek_eog_text() {
     return s;
 }
 
-// tokens that end generation: fim pad/repo/file_sep, the eog text list, then
-// eos / eot / eom
+// End-of-generation ids: the fim pad, repo and file separator tokens, the EOG text
+// list, then eos, eot and eom.
 static void build_eog(tok_vocab & v, const std::vector<int32_t> & order) {
     const int32_t eot = find_by_texts(order, v, {"<|eot_id|>", "<|im_end|>", "<|end|>",
         "<end_of_turn>", "<|endoftext|>", "<|end_of_text|>", "<EOT>", "_<EOT>", "[EOT]"});
@@ -139,8 +139,8 @@ static void build_eog(tok_vocab & v, const std::vector<int32_t> & order) {
     v.eog.assign(ids.begin(), ids.end());
 }
 
-// CONTROL or UNKNOWN tokens with "unused" in the text are UNUSED as well,
-// so they drop out of the special-token list
+// CONTROL tokens whose text contains "unused" become UNUSED, so they drop out of
+// the special-token list.
 static void mark_unused_by_name(tok_vocab & v) {
     for (auto & t : v.toks)
         if ((t.attr & ATTR_CONTROL) && !(t.attr & ATTR_UNUSED) &&
@@ -155,7 +155,7 @@ static bool vocab_load(tok_vocab & v, const gguf_context * g) {
         fprintf(stderr, "qz_tok: unsupported tokenizer.ggml.model\n");
         return false;
     }
-    {   // absent key: qwen35, the only pre-tokenizer before the table
+    {   // key absent: qwen35
         const int64_t id = gguf_find_key(g, "tokenizer.ggml.pre");
         const std::string pre = id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_STRING ? gguf_get_val_str(g, id) : "qwen35";
         const tok_pre * tp = nullptr;
@@ -228,7 +228,7 @@ static bool vocab_load(tok_vocab & v, const gguf_context * g) {
         v.bpe_ranks.emplace(std::make_pair(first, second), (int32_t) i);
     }
 
-    {   // add_bos / add_eos: absent key means the BPE default (false here)
+    {   // key absent: the BPE default, false here
         const int64_t id = gguf_find_key(g, "tokenizer.ggml.add_bos_token");
         if (id >= 0) v.add_bos = gguf_get_val_bool(g, id);
     }
@@ -236,7 +236,7 @@ static bool vocab_load(tok_vocab & v, const gguf_context * g) {
         const int64_t id = gguf_find_key(g, "tokenizer.ggml.add_eos_token");
         if (id >= 0) v.add_eos = gguf_get_val_bool(g, id);
     }
-    // gpt2 defaults (llama.cpp) when the GGUF does not carry the ids
+    // gpt2 defaults, as in llama.cpp, when the GGUF has no ids
     v.bos_id = 11;
     v.eos_id = 11;
     {
@@ -253,7 +253,6 @@ static bool vocab_load(tok_vocab & v, const gguf_context * g) {
     const std::vector<int32_t> order = sorted_by_text(v);
     build_eog(v, order);
 
-    // special tokens: CONTROL | USER_DEFINED | UNKNOWN, longest text first
     v.special.clear();
     for (size_t i = 0; i < v.toks.size(); i++)
         if (v.toks[i].attr & (ATTR_CONTROL | ATTR_USER_DEFINED | ATTR_UNKNOWN))
@@ -264,15 +263,15 @@ static bool vocab_load(tok_vocab & v, const gguf_context * g) {
     return true;
 }
 
-// raw-text / token fragments of the input, after the special-token split
+// A piece of the input after the special-token split: raw text, or a token.
 struct frag {
     bool is_tok = false;
     int32_t tok = -1;
     int64_t off = 0, len = 0;   // into the raw text when !is_tok
 };
 
-// llama.cpp tokenizer_st_partition: split raw fragments on each special token
-// (CONTROL / UNKNOWN only with parse_special)
+// Split raw fragments on each special token, as llama.cpp's tokenizer_st_partition
+// does. CONTROL and UNKNOWN tokens count only with parse_special.
 static void st_partition(std::vector<frag> & frags, const std::string & text,
                          const tok_vocab & v, bool parse_special) {
     for (int32_t sp : v.special) {
@@ -318,7 +317,8 @@ struct bigram_cmp {
     }
 };
 
-// llm_tokenizer_bpe_session::tokenize for one raw fragment (byte_encode BPE)
+// One raw fragment through llama.cpp's llm_tokenizer_bpe_session::tokenize, the
+// byte_encode BPE path.
 static void bpe_fragment(const std::string & text, const tok_vocab & v, std::vector<int32_t> & output) {
     const std::vector<std::string> words = unicode_regex_split(text, v.pre_re, true);
     for (const std::string & word : words) {
@@ -354,7 +354,6 @@ static void bpe_fragment(const std::string & text, const tok_vocab & v, std::vec
             const std::string lt = word.substr((size_t) ls.off, ls.n);
             const std::string rt = word.substr((size_t) rs.off, rs.n);
             if (lt + rt != b.text) continue;   // stale
-            // merge the right symbol into the left one
             ls.n += rs.n;
             rs.n = 0;
             ls.next = rs.next;
@@ -380,7 +379,7 @@ static void bpe_fragment(const std::string & text, const tok_vocab & v, std::vec
     }
 }
 
-// llama.cpp llama_decode_text: byte-level decode of a NORMAL token
+// Byte-level decode of a NORMAL token, as llama.cpp's llama_decode_text does.
 static std::string decode_text(const std::string & text) {
     std::string out;
     for (uint32_t cpt : unicode_cpts_from_utf8(text)) {
@@ -417,7 +416,7 @@ void * qz_tok_open(const char * model) {
     return v;
 }
 
-// returns the token count, or -(needed) when out is too small
+// Returns the token count, or -(needed) when out is too small.
 int qz_tok_encode(void * m, const char * text, int add_special, int parse_special, int32_t * out, int max) {
     if (!m) return -1;
     const tok_vocab & v = *(tok_vocab *) m;
@@ -439,8 +438,8 @@ int qz_tok_encode(void * m, const char * text, int add_special, int parse_specia
     return (int) output.size();
 }
 
-// bytes of one token's piece (special tokens rendered when special != 0);
-// negative: -(needed)
+// Bytes of one token's piece, with special tokens rendered when special != 0.
+// Negative: -(needed).
 int qz_tok_piece(void * m, int32_t tok, char * buf, int len, int special) {
     if (!m) return 0;
     const tok_vocab & v = *(tok_vocab *) m;
@@ -462,7 +461,7 @@ int qz_tok_piece(void * m, int32_t tok, char * buf, int len, int special) {
     return (int) piece.size();
 }
 
-// all end-of-generation ids, ascending, up to max
+// All end-of-generation ids in ascending order, up to max.
 int qz_tok_eog(void * m, int32_t * out, int max) {
     if (!m) return 0;
     const tok_vocab & v = *(tok_vocab *) m;
@@ -471,7 +470,7 @@ int qz_tok_eog(void * m, int32_t * out, int max) {
     return (int) v.eog.size();
 }
 
-// the GGUF's tokenizer.chat_template (UTF-8), or NULL when it has none
+// The GGUF's tokenizer.chat_template in UTF-8, or NULL when there is none.
 const char * qz_tok_chat_template(void * m) {
     if (!m) return nullptr;
     const tok_vocab & v = *(tok_vocab *) m;

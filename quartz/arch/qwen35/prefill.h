@@ -1,18 +1,18 @@
-// Batched prefill: prompt rows through the trunk as GEMMs on both cards (TP2),
-// writing the K / V, DeltaNet, conv and MTP state the decode continues from.
+// Batched prefill. Runs prompt rows through the trunk as GEMMs on both cards (TP2)
+// and writes the K / V, DeltaNet, conv and MTP state that decode resumes from.
 #pragma once
 
 #include <vector>
 
 #include "core/devices.h"
 
-// per-card geometry (PF_ prefix: engine.h defines D, S, G, ... as macros)
+// Per-card geometry. The PF_ prefix avoids the D, S, G macros engine.h defines.
 constexpr int PF_D = 5120, PF_CCH = 5120, PF_HK = 8, PF_HV = 24, PF_S = 128, PF_G = 3072, PF_AQ = 6144,
               PF_AKV = 512, PF_HQ = 12, PF_HKV = 2, PF_HD = 256, PF_FF = 8704;
 #include "kernels/pf_gemm.h"
 
 // ------------------------------------------------------- elementwise ----
-// token embeddings; with irow, row m takes image row irow[m] (>= 0) instead
+// Token embeddings. With irow, row m takes image row irow[m] when that is >= 0.
 __global__ void pf_embed(const int32_t * __restrict__ tok, const int * __restrict__ ev, const __half * __restrict__ es,
                          float * x, int n, int Mp, const int * __restrict__ irow = nullptr, const float * __restrict__ img = nullptr) {
     const int m = blockIdx.x;
@@ -27,8 +27,8 @@ __global__ void pf_embed(const int32_t * __restrict__ tok, const int * __restric
         x[(size_t) m * PF_D + k] = (float) q[k] * __half2float(es[(size_t) id * (PF_D / 32) + k / 32]);
 }
 
-// causal conv1d (4 taps) + silu over all rows at once; rows below q0 come from
-// the window cs (qkv rows at stride PF_AQ)
+// Causal conv1d (4 taps) and silu over all rows at once. Rows below q0 read the
+// window cs, which holds qkv rows at stride PF_AQ.
 __device__ __forceinline__ float pf_conv_in(const float * qkv, const float * cs, int k, int c, int q0) {
     return k >= q0 ? qkv[(size_t) k * PF_AQ + c] : cs[(3 + k - q0) * PF_CCH + c];
 }
@@ -38,13 +38,13 @@ __device__ __forceinline__ float pf_conv_at(const float * qkv, const float * cs,
                     pf_conv_in(qkv, cs, m - 1, c, q0) * w[2] + qkv[(size_t) m * PF_AQ + c] * w[3];
     return o / (1.f + expf(-o));
 }
-// the window as it is before row snap of the chunk (the prefix cache's mid-chunk snapshot)
+// The conv window before row snap, the prefix cache's mid-chunk snapshot.
 __global__ void pf_conv_snap(const float * __restrict__ qkv, int snap, const float * __restrict__ cs, float * out, int q0 = 0) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= PF_CCH) return;
     out[c] = pf_conv_in(qkv, cs, snap - 3, c, q0); out[PF_CCH + c] = pf_conv_in(qkv, cs, snap - 2, c, q0); out[2 * PF_CCH + c] = pf_conv_in(qkv, cs, snap - 1, c, q0);
 }
-// the window after the chunk: its last three inputs (cs == ws is fine)
+// The chunk's conv window afterwards: its last three inputs. cs may alias ws.
 __global__ void pf_conv_commit(const float * __restrict__ qkv, int n, const float * cs, float * ws, int q0 = 0) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= PF_CCH || n <= 0) return;
@@ -52,8 +52,8 @@ __global__ void pf_conv_commit(const float * __restrict__ qkv, int n, const floa
     ws[c] = a; ws[PF_CCH + c] = b; ws[2 * PF_CCH + c] = d;
 }
 
-// conv + DeltaNet input prep in one pass per row: q / k go from the conv straight
-// into their l2 norms (not stored), the v channels are written for the scan
+// Conv and DeltaNet input prep, one pass per row. q and k go through the conv into
+// their l2 norms and are never stored. The v channels are written out for the scan.
 __global__ void __launch_bounds__(256) pf_conv_prep(
         const float * __restrict__ qkv, const float * __restrict__ cs, const float * __restrict__ w4, float * conv,
         const float * __restrict__ ba, float eps,
@@ -62,13 +62,13 @@ __global__ void __launch_bounds__(256) pf_conv_prep(
     __shared__ float red[4];
     const int m = m0 + blockIdx.x, t = threadIdx.x, wave = t >> 6, lane = t & 63;
     const float epsn = eps * (1.f / 128.f), l2i = 1.f / sqrtf(128.f);
-    // the v channels the scan reads, through the conv
+    // the v channels the scan reads, taken through the conv
     for (int c = 2 * PF_HK * PF_S + t; c < PF_CCH; c += 256) conv[(size_t) m * PF_CCH + c] = pf_conv_at(qkv, cs, w4, m, c, q0);
-    for (int v = 0; v < 2 * PF_HK; v += 2) {          // two vectors per pass: q / k of one head
+    for (int v = 0; v < 2 * PF_HK; v += 2) {          // one head per pass, both its q and its k
         const int kh = v / 2;
-        const int vec = wave >> 1;                      // waves 0,1: q; 2,3: k
+        const int vec = wave >> 1;                      // waves 0, 1 do q, waves 2, 3 do k
         const int e = (wave & 1) * 64 + lane;
-        const float x = pf_conv_at(qkv, cs, w4, m, vec * PF_S * PF_HK + kh * PF_S + e, q0);   // q / k: conv in place
+        const float x = pf_conv_at(qkv, cs, w4, m, vec * PF_S * PF_HK + kh * PF_S + e, q0);   // q or k: conv here, never stored
         float s = x * x;
 #pragma unroll
         for (int off = 32; off > 0; off >>= 1) s += __shfl_down(s, off, 64);
@@ -88,8 +88,8 @@ __global__ void __launch_bounds__(256) pf_conv_prep(
     }
 }
 
-// the DeltaNet recurrence over n rows: one wave per (head, 16 value columns),
-// the decode scan's order; row m + 1's inputs load while row m computes
+// The DeltaNet recurrence over n rows in the decode scan's order: one wave per head
+// and 16 value columns. Row m + 1's inputs load while row m computes.
 struct pf_dn_in { float k[32], q[32], v, bt, dc; };
 __device__ __forceinline__ void pf_dn_load(pf_dn_in & a, const float * __restrict__ qn, const float * __restrict__ kn,
                                            const float * __restrict__ conv, const float * __restrict__ beta,
@@ -109,7 +109,7 @@ __device__ __forceinline__ void pf_dn_load(pf_dn_in & a, const float * __restric
 __device__ __forceinline__ void pf_dn_row(float (&s)[32], const pf_dn_in & a, float * o, int m, int h, int r, int jl, int j) {
 #pragma unroll
     for (int i = 0; i < 32; i++) s[i] = s[i] * a.dc;
-    // explicit fmas: the result does not depend on where the compiler contracts
+    // explicit fmas so the result does not depend on where the compiler contracts
     float p = 0.f;
 #pragma unroll
     for (int i = 0; i < 32; i++) p = __builtin_fmaf(s[i], a.k[i], p);
@@ -128,7 +128,7 @@ __global__ void __launch_bounds__(64) pf_dn_scan(
         const float * __restrict__ qn, const float * __restrict__ kn, const float * __restrict__ conv,
         const float * __restrict__ beta, const float * __restrict__ dec, float * state, float * o, int n, int m0 = 0,
         int snap = -1, float * __restrict__ snap_state = nullptr) {
-    // snap_state: a copy of the state as it is before row snap (the prefix cache's mid-chunk snapshot)
+    // snap_state copies the state before row snap, the prefix cache's mid-chunk snapshot
     const int h = blockIdx.x / 8, cg = blockIdx.x % 8, lane = threadIdx.x;
     const int r = lane >> 4, jl = lane & 15, j = cg * 16 + jl, kh = h % PF_HK;
     float * st = state + (size_t) h * PF_S * PF_S;
@@ -158,14 +158,14 @@ __global__ void __launch_bounds__(64) pf_dn_scan(
     for (int i = 0; i < 32; i++) st[(r * 32 + i) * PF_S + j] = s[i];
 }
 
-// gated rms norm per head (o * rsqrt(mean(o^2) + eps) * w * silu(z)),
-// quantized as the ssm_out input; one block (128 threads) per (row, head)
+// Gated rms norm per head, o * rsqrt(mean(o^2) + eps) * w * silu(z), quantized as the
+// ssm_out input. One block of 128 threads per row and head.
 __global__ void __launch_bounds__(128) pf_dn_out(
         const float * __restrict__ o, const float * __restrict__ z, const float * __restrict__ nw, float eps,
         int8_t * Ag, float * sag, int Mp, int m0 = 0, int n = 1 << 30) {
     __shared__ float red[2];
     const int m = m0 + blockIdx.x / PF_HV, h = blockIdx.x % PF_HV, t = threadIdx.x;
-    if (m >= n) {   // padded rows of the ssm_out input: zeros
+    if (m >= n) {   // padded rows of the ssm_out input get zeros
         Ag[((size_t) ((h * PF_S + t) / 128) * Mp + m) * 128 + (h * PF_S + t) % 128] = 0;
         if ((t & 31) == 0) sag[((size_t) ((h * PF_S + t) / 128) * Mp + m) * 4 + ((h * PF_S + t) % 128) / 32] = 0.f;
         return;
@@ -181,8 +181,8 @@ __global__ void __launch_bounds__(128) pf_dn_out(
     pf_quant_unit((v * inv) * nw[t] * (zj / (1.f + expf(-zj))), h * PF_S + t, m, Mp, Ag, sag, t & 31);
 }
 
-// attention q / k: per-head RMS norm + MRoPE; q -> q16, k / v -> the arena at
-// p0 + m; rp: per-row (t, h, w) rope positions (null: p0 + m)
+// Attention q and k: per-head RMS norm then MRoPE. q goes to q16, and k and v go to
+// the arena at p0 + m. rp holds per-row (t, h, w) rope positions; null means p0 + m.
 __global__ void __launch_bounds__(256) pf_attn_qk(
         const float * __restrict__ yq, const float * __restrict__ yk, const float * __restrict__ yv,
         const float * __restrict__ qw, const float * __restrict__ kw, float eps, int p0,
@@ -221,8 +221,8 @@ __global__ void __launch_bounds__(256) pf_attn_qk(
     if (!isq) kv_v[qz_kv_row(pos, PF_HKV, h) + t] = __float2half(yv[(size_t) m * PF_AKV + h * PF_HD + t]);
 }
 
-// MTP entry inputs: [enorm(emb(tok[r])) | hnorm(hidden of the previous
-// position)], one block per row
+// MTP entry inputs: enorm(emb(tok[r])) followed by hnorm of the hidden at the previous
+// position. One block per row.
 __global__ void __launch_bounds__(256) pf_mtp_in(
         const int32_t * __restrict__ tok, const int * __restrict__ ev, const __half * __restrict__ es,
         const float * __restrict__ hn, int hoff, const float * __restrict__ ew, const float * __restrict__ hw,
@@ -235,7 +235,7 @@ __global__ void __launch_bounds__(256) pf_mtp_in(
         return;
     }
     const signed char * q = (const signed char *) (ev + (size_t) tok[r] * (PF_D / 4));
-    const float * ir = irow && irow[r] >= 0 ? img + (size_t) irow[r] * PF_D : nullptr;   // image row (as pf_embed)
+    const float * ir = irow && irow[r] >= 0 ? img + (size_t) irow[r] * PF_D : nullptr;   // image row, as in pf_embed
     const float * hr = r + hoff >= 0 ? hn + (size_t) (r + hoff) * PF_D : nullptr;
     float se = 0.f, sh = 0.f;
     for (int k = t; k < PF_D; k += 256) {
@@ -259,34 +259,33 @@ __global__ void __launch_bounds__(256) pf_mtp_in(
 typedef _Float16 pf_h2 __attribute__((ext_vector_type(2)));
 
 
-// pf_flash2: causal attention as two register-tiled GEMMs; block = 64 queries
-// of one head, wave w holds q dims w * 32 .. + 31, key tiles of 16
+// pf_flash2: causal attention as two register-tiled GEMMs. A block is 64 queries of
+// one head, wave w holds q dims w * 32 .. + 31, and keys come in tiles of 16.
 #define PF2_KT 16
-#define PF2_KS 264                                         // K / V row stride in halves (256 + 8: rows kg + G j on distinct banks)
-#define PF2_QKP 1                                          // QK: K reads issued this many steps ahead (2+ spill)
-#define PF2_NW 8                                           // waves: wave w holds dims w * DW .. + DW - 1 of QB = 64 queries
+#define PF2_KS 264                                         // K / V row stride in halves, 256 + 8 so rows kg + G j hit distinct banks
+#define PF2_QKP 1                                          // QK: how many steps ahead the K reads are issued (2 or more spill)
+#define PF2_NW 8                                           // waves: wave w holds dims w * DW .. w * DW + DW - 1 of the QB = 64 queries
 __global__ void __launch_bounds__(PF2_NW * 64, 1) pf_flash2(
         const __half * __restrict__ q16, const __half * __restrict__ kv_k, const __half * __restrict__ kv_v,
         const float * __restrict__ yq, int p0, int n, float * __restrict__ out, int mb = 0) {
     constexpr int NW = PF2_NW, NT = NW * 64, DW = 256 / NW, QB = 8 * NW, QL = 2, KG = 2;
-    constexpr int KL = PF2_KT / KG;                        // keys per lane in QK: kg + KG j
+    constexpr int KL = PF2_KT / KG;                        // keys per lane in QK, kg + KG j
     static_assert((QB / QL) * KG == 64, "QK lane tile");
     static_assert((QB / 4) * (DW / 8) == 64, "PV lane tile");
     __shared__ __attribute__((aligned(16))) __half Ks[PF2_KT * PF2_KS], Vs[PF2_KT * PF2_KS];
-    // per wave: partial scores [query][key], unpadded rows of KT; 16-byte chunk c of query q's row stored at
-    // c ^ ((q >> 1) & 3), which keeps the QK b128 writes and the softmax b64 reads conflict-free
+    // Per wave, partial scores [query][key], rows unpadded. Query q's chunk c sits at
+    // c ^ ((q >> 1) & 3), which keeps QK b128 writes and softmax b64 reads conflict-free.
     __shared__ __attribute__((aligned(16))) float Sp[NW][QB][PF2_KT];
     auto spc = [](int q, int c) { return c ^ ((q >> 1) & 3); };
-    // QK lane kg's keys: kg * KL + j (contiguous, K rows swizzled: 16-byte chunk ^ the row's key group
-    // so the KG rows read together sit on distinct banks)
+    // QK lane kg's keys are kg * KL + j. kcol swizzles K rows onto distinct banks.
     auto qkey = [](int kg, int j) { return kg * KL + j; };
     auto kcol = [](int row, int col) { return col ^ ((row / KL) * 8); };
     __shared__ __attribute__((aligned(16))) float Pt[PF2_KT][QB + 4];   // probabilities [key][query]
-    __shared__ __attribute__((aligned(16))) float cr[QB], ls[QB];       // per query: rescale of this tile, final l
+    __shared__ __attribute__((aligned(16))) float cr[QB], ls[QB];       // per query: this tile's rescale and the final l
     const int h = blockIdx.y, kh = h / 6, t = threadIdx.x, w = t >> 6, lane = t & 63;
     const int m0 = mb + (gridDim.x - 1 - blockIdx.x) * QB;   // longest causal blocks dispatched first
     const int kmax = p0 + min(m0 + QB - 1, n - 1);
-    // QK lane: queries qg + r * QB / 2; keys qkey(kg, j)
+    // QK lane: queries qg + r * QB / 2, keys qkey(kg, j)
     const int qg = lane / KG, kg = lane % KG;
     pf_h2 qv[QL][DW / 2];
 #pragma unroll
@@ -306,11 +305,10 @@ __global__ void __launch_bounds__(PF2_NW * 64, 1) pf_flash2(
     for (int i = 0; i < 4; i++)
 #pragma unroll
         for (int d = 0; d < 8; d++) o[i][d] = 0.f;
-    // tile loads: LPT x (key, 8 halves) of K and of V per thread
+    // tile loads: each thread takes LPT items of (key, 8 halves), for K and for V
     constexpr int LPT = PF2_KT * 32 / NT;
     uint4 nk[LPT];
-    // V is loaded straight as key pairs: thread = (pair j = t >> 6, dims (t & 63) * 4 .. + 3),
-    // 8 B of key 2j and 8 B of key 2j + 1, so the pair dwords are built in-lane (no cross-lane shuffle)
+    // V is loaded as key pairs, so the pair dwords are built in-lane with no shuffle.
     static_assert(NT == 8 * 64, "V load: 8 key pairs x 64 lanes");
     uint2 ve = make_uint2(0, 0), vo = make_uint2(0, 0);
     auto load = [&](int kt) {
@@ -320,7 +318,7 @@ __global__ void __launch_bounds__(PF2_NW * 64, 1) pf_flash2(
             nk[u] = make_uint4(0, 0, 0, 0);
             if (kp <= kmax) nk[u] = *(const uint4 *) (kv_k + qz_kv_row(kp, PF_HKV, kh) + lc);
         }
-        {   // keys kt .. kt + 15 lie in one 64-position page of qz_kv_row
+        {   // keys kt .. kt + 15 sit in one 64-position page of qz_kv_row
             const int ke = kt + 2 * (t >> 6), dd = (t & 63) * 4;
             ve = vo = make_uint2(0, 0);
             if (ke <= kmax)     ve = *(const uint2 *) (kv_v + qz_kv_row(ke, PF_HKV, kh) + dd);
@@ -336,8 +334,8 @@ __global__ void __launch_bounds__(PF2_NW * 64, 1) pf_flash2(
     };
     load(0);
     for (int kt = 0; kt <= kmax; kt += PF2_KT) {
-        __syncthreads();                                   // the last tile's QK / PV are done with Ks, Vs, Pt
-        {   // V as key pairs: dword (key 2j, key 2j + 1) of one dim; pair row j, stride PF2_KS dwords
+        __syncthreads();                                   // the last tile's QK and PV are done with Ks, Vs and Pt
+        {   // V as key pairs: dword (key 2j, key 2j + 1) of one dim, at pair row j
             auto lo = [](uint32_t a, uint32_t b) { return __builtin_amdgcn_perm(b, a, 0x05040100u); };
             auto hi = [](uint32_t a, uint32_t b) { return __builtin_amdgcn_perm(b, a, 0x07060302u); };
             *(uint4 *) ((uint32_t *) Vs + (t >> 6) * PF2_KS + (t & 63) * 4) =
@@ -352,7 +350,7 @@ __global__ void __launch_bounds__(PF2_NW * 64, 1) pf_flash2(
             for (int r = 0; r < QL; r++)
 #pragma unroll
                 for (int j = 0; j < KL; j++) s[r][j] = 0.f;
-            {   // software-pipelined: the read of step it + PF2_QKP is in flight while step it computes
+            {   // software-pipelined, so the read of step it + PF2_QKP is in flight
                 constexpr int NS = DW / 8 * KL;
                 auto kaddr = [&](int it) { const int row = qkey(kg, it % KL); return (const uint4 *) &Ks[row * PF2_KS + kcol(row, w * DW + (it / KL) * 8)]; };
                 uint4 kb[PF2_QKP + 1];
@@ -378,22 +376,22 @@ __global__ void __launch_bounds__(PF2_NW * 64, 1) pf_flash2(
                 for (int j = 0; j < KL; j += 4) *(float4 *) &Sp[w][qg + (QB / QL) * r][4 * spc(qg + (QB / QL) * r, (kg * KL + j) >> 2)] = make_float4(s[r][j], s[r][j + 1], s[r][j + 2], s[r][j + 3]);
         }
         __syncthreads();
-        {   // softmax: query sq, keys sk, sk + 1
-            // indices rebuilt from the lane id here (kept live they spill)
+        {   // softmax: query sq, keys sk and sk + 1
+            // indices rebuilt from the lane id: kept live they spill
             int lid = __lane_id();
             asm volatile("" : "+v"(lid));
             const int sk = (lid & 7) * 2, sq = __builtin_amdgcn_readfirstlane(w) * 8 + (lid >> 3);
             float x[2], a2[2] = { 0.f, 0.f };
 #pragma unroll
-            for (int v = 0; v < NW; v++) {                // the waves' partials in wave order
+            for (int v = 0; v < NW; v++) {                // the waves' partials, in wave order
                 const float2 f = *(const float2 *) &Sp[v][sq][4 * spc(sq, sk >> 2) + (sk & 3)];
                 a2[0] += f.x; a2[1] += f.y;
             }
 #pragma unroll
-            for (int u = 0; u < 2; u++)                   // softmax in base 2: scores in log2 units, v_exp_f32
+            for (int u = 0; u < 2; u++)                   // softmax in base 2: scores in log2 units, then v_exp_f32
                 x[u] = kt + sk + u > sqpos ? -INFINITY : a2[u] * (1.4426950408889634f / 16.f);
             float tm = fmaxf(x[0], x[1]);
-            // max over the query's 8 lanes on DPP (xor 1, xor 2, then the other quad: any order gives the max)
+            // max over the query's 8 lanes on DPP; the three steps can run in any order
             tm = fmaxf(tm, qz_dpp<0xb1, false>(tm)); tm = fmaxf(tm, qz_dpp<0x4e, false>(tm)); tm = fmaxf(tm, qz_dpp<0x141, false>(tm));
             const float nm = fmaxf(mx, tm);               // finite: key 0 is in tile 0 and visible to every query
             const float corr = mx == -INFINITY ? 0.f : __builtin_amdgcn_exp2f(mx - nm);
@@ -401,14 +399,14 @@ __global__ void __launch_bounds__(PF2_NW * 64, 1) pf_flash2(
 #pragma unroll
             for (int u = 0; u < 2; u++) {
                 float p = x[u] == -INFINITY ? 0.f : __builtin_amdgcn_exp2f(x[u] - nm);
-                p = (float) (_Float16) p;                 // P x V uses p rounded to f16, so l sums the rounded values
+                p = (float) (_Float16) p;                 // P x V takes p rounded to f16, so l sums the rounded values
                 pr[u] = p;
                 ps += p;
             }
-            // the lane's key pair (sk, sk + 1) as one f16 pair, [pair][query] in Pt's space
+            // the lane's key pair (sk, sk + 1) as one f16 pair at [pair][query] in Pt
             ((pf_h2 *) &Pt[0][0])[(sk / 2) * (QB + 4) + sq] = pf_h2{ (_Float16) pr[0], (_Float16) pr[1] };
-            // the xor 1 / 2 / 4 butterfly on DPP, the same sums: after xor 2 all four lanes of a quad hold the
-            // same value, so row_half_mirror (lane 7 - i, the other quad) supplies what lane i ^ 4 held
+            // the xor 1 / 2 / 4 butterfly on DPP gives the same sums. After xor 2 the
+            // quad agrees, so row_half_mirror (lane 7 - i) supplies lane i ^ 4.
             ps += qz_dpp<0xb1, false>(ps); ps += qz_dpp<0x4e, false>(ps); ps += qz_dpp<0x141, false>(ps);
             l = l * corr + ps;
             mx = nm;
@@ -418,8 +416,8 @@ __global__ void __launch_bounds__(PF2_NW * 64, 1) pf_flash2(
         {   // PV
             const float4 c4 = *(const float4 *) &cr[pq];
             const float cc[4] = { c4.x, c4.y, c4.z, c4.w };
-            // lazy rescale: once the running max settles corr is exactly 1 (expf(0)), so a wave
-            // where no lane's queries moved skips the multiplies (same bits)
+            // lazy rescale: once the running max settles, corr is exactly 1, so a wave in
+            // which no lane's queries moved skips the multiplies and keeps the same bits.
             if (__any(cc[0] != 1.f || cc[1] != 1.f || cc[2] != 1.f || cc[3] != 1.f))
 #pragma unroll
                 for (int i = 0; i < 4; i++)
@@ -454,12 +452,12 @@ __global__ void __launch_bounds__(PF2_NW * 64, 1) pf_flash2(
     }
 }
 
-// DSpine target features: the residual after these trunk layers (0-based),
-// captured on card 0 right after the next layer's attn norm
+// DSpine target features: the residual after these trunk layers, 0-based, captured on
+// card 0 right after the next layer's attn norm.
 constexpr int PF_FEAT_LAYERS[5] = { 1, 16, 31, 46, 61 };
 
 // ------------------------------------------------------------ driver ----
-// a prompt's images: per position, its image row (-1: token) and rope (t, h, w)
+// A prompt's images: per position the image row (-1 for a token) and rope (t, h, w)
 struct qz_mm_view {
     const int * irow = nullptr;
     const int * rpos = nullptr;
@@ -475,27 +473,27 @@ struct qz_mm_view {
 struct qz_prefill {
     int Mmax = 0, Mp = 0;
     std::vector<int> mm_irow, mm_rpos;   // host staging of a chunk's qz_mm_view rows
-    // DSpine feature capture [5][Mmax][PF_D] on card 0 (null: off)
+    // DSpine feature capture, [5][Mmax][PF_D] on card 0; null means off
     float * feat = nullptr;
     struct card {
         float * x = nullptr, * part = nullptr, * y = nullptr, * conv = nullptr,
               * z = nullptr, * ba = nullptr, * qn = nullptr, * kn = nullptr, * beta = nullptr, * dec = nullptr,
               * o = nullptr, * fg = nullptr, * fu = nullptr, * yk = nullptr, * yv = nullptr,
               * hn = nullptr, * cat = nullptr,
-              * edge = nullptr;   // [recurrent layer][3][CCH]: half 0's last three qkv rows, half 1's conv window
-        int8_t * aq = nullptr, * aq2 = nullptr; float * as = nullptr, * as2 = nullptr;   // grouped int8 GEMM input + scales (two: ffn in / out)
-        void * pl[2] = {}, * pr[2] = {};                 // partials (bf16 or f32), two sets: this card's own, the peer's (written by its GEMM)
+              * edge = nullptr;   // [recurrent layer][3][PF_CCH]: half 0's last three qkv rows, half 1's conv window
+        int8_t * aq = nullptr, * aq2 = nullptr; float * as = nullptr, * as2 = nullptr;   // grouped int8 GEMM input and scales, two sets for ffn in and out
+        void * pl[2] = {}, * pr[2] = {};                 // partials, bf16 or f32: this card's own, the peer's written by its GEMM
         __half * q16 = nullptr;
         int32_t * tok = nullptr;
-        int * irow = nullptr, * rpos = nullptr;          // a chunk's image rows / rope positions (qz_mm_view)
-        size_t scr = 0;                                  // bytes carved from the engine's scratch (0: own buffers)
+        int * irow = nullptr, * rpos = nullptr;          // a chunk's image rows and rope positions (qz_mm_view)
+        size_t scr = 0;                                  // bytes carved from the engine's scratch; 0 means own buffers
         hipEvent_t ev = nullptr, ev_aux = nullptr, evp[4] = {};
         hipStream_t aux = nullptr;
     } c[2];
 
     // the per-card buffers of init(max_rows): (pointer, bytes) for M rows
     static std::vector<std::pair<void **, size_t>> bufs(card & k, size_t M) {
-        const size_t xb = 2;                             // bf16 cross-card partials
+        const size_t xb = 2;                             // bytes per bf16 cross-card partial
         return { { (void **) &k.x, M * PF_D * 4 }, { (void **) &k.part, M * PF_D * 4 }, { (void **) &k.y, M * PF_AQ * 4 },
                  { (void **) &k.conv, M * PF_CCH * 4 }, { (void **) &k.z, M * PF_G * 4 }, { (void **) &k.ba, M * 2 * PF_HV * 4 },
                  { (void **) &k.qn, M * PF_HK * PF_S * 4 }, { (void **) &k.kn, M * PF_HK * PF_S * 4 },
@@ -509,7 +507,7 @@ struct qz_prefill {
                  { (void **) &k.irow, M * 4 }, { (void **) &k.rpos, M * 3 * 4 } };
     }
     static size_t rows(int max_rows) { return (size_t) ((max_rows + PF_MT - 1) / PF_MT * PF_MT + PF_MT); }
-    // device bytes per card init(max_rows) needs (256-byte aligned buffers)
+    // device bytes per card that init(max_rows) needs, buffers 256-byte aligned
     static size_t bytes(int max_rows) {
         card k;
         std::vector<size_t> v;
@@ -526,13 +524,13 @@ struct qz_prefill {
         return 0;
     }
     int init(qz_engine & e, int max_rows) {
-        Mmax = (int) rows(max_rows);   // + one tile: the MTP pass has n + 1 rows
+        Mmax = (int) rows(max_rows);   // one extra tile: the MTP pass has n + 1 rows
         qz_mem_scope mem("prefill");
         for (int i = 0; i < 2; i++) {
             card & k = c[i];
             CHECK(hipSetDevice(qz_dev_of(i)));
             const auto b = bufs(k, Mmax);
-            // the engine's scratch when it holds them (qz_engine::scratch_min), else own buffers
+            // carve from the engine's scratch when it has room, else own buffers
             if (e.C[i].scr_carve(b)) k.scr = bytes(max_rows);
             else for (const auto & x : b) CHECK(qz_dmalloc(x.first, x.second));
             CHECK(hipEventCreateWithFlags(&k.ev, hipEventDisableTiming));
@@ -545,25 +543,25 @@ struct qz_prefill {
         return 0;
     }
 
-    // two token halves on two streams per card, so one half's small kernels
-    // run beside the other's GEMMs
+    // Two token halves on two streams per card, so one half's small kernels run beside
+    // the other half's GEMMs.
     struct half { int r0 = 0, r1 = 0, ty0 = 0, nty = 0, rp = 0; };
     half hv[2];
     int nh = 1;
-    int hset[2] = {0, 0}, hpn[2] = {0, 0};          // per half: the pending cross-card sum (set, rows; 0 none)
-    hipEvent_t evx[2][2] = {}, evh[2][4] = {};      // [card][half]: partial written; [card][kind]: half 0 conv / scan / kv done, join
+    int hset[2] = {0, 0}, hpn[2] = {0, 0};          // per half: the partial set in use (hset) and a pending sum flag (hpn)
+    hipEvent_t evx[2][2] = {}, evh[2][4] = {};      // [card][half]: a partial is written. [card][kind]: half 0's conv, scan or kv is done, or the join
 
     hipStream_t hs(qz_engine & e, int i, int h) { return h == 0 ? e.C[i].st : c[i].aux; }
 
-    // C = A x W over the half's token tiles (A: the grouped int8 input, default aq)
+    // C = A x W over the half's token tiles. A is the grouped int8 input, aq by default.
     void gemm(qz_engine & e, int i, int h, const char * W, const __half * sw, int N, int K, float * C, int ldc,
               const int8_t * A = nullptr, const float * As = nullptr) {
         const half & H = hv[h];
         hipLaunchKernelGGL(pf_gemm<0>, dim3((N + 63) / 64, H.nty), dim3(256), 0, hs(e, i, h), A ? A : c[i].aq, As ? As : c[i].as, Mp,
                            W, sw, K, K, C, ldc, N, H.ty0, 0);
     }
-    // row-parallel projection: each card writes its bf16 partial locally and to
-    // the peer; the next norm() applies x += p0 + p1 (two partial sets alternate)
+    // Row-parallel projection. Each card writes its bf16 partial locally and to the peer.
+    // The next norm() applies x += p0 + p1. Two partial sets alternate.
     void rowpar(qz_engine & e, int h, const char * const * W, const __half * const * sw, int K, bool ffn) {
         const half & H = hv[h];
         hset[h] ^= 1;
@@ -575,8 +573,8 @@ struct qz_prefill {
         }
         hpn[h] = 1;
     }
-    // RMS norm of the half's rows of x (quantized into aq, and / or f32 to
-    // outf), the half's pending cross-card sum first when there is one
+    // RMS norm of the half's rows of x, quantized into Ag and optionally as f32 into
+    // outf. A pending cross-card sum is added first.
     void norm(qz_engine & e, int i, int h, const float * w, int8_t * Ag, float * outf, int rows_end = -1, hipStream_t st_ = nullptr) {
         const half & H = hv[h];
         card & k = c[i];
@@ -595,8 +593,8 @@ struct qz_prefill {
     void ev(qz_engine & e, int i, int h, int kind) { CHECK(hipEventRecord(evh[i][kind], hs(e, i, h))); }
     void wait(qz_engine & e, int i, int h, int kind) { CHECK(hipStreamWaitEvent(hs(e, i, h), evh[i][kind], 0)); }
 
-    // the image rows / rope positions of positions first .. first + R - 1 to
-    // card `card`'s irow / rpos (-1: both cards), on the card's main stream
+    // Stage the image rows and rope positions of positions first .. first + R - 1 into
+    // the given card's irow and rpos, on its main stream; card -1 means both cards.
     void mm_stage(qz_engine & e, const qz_mm_view * mm, int first, int R, int card = -1) {
         mm_irow.resize(R); mm_rpos.resize((size_t) R * 3);
         for (int r = 0; r < R; r++) { mm_irow[r] = mm->img(first + r); mm->rope(first + r, &mm_rpos[(size_t) r * 3]); }
@@ -607,8 +605,8 @@ struct qz_prefill {
         }
     }
 
-    // MTP K / V entries for p0 + 1 .. p0 + n (and entry 0 when p0 == 0), after
-    // both halves joined
+    // MTP K / V entries for p0 + 1 .. p0 + n, plus entry 0 when p0 == 0. Runs after both
+    // halves have joined.
     void mtp_pass(qz_engine & e, const int32_t * toks, int p0, int n, int32_t next, const qz_mm_view * mm = nullptr) {
         const int first = p0 == 0 ? 0 : p0 + 1;               // first entry position
         const int R = p0 + n + 1 - first;                     // entries first .. p0 + n
@@ -618,14 +616,14 @@ struct qz_prefill {
             const int pos = first + r;
             mt[r] = pos - p0 < n ? toks[pos - p0] : next;
         }
-        const int hoff = first - 1 - p0;                      // hn row of entry r's hidden: r + hoff
+        const int hoff = first - 1 - p0;                      // entry r's hidden lives in hn row r + hoff
         const int save = Mp;
         if (mm) mm_stage(e, mm, first, R);
         for (int i = 0; i < 2; i++) {
             qz_card & K = e.C[i];
             card & k = c[i];
             CHECK(hipSetDevice(qz_dev_of(i)));
-            // trunk hidden of every row, output-normed (the MTP pairing input); per half (its pending sum), main stream
+            // the MTP pairing input: the output-normed trunk hidden of every row
             Mp = save;
             for (int h = 0; h < nh; h++) norm(e, i, h, K.A.out_norm, (int8_t *) nullptr, k.hn, hv[h].r1, K.st);
             CHECK(hipMemcpyAsync(k.tok, mt.data(), (size_t) R * 4, hipMemcpyHostToDevice, K.st));
@@ -649,8 +647,8 @@ struct qz_prefill {
         hpn[0] = hpn[1] = 0;
     }
 
-    // MTP K / V entries first .. first + R - 1 from staged rows: entry r pairs
-    // toks[r] with hn[card][r], the output-normed hidden of the position before
+    // MTP K / V entries first .. first + R - 1 from staged rows. Entry r pairs toks[r]
+    // with hn[card][r], the output-normed hidden of the position before.
     void mtp_rows(qz_engine & e, const int32_t * toks, float * const * hn, int first, int R) {
         for (int r0 = 0; r0 < R; r0 += Mmax - PF_MT) {
             const int n = std::min(Mmax - PF_MT, R - r0), Mr = (n + PF_MT - 1) / PF_MT * PF_MT;
@@ -681,8 +679,8 @@ struct qz_prefill {
         CHECK(hipSetDevice(qz_dev_of(0)));
     }
 
-    // positions p0 .. p0 + n - 1 of toks, next = the token at p0 + n; snap > 0 also
-    // copies the recurrent state before row snap (prefix cache). Returns 0
+    // Runs positions p0 .. p0 + n - 1 of toks, next being the token at p0 + n. snap > 0
+    // also copies the recurrent state before row snap for the prefix cache. Returns 0.
     int run(qz_engine & e, const int32_t * toks, int p0, int n, int32_t next,
             int snap = -1, float * const * snap_dn = nullptr, float * const * snap_cs = nullptr,
             const qz_mm_view * mm = nullptr) {
@@ -691,7 +689,7 @@ struct qz_prefill {
         if (n <= 0 || n + 1 > Mmax) return 1;
         Mp = (n + PF_MT - 1) / PF_MT * PF_MT;
         const float eps = e.eps;
-        // halves: at least 2 tiles each, else one
+        // two halves only when each gets at least 2 tiles
         const int split = (n / 2 + PF_MT - 1) / PF_MT * PF_MT;
         nh = split >= 2 * PF_MT && split < n ? 2 : 1;
         if (nh == 2) { hv[0] = { 0, split, 0, split / PF_MT, split }; hv[1] = { split, n, split / PF_MT, (Mp - split) / PF_MT, Mp }; }
@@ -704,23 +702,23 @@ struct qz_prefill {
                 for (int h = 0; h < 2; h++) CHECK(hipEventCreateWithFlags(&evx[i][h], hipEventDisableTiming));
                 for (int j = 0; j < 4; j++) CHECK(hipEventCreateWithFlags(&evh[i][j], hipEventDisableTiming));
             }
-            // in the shared scratch the buffers hold the decode's partials: zero them, as
-            // fresh buffers were (rows past n are padding the kernels never mix in)
+            // in the shared scratch the buffers still hold the decode's partials, so zero
+            // them like fresh buffers. Rows past n are padding the kernels skip.
             if (c[i].scr) CHECK(hipMemsetAsync(e.C[i].scr, 0, c[i].scr, K.st));
             CHECK(hipEventRecord(c[i].ev, K.st));
         }
         for (int i = 0; i < 2; i++) {
             qz_card & K = e.C[i];
             CHECK(hipSetDevice(qz_dev_of(i)));
-            // the first row-parallel partial goes straight into the peer's scratch: only
-            // after the peer zeroed it (the peer may still be busy, e.g. with the last
-            // chunk's snapshot copies; its memset then wiped this card's partial)
+            // the first row-parallel partial lands in the peer's scratch, so wait until
+            // the peer has zeroed it: the peer may still be busy with the last chunk's
+            // snapshot copies, and its memset would then wipe this card's partial.
             CHECK(hipStreamWaitEvent(K.st, c[1 - i].ev, 0));
             CHECK(hipMemcpyAsync(c[i].tok, toks, (size_t) n * 4, hipMemcpyHostToDevice, K.st));
             if (mm) { mm_stage(e, mm, p0, n, i); CHECK(hipSetDevice(qz_dev_of(i))); }   // after the scratch memset
             hipLaunchKernelGGL(pf_embed, dim3(Mp), dim3(256), 0, K.st, c[i].tok, K.A.emb_vals, K.A.emb_scal, c[i].x, n, Mp,
                                mm ? (const int *) c[i].irow : nullptr, mm ? mm->rows[i] : nullptr);
-            if (nh == 2) { ev(e, i, 0, 3); wait(e, i, 1, 3); }   // half 1 starts after the embedding
+            if (nh == 2) { ev(e, i, 0, 3); wait(e, i, 1, 3); }   // half 1 starts only after the embedding
         }
         enum { EV_CONV = 0, EV_SCAN = 1, EV_KV = 2 };
         for (int il = 0; il < e.n_layer; il++) {
@@ -735,8 +733,8 @@ struct qz_prefill {
                     CHECK(hipSetDevice(qz_dev_of(i)));
                     hipStream_t st = hs(e, i, h);
                     norm(e, i, h, W.attn_norm, k.aq, (float *) nullptr);
-                    // DSpine features: complete once layer il's attn norm applied
-                    // layer il - 1's pending sum
+                    // DSpine features: the residual is complete once layer il's attn norm
+                    // has applied layer il - 1's pending sum.
                     for (int ft = 0; feat && i == 0 && ft < 5; ft++)
                         if (il == PF_FEAT_LAYERS[ft] + 1)
                             CHECK(hipMemcpyAsync(feat + ((size_t) ft * Mmax + H.r0) * PF_D, k.x + (size_t) H.r0 * PF_D,
@@ -745,11 +743,11 @@ struct qz_prefill {
                         gemm(e, i, h, W.bet_vals, W.bet_scal, PF_HV, PF_D, k.ba, 2 * PF_HV);
                         gemm(e, i, h, W.alp_vals, W.alp_scal, PF_HV, PF_D, k.ba + PF_HV, 2 * PF_HV);
                         // qkv at row stride PF_AQ: k.y is shared with attention, and the
-                        // halves may be a layer apart
+                        // halves may be a layer apart.
                         gemm(e, i, h, W.qkv_vals, W.qkv_scal, PF_CCH, PF_D, k.y, PF_AQ);
                         gemm(e, i, h, W.gat_vals, W.gat_scal, PF_G, PF_D, k.z, PF_G);
-                        // conv: half 1's window is half 0's last three qkv rows, copied to
-                        // k.edge per layer
+                        // conv: half 1's window is half 0's last three qkv rows,
+                        // copied into k.edge once per recurrent layer.
                         float * edge = k.edge + (size_t) nrl * 3 * PF_CCH;
                         const float * cs = h == 1 ? edge : W.conv_state;
                         const int q0 = h == 1 ? H.r0 : 0;
@@ -759,8 +757,8 @@ struct qz_prefill {
                         if (h == 1) wait(e, i, h, EV_CONV);
                         hipLaunchKernelGGL(pf_conv_prep, dim3(nr), dim3(256), 0, st, k.y, cs, W.conv1d, k.conv,
                                            k.ba, eps, W.dt_bias, W.ssm_a, k.qn, k.kn, k.beta, k.dec, H.r0, q0);
-                        // the snapshot window: by the half whose rows hold snap - 3 .. snap - 1 (half 0
-                        // still sees the old window: half 1 commits only after EV_CONV)
+                        // snapshot window: the half whose rows hold snap - 3 .. snap - 1.
+                        // Half 0 still sees the old window; half 1 commits after EV_CONV.
                         if (snap >= 0 && (nh == 1 || (h == 0) == (snap <= hv[1].r0)))
                             hipLaunchKernelGGL(pf_conv_snap, dim3((PF_CCH + 255) / 256), dim3(256), 0, st, k.y, snap, cs,
                                                snap_cs[i] + (size_t) nrl * 3 * PF_CCH, q0);
@@ -785,7 +783,7 @@ struct qz_prefill {
                         hipLaunchKernelGGL(pf_quant, dim3(np), dim3(256), 0, st, k.o, PF_HQ * PF_HD, PF_HQ * PF_HD, k.aq, k.as, Mp, H.r0);
                     }
                 }
-                {   // ssm_out / attn_output (both K = 3072 per card) + the cross-card sum
+                {   // ssm_out or attn_output, both K = 3072 per card, plus the cross-card sum
                     const char * Wo[2] = { e.C[0].wh[il].out_vals, e.C[1].wh[il].out_vals };
                     const __half * So[2] = { e.C[0].wh[il].out_scal, e.C[1].wh[il].out_scal };
                     rowpar(e, h, Wo, So, PF_G, false);
@@ -796,7 +794,7 @@ struct qz_prefill {
                     card & k = c[i];
                     CHECK(hipSetDevice(qz_dev_of(i)));
                     norm(e, i, h, W.post_norm, k.aq, (float *) nullptr);
-                    // gate + up + SwiGLU + quantize in one GEMM: input aq, output aq2 (the down projection's input)
+                    // gate, up and SwiGLU plus quantize in one GEMM, aq in and aq2 out
                     hipLaunchKernelGGL(pf_gemm<1>, dim3(PF_FF / 32, H.nty), dim3(256), 0, hs(e, i, h), k.aq, k.as, Mp, W.fg_vals, W.fg_scal,
                                        PF_D, PF_D, (float *) nullptr, 0, PF_FF, H.ty0, 0, (unsigned short *) nullptr,
                                        W.fu_vals, W.fu_scal, k.aq2, k.as2);

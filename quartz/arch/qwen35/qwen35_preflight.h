@@ -1,5 +1,5 @@
-// qwen35 start-up memory check, before the weight load: the memory each card
-// needs for the requested context against what it has free.
+// qwen35 start-up memory check, run before the weight load: compares the memory each
+// card needs for the requested context with what it has free.
 #pragma once
 #include <hip/hip_runtime.h>
 
@@ -12,12 +12,12 @@
 #include "engine.h"
 #include "loader.h"
 
-// from the per-card ledger (2026-11-22): DSpine takes 3.8 GB at any context;
-// the cycle buffers, the snapshot staging, the drafter switch and the HIP
-// runtime's own share about 1 GB; the batched prefill wants 256 MB left free
+// Per-card ledger: DSpine takes 3.8 GB at any context, and the cycle buffers, the
+// snapshot staging, the drafter switch and the HIP runtime share about 1 GB. The
+// batched prefill wants 256 MB left free.
 constexpr double QZ_PF_DSPINE = 3.85e9, QZ_PF_FIXED = 1.0e9, QZ_PF_HEADROOM = 0.25e9;
-// with --mmproj both cards grow by 1.1-1.2 GB at load and one by ~0.3 GB more
-// once an image is encoded (0.93 GB projector): its file size + 1 GB on each
+// With --mmproj both cards grow by 1.1-1.2 GB at load and one by another ~0.3 GB once
+// an image is encoded; the projector is 0.93 GB, so budget its file size + 1 GB.
 constexpr double QZ_PF_MMPROJ_EXTRA = 1.0e9;
 
 inline double qz_file_bytes(const char * p) {
@@ -25,7 +25,7 @@ inline double qz_file_bytes(const char * p) {
     return p && stat(p, &st) == 0 ? (double) st.st_size : 0.0;
 }
 
-// 0: fits (or cannot be sized here: init reports the model problem); 1: refused
+// 0: fits or cannot be sized here (init reports it); 1: refused
 inline int qz_vram_check(const char * model, int max_ctx, int steps, size_t scratch, const char * dspine, const char * mmproj) {
     qz_gguf g;
     if (!g.open(model)) return 0;
@@ -55,7 +55,7 @@ inline int qz_vram_check(const char * model, int max_ctx, int steps, size_t scra
         if (need[c] > free_b[c] && (bad < 0 || need[c] - free_b[c] > need[bad] - free_b[bad])) bad = c;
     if (bad < 0) return 0;
 
-    // the largest context whose K / V fits next to everything else on both cards
+    // the largest context whose K/V fits next to everything else on both cards
     int fit = 0;
     for (int lo = 1024, hi = max_ctx; lo <= hi; ) {
         const int mid = lo + (hi - lo) / 2;

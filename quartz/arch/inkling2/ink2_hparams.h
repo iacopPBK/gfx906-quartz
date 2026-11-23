@@ -5,7 +5,7 @@
 constexpr int D = 2304, NL = 24, HQ = 24, HKV = 8, HD = 128, NE = 128, NE_USED = 8, FFE = 1152;
 constexpr int WIN = 1024, DREL = 16, REL_EXT = 1024, NCONV = 4, ARB = 6;
 constexpr int LOOP0 = 6, LOOP1 = 18, NPASS = 3, GRANK = 64, NCTRL = 4;
-constexpr int NAPP = NL + (NPASS - 1) * (LOOP1 - LOOP0);   // layer applications (state slots) per token: 48
+constexpr int NAPP = NL + (NPASS - 1) * (LOOP1 - LOOP0);   // layer applications per token, one state slot each: 48
 constexpr int VOCAB = 201024, VOCAB_REAL = 200058;
 constexpr int32_t END_MESSAGE = 200010;                     // <|end_message|>: closes every chat message
 constexpr int32_t IMG_PAD = 200054;                         // <|unused_200054|>: the template's image placeholder (after <|content_image|>)
@@ -21,7 +21,7 @@ struct hparams {
     int32_t eos = -1;
 };
 
-// the GGUF keys quartz depends on; false (with a message per mismatch) for another shape
+// the GGUF keys quartz depends on, and a failure message for every mismatch
 static inline bool parse(const qz_gguf & g, hparams & h) {
     bool ok = true;
     auto need = [&](const char * k, int64_t want, int64_t got) {
@@ -78,7 +78,7 @@ static inline bool parse(const qz_gguf & g, hparams & h) {
     return ok;
 }
 
-// every tensor's dims and type (Q8_0 matrices, F32 vectors and tables), and no others
+// the dims and type of every tensor quartz reads, and no other tensor may be in the file
 static inline bool check_tensors(const qz_gguf & g) {
     bool ok = true;
     int n = 0;

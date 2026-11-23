@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenAI-compatible server for the quartz engine (chat / completions, SSE, tools, images).
+"""OpenAI-compatible server for the quartz engine: chat, completions, SSE, tools, images.
 Run: python3 quartz/server/quartz_server.py --model <target.gguf> [--dspine <draft.gguf>] [--mmproj <projector.gguf>]"""
 import argparse
 import base64
@@ -49,7 +49,7 @@ EMIT_CB = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.POINTER(ctypes
 
 
 class Engine:
-    """libquartz + tokenizer; generate() streams decoded text pieces."""
+    """A libquartz model and its tokenizer. generate() streams decoded text pieces."""
 
     def __init__(self, lib, model, max_ctx, slot_t, slack):
         L = ctypes.CDLL(lib)
@@ -99,7 +99,7 @@ class Engine:
         self.template = self._load_template()
 
     def drafter_name(self, drafted):
-        """The log's decode mode: qwen35 drafts with DSpine or MTP, Inkling with DSpark or not at all."""
+        """Name of the decode mode for the log line."""
         if self.arch == "qwen35":
             return "dspine" if drafted else "mtp"
         return "dspark" if drafted else "plain"
@@ -111,7 +111,7 @@ class Engine:
         if raw is None:
             return None
         src = raw.decode("utf-8")
-        # HF's {% generation %} tags (unknown to jinja2) become an always-true if
+        # jinja2 does not know HF's {% generation %} tags, so make them an always-true if
         src = re.sub(r"\{%(-?)\s*generation\s*(-?)%\}", r"{%\1 if true \2%}", src)
         src = re.sub(r"\{%(-?)\s*endgeneration\s*(-?)%\}", r"{%\1 endif \2%}", src)
 
@@ -131,7 +131,7 @@ class Engine:
         self.vision = True
 
     def add_images(self, blobs):
-        """Encoded image files -> [(id, nx, ny)] (cached by content in libquartz)."""
+        """Encode image files into [(id, nx, ny)], cached by content in libquartz."""
         out = []
         with self.lock:
             for b in blobs:
@@ -146,7 +146,7 @@ class Engine:
         return out
 
     def expand_images(self, prompt, imgs):
-        """One <|image_pad|> per image (as the template writes it) -> nx * ny."""
+        """Expand each <|image_pad|> to nx * ny tokens, one pad per image."""
         out, k = [], 0
         for t in prompt:
             if t == self.img_pad:
@@ -200,13 +200,13 @@ class Engine:
 
     def generate(self, prompt, max_new, on_text, stop_strings=(), want_ids=False, ignore_eos=False, sampling=None,
                  images=(), special=False):
-        """Blocking; on_text(str) gets text deltas (False stops); special: control tokens as text.
-        Returns (text, ids, stats, finish_reason)."""
+        """Blocking. on_text(str) gets text deltas and stops on False; special keeps
+        control tokens as text. Returns (text, ids, stats, finish_reason)."""
         dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
         hold = max((len(s) for s in stop_strings), default=1) - 1
         state = {"text": "", "sent": 0, "ids": [], "stopped": None, "gone": False}
-        # --progress N: every N s the tokens so far, the last window's tok/s and
-        # tokens per round
+        # --progress N: every N s, the token count so far, the last window's tok/s and
+        # its tokens per round
         every = getattr(Handler.args, "progress", 0) or 0
         lg = {"t0": None, "last": None, "n": 0, "wn": 0, "wr": 0}
 
@@ -268,8 +268,8 @@ class Engine:
         return state["text"], state["ids"], st, finish
 
 
-# QZ_TRACE=<dir>: one JSON file per request plus flags for answers that look
-# cut short (read with quartz/server/quartz_trace.py)
+# QZ_TRACE=<dir>: one JSON file per request, with flags for answers that look cut
+# short. Read them with quartz/server/quartz_trace.py.
 TRACE = os.environ.get("QZ_TRACE")
 ENGINE_STOP = {0: "max_new/arena", 1: "eog", 2: "abort", 3: "client gone", -1: "error"}
 ENGINE_ERROR = {"error": {"message": "the engine failed during generation (see the server log)",
@@ -280,8 +280,8 @@ KFD_NODES = "/sys/class/kfd/kfd/topology/nodes"
 
 
 def kfd_arches():
-    """gfx name per GPU node in HIP order, or None when the KFD topology is not
-    readable. HIP numbers the GPU nodes in node order, skipping the CPU node."""
+    """gfx name per GPU node, in HIP order, or None when the KFD topology cannot be
+    read. HIP numbers the GPU nodes in node order and skips the CPU node."""
     try:
         nodes = sorted(int(d) for d in os.listdir(KFD_NODES) if d.isdigit())
     except OSError:
@@ -304,9 +304,9 @@ def select_devices():
     """Keep only the gfx906 cards in the visible set, before HIP initializes.
 
     The runtime binds kernel images to the first visible device, so a card of
-    another architecture in front of the MI50s fails every launch even when the
-    work runs on an MI50. Done here because the variable is read once, at the
-    first HIP call; the engine cannot change it from inside."""
+    another architecture in front of the MI50s fails every launch, even when the
+    work runs on an MI50. It happens here because the variable is read once, at
+    the first HIP call, and the engine cannot change it from inside."""
     if os.environ.get("ROCR_VISIBLE_DEVICES") and not os.environ.get("HIP_VISIBLE_DEVICES"):
         return                                         # filtered below HIP: leave it alone
     arches = kfd_arches()
@@ -339,7 +339,7 @@ _SPECIAL_RE = re.compile(r"(<\|[^<>|\s]+\|>)")
 
 
 def escape_specials(x):
-    """Escape "<|" in message / tool strings so quoted control tokens stay text."""
+    """Escape "<|" in message and tool strings so quoted control tokens stay text."""
     if isinstance(x, str):
         return x.replace("<|", _ESC)
     if isinstance(x, list):
@@ -350,8 +350,8 @@ def escape_specials(x):
 
 
 def normalize_messages(messages):
-    """OpenAI chat messages -> what the GGUF template expects: content None ->
-    "", assistant tool-call arguments as objects (clients send JSON strings)."""
+    """Turn OpenAI chat messages into what the GGUF template expects: content None
+    becomes "", and tool-call arguments become objects instead of JSON strings."""
     out = []
     for m in messages or []:
         m = dict(m)
@@ -485,8 +485,8 @@ class Handler(BaseHTTPRequestHandler):
             s.order[i] = o
         return s, None, notes
 
-    # reasoning_effort (qwen35: xhigh / medium / low; other models: the request's value as
-    # is): chat_template_kwargs, then the request's reasoning_effort, then --reasoning-effort
+    # reasoning_effort: chat_template_kwargs, else the request field, else
+    # --reasoning-effort. qwen35 maps to xhigh / medium / low, others pass it through.
     _EFFORT = {"minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh"}
 
     def _template_kwargs(self, req):
@@ -541,8 +541,8 @@ class Handler(BaseHTTPRequestHandler):
         stop = req.get("stop") or []
         if isinstance(stop, str):
             stop = [stop]
-        # how much of this prompt matches the previous one (the prefix cache can
-        # reuse at most that much)
+        # how much of this prompt matches the previous one: the most the prefix cache
+        # can reuse
         prev = getattr(Handler, "_last_prompt", [])
         common = 0
         for a, b in zip(prev, prompt):
@@ -588,7 +588,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, out)
 
     def _trace(self, tr, chat, text, ids, st, finish, think_open, tools, max_new):
-        """Write the QZ_TRACE record; flag answers that look cut short."""
+        """Write the QZ_TRACE record and flag answers that look cut short."""
         if tr is None:
             return
         try:
@@ -626,7 +626,7 @@ class Handler(BaseHTTPRequestHandler):
             st.n_prompt, t["cache_n"], t["prompt_ms"] / 1000, "" if finish == "stop" else " | " + finish))
 
     def _timings(self, st):
-        # llama-server's convention: prompt_n = tokens processed, cache_n = taken from the prefix cache
+        # llama-server's convention: prompt_n processed, cache_n taken from the prefix cache
         return {"cache_n": st.n_cached, "prompt_n": st.n_prompt - st.n_cached, "prompt_ms": round(st.prefill_ms, 1),
                 "prompt_per_second": round(1000.0 * (st.n_prompt - st.n_cached) / st.prefill_ms, 1) if st.prefill_ms else 0,
                 "predicted_n": st.n_gen, "predicted_ms": round(st.decode_ms, 1),
@@ -676,7 +676,7 @@ class Handler(BaseHTTPRequestHandler):
             finish = "tool_calls"
         self._summary(st, finish)
         self._trace(tr, chat, text, ids, st, finish, think_open, tools, max_new)
-        if finish == "error":                    # headers are out: the error goes as an SSE event
+        if finish == "error":                    # headers are out: send it as an SSE event
             try:
                 self.wfile.write(b"data: " + json.dumps(ENGINE_ERROR).encode() + b"\n\n")
                 self.wfile.write(b"data: [DONE]\n\n")
@@ -701,7 +701,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def preflight(args):
-    """Fail fast, in words, on what would otherwise surface a minute into the load."""
+    """Fail fast with a clear message on what would surface a minute into the load."""
     def die(msg):
         log("error: " + msg)
         sys.exit(2)
@@ -728,10 +728,10 @@ def preflight(args):
 
 
 def supervise(args):
-    """Run the server as a child and start it again when its start crashes or
-    hangs (HIP initialisation occasionally does). Exceptions the child reports
-    itself, such as a refused model, are not retried; QZ_START_RETRIES (default
-    3) caps the attempts and QZ_START_TIMEOUT (default 180 s) the wait for ready."""
+    """Run the server as a child and restart it when its start crashes or hangs, as
+    HIP initialisation occasionally does. Errors the child reports itself, such as
+    a refused model, are not retried. QZ_START_RETRIES (default 3) caps the
+    attempts, QZ_START_TIMEOUT (default 180 s) the wait for ready."""
     tries = max(1, int(os.environ.get("QZ_START_RETRIES", "3")))
     wait = float(os.environ.get("QZ_START_TIMEOUT", "180"))
     stop = []
@@ -762,7 +762,7 @@ def supervise(args):
             log("start: no ready after %.0f s, killing it" % wait)
             child.kill()
         rc = child.wait()
-        if stop or rc >= 0:               # asked to quit, or the child reported its own error: retrying will not help
+        if stop or rc >= 0:               # asked to quit, or the child reported its own error: no retry
             sys.exit(rc)
         if attempt < tries:
             log("start: the server died on signal %d before ready (HIP init fault?), retrying (%d/%d)" % (-rc, attempt + 1, tries))
@@ -777,7 +777,7 @@ def main():
     ap.add_argument("--lib", default=os.path.join(REPO, "build/bin/libquartz.so"))
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8090)
-    ap.add_argument("--max-ctx", type=int, default=262144, help="context length (262144: 29.7 GB per card)")
+    ap.add_argument("--max-ctx", type=int, default=262144, help="context length, at least 1024")
     ap.add_argument("--slot-t", type=int, default=0, help="rows per cycle: 3, 4, or 0 adaptive")
     ap.add_argument("--slack", type=int, default=1, help="adaptive depth slack")
     ap.add_argument("--temp", type=float, default=1.0, help="default temperature (0 = greedy)")
@@ -785,7 +785,7 @@ def main():
     ap.add_argument("--top-p", type=float, default=0.95, help="default top-p")
     ap.add_argument("--min-p", type=float, default=0.0, help="default min-p")
     ap.add_argument("--mmproj", default=None, help="vision projector GGUF (Qwen: qwen3vl_merger, Inkling: inkling2v): image input in chat")
-    ap.add_argument("--dspine", default=None, help="DSpine draft GGUF: decode with the block drafter")
+    ap.add_argument("--dspine", default=None, help="draft GGUF (Qwen: DSpine, Inkling: DSpark)")
     ap.add_argument("--progress", type=float, default=0, metavar="SECONDS",
                     help="log decode progress every SECONDS (0: off)")
     ap.add_argument("--reasoning-effort", default="medium", choices=["xhigh", "medium", "low", "template"],
@@ -799,8 +799,8 @@ def main():
         os.environ["QZ_DSPINE"] = args.dspine
     if args.mmproj:                          # read by qz_create's memory check
         os.environ["QZ_MMPROJ"] = args.mmproj
-    # read by the HIP runtime when libquartz first touches a device: P2P over PCIe
-    # needs fine-grained PCIe memory
+    # read by the HIP runtime at libquartz's first device touch: P2P over PCIe needs
+    # fine-grained PCIe memory
     os.environ.setdefault("HSA_FORCE_FINE_GRAIN_PCIE", "1")
     os.environ.setdefault("GPU_MAX_HW_QUEUES", "8")
     preflight(args)

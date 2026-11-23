@@ -1,25 +1,23 @@
-// inkling2: batched prefill. Chunks of PF_M prompt rows through the
-// 48 applications of docs/inkling2.md, application by application (exact:
-// rows interact only through a slot's KV and conv history, and every chunk
-// row passes one application before the next starts). The Q8 GEMMs (dense
-// and grouped MoE) share one tile body on quartz's repacked Q8 planes; the norm +
-// quant and the activation plane layout come from the shared pf_gemm.h; the
-// depth mix, loop controllers, head post / convs along rows and the HD 128
-// flash attention are arch kernels.
-// Decode stays on ink2_engine::step(). Included after ink2_kernels.h / ink2_engine.h (same TU).
+// inkling2 batched prefill. Prompt rows pass through the 48 applications of
+// docs/inkling2.md in chunks of PF_M, one application at a time, which is exact: rows
+// interact only through a slot's KV and conv history. The dense and grouped MoE Q8
+// GEMMs share one tile body over the repacked Q8 planes; norm, quant and the plane
+// layout come from pf_gemm.h. The depth mix, the loop controllers, the head post and
+// the row convs, and the HD 128 flash attention are arch kernels. Decode stays on
+// ink2_engine::step(). Same TU as ink2_kernels.h and ink2_engine.h.
 #pragma once
 
-#include "kernels/pf_gemm.h"     // pf_norm_quant, pf_quant_unit, the plane types
+#include "kernels/pf_gemm.h"     // pf_norm_quant, pf_quant_unit, plane types
 
-constexpr int PF_NP = 8 * PF_M;             // max (row,expert) pairs per chunk
-constexpr int GUL = 2 * FFL;                // local gate | up rows per expert
-constexpr int NGRP_FF = (FFL + 127) / 128;  // groups of 128 in the down contraction: 5 (the last one half)
-constexpr int FFL_PAD = NGRP_FF * 128;      // 640
+constexpr int PF_NP = 8 * PF_M;             // max (row, expert) pairs per chunk
+constexpr int GUL = 2 * FFL;                // local gate and up rows per expert
+constexpr int NGRP_FF = (FFL + 127) / 128;  // 128-wide groups of the down contraction, 5, the last one half
+constexpr int FFL_PAD = NGRP_FF * 128;
 constexpr int NSC_FF = NGRP_FF * 4;         // scale slots per row of the down input planes
 
 // ------------------------------------------------------------- kernels ----
 
-// token rows of the Q8 embedding, rmsnorm * embd_norm; one block per row
+// Token rows: the Q8 embedding row, RMSNorm, then embd_norm. One block per row.
 static __global__ __launch_bounds__(256) void k_pf_embed(const int * tok, const char * ev, const __half * es,
                                                          const float * w, float eps, float * x) {
     __shared__ float red[16];
@@ -37,16 +35,16 @@ static __global__ __launch_bounds__(256) void k_pf_embed(const int * tok, const 
     for (int k = 0; k < D / 256; k++) x[(size_t) row * D + t + k * 256] = v[k] * r * w[t + k * 256];
 }
 
-// image rows: row r of the chunk takes image row irow[r] as is (no embedding norm), irow < 0 keeps the token's
+// Image rows: chunk row r copies image row irow[r], no norm; irow < 0 keeps the token.
 static __global__ __launch_bounds__(256) void k_pf_img(const int * irow, const float * img, float * x) {
     const int r = irow[blockIdx.x];
     if (r < 0) return;
     for (int i = threadIdx.x; i < D; i += 256) x[(size_t) blockIdx.x * D + i] = img[(size_t) r * D + i];
 }
 
-// mix(blocks, cur, query), one row per block: the states are [PF_M][D] batch
-// buffers at the same row; MQ query columns land in out[j*ostr + row]. The
-// row's state values stay in registers (one read of each state)
+// mix(blocks, cur; query) for a whole chunk, one block per row. Each state is a
+// [PF_M][D] buffer read at the same row; the MQ query columns land in out[j*ostr + row].
+// A state value is read once and stays in registers.
 struct pfmix { const float * p[6]; int n; const float * qy; int m; float * out; size_t ostr; };
 template <int MQ>
 static __global__ __launch_bounds__(256) void k_pf_mix2(pfmix A) {
@@ -102,8 +100,8 @@ static __global__ __launch_bounds__(256) void k_pf_mix2(pfmix A) {
         }
 }
 
-// z[j][row][2D] = [rmsnorm(cur_j); rmsnorm(msg_j)] (no gain), one block per
-// (row, j); the ctrl down GEMM reads it. grid (m, nj), job j0 + blockIdx.y
+// z[j][row][2D] = [rmsnorm(cur_j); rmsnorm(msg_j)] with no gain, the down GEMM's input.
+// One block per (row, j), grid (m, nj), job j0 + blockIdx.y.
 struct pfrms { const float * cur[4]; const float * msg; float * z; int j0; };
 static __global__ __launch_bounds__(256) void k_pf_rms2(pfrms A) {
     __shared__ float red[4 * 2];
@@ -118,15 +116,15 @@ static __global__ __launch_bounds__(256) void k_pf_rms2(pfrms A) {
     for (int i = tid; i < D; i += 256) { z[i] = c[i] * rc; z[D + i] = g[i] * rm; }
 }
 
-// g[j][row][64] = Z[j][row][2D] . wd[64][2D] (f32)
+// The controller down GEMM: g[j][row][64] = Z[j][row][2D] . wd[64][2D], in f32.
 struct pfcdn { const float * z; const float * wd0, *wd1, *wd2, *wd3; float * g; int j0, m; };
 
-// out = (1 - tanh(g.forget)).cur + tanh(g.gain).msg per row: both small f32 GEMMs vs g[j][row][64]
+// The state update: out = (1 - tanh(g.forget)) * cur + tanh(g.gain) * msg per row, in f32.
 struct pfcup { const float * g, * msg; const float * cur[4]; const float * wgs[4], * wfs[4]; float * out; int j0, m; };
 
-// controllers as 64x64-tiled f32 GEMMs (4 x 4 per thread). down: K = 2D
-// split CT_S ways, partials gp[ks][j][row][GRANK]; up sums them in order
-// (deterministic), then the gain / forget GEMMs against g and the update
+// The loop controllers as 64x64-tiled f32 GEMMs, 4 x 4 per thread. down splits K = 2D
+// CT_S ways into gp[ks][j][row][GRANK]; up sums the parts in order (deterministic), then
+// runs the gain and forget GEMMs against g and applies the update.
 constexpr int CT_S = 8, CT_KS = 2 * D / CT_S, CT_KC = 32;
 static __global__ __launch_bounds__(256) void k_pf_ctrl_down2(pfcdn a, float * gp) {
     __shared__ float sX[64][CT_KC + 1], sW[GRANK][CT_KC + 1];
@@ -162,7 +160,6 @@ static __global__ __launch_bounds__(256) void k_pf_ctrl_down2(pfcdn a, float * g
         for (int c = 0; c < 4; c++) gp[(((size_t) ks * 4 + j) * PF_M + row) * GRANK + tc + 16 * c] = acc[i][c];
     }
 }
-// g[j][row][k] = sum over the K splits, in order
 static __global__ __launch_bounds__(256) void k_pf_gsum(const float * gp, float * g, int j0, int m) {
     const int i = blockIdx.x * 256 + threadIdx.x, j = j0 + blockIdx.y;
     if (i >= m * GRANK) return;
@@ -209,9 +206,8 @@ static __global__ __launch_bounds__(256) void k_pf_ctrl_up2(pfcup a) {
     }
 }
 
-// per local head (Q / R clip, tau; the clipped R for the attention's bias) and
-// per kv head (K/V short conv along the chunk rows, clip / norm into the cache),
-// row per blockIdx.y
+// Head post, one chunk row per blockIdx.y. Local heads: the Q and R clips, tau and the
+// clipped R for the attention bias. Kv heads: the K or V conv along rows, then clip or norm.
 struct pfhp {
     const float * qr, * rr, * kr, * vr, * dk, * dv;          // [M][QL/HL../KVL/16]
     const float * qclip, * rclip, * kconv, * vconv;
@@ -271,8 +267,8 @@ static __global__ __launch_bounds__(128) void k_pf_head_post(pfhp a) {
     }
 }
 
-// attention inputs: the window (SWA: rows pos%PF_RING of the ring) or the whole
-// cache (full); out: sigmoid-gated, quantized into the attn_output planes
+// Attention inputs. The keys and values come from the sliding window (rows pos%PF_RING
+// of the ring) or from the whole cache when full is set. The output is gated and quantized.
 struct pfat {
     const float * q, * gate;                  // [M][QL], [M][QL]
     const float * rv, * relb, * sk;           // [M][HQL][DREL], [REL_EXT][DREL], [M][HQL] (bias in the kernel)
@@ -281,14 +277,14 @@ struct pfat {
     unsigned char * oq; float * os;
 };
 
-// tiled flash attention: one block per (64-row tile, q head), key tiles of
-// 64. S = Q.K^T with packed f16 dots (4 rows x 4 keys per thread), online
-// softmax per row (bias from R . relb - sink, causal / window mask, the zero sink logit),
-// O += P.V in f32 (4 rows x 8 dims per thread); the 16 lanes of a row group
-// own the same rows in both phases, so row statistics stay in registers
-constexpr int FA_K = 64, FA_QS = HD + 8;                // key tile, Q / K / V LDS row stride (halves)
+// Tiled flash attention, one block per (row tile, q head) and 64-wide key tiles.
+// S = Q.K^T uses packed f16 dots, 4 rows x 4 keys per thread. The online softmax runs
+// per row with the bias R . relb - sink, the causal and window masks and the zero sink
+// logit. O += P.V in f32. Row statistics stay in registers because the 16 lanes of a
+// row group own the same rows in both phases.
+constexpr int FA_K = 64, FA_QS = HD + 8;                // key tile, Q / K / V LDS row stride in halves
 typedef __fp16 fa_h2 __attribute__((ext_vector_type(2)));
-// RPT rows per thread (tile FA_R = 16 * RPT rows); QLO: Q as f16 hi + lo (f32-exact scores)
+// RPT rows per thread, so a tile holds 16 * RPT rows. QLO splits Q into an f16 hi and lo.
 template <int RPT, bool QLO, int FA_R = 32>
 static __global__ __launch_bounds__(16 * FA_R / RPT) void k_pf_fattn(pfat a, int m) {
     constexpr int NQ = QLO ? 2 : 1, NTH = 16 * FA_R / RPT;
@@ -422,7 +418,7 @@ static __global__ __launch_bounds__(16 * FA_R / RPT) void k_pf_fattn(pfat a, int
             }
         }
     }
-    // the sink logit (0), normalize, gate; quantized through LDS (32 lanes = 32 dims of one row)
+    // Add the zero sink logit, normalize, gate, then quantize through LDS (32 dims a warp).
     __syncthreads();
     float * sO = (float *) sQ;                             // [rows of this pass][HD] f32
     constexpr int PR = NQ * FA_R * FA_QS * 2 / (HD * 4) >= FA_R ? FA_R : 32;   // rows per pass
@@ -450,11 +446,10 @@ static __global__ __launch_bounds__(16 * FA_R / RPT) void k_pf_fattn(pfat a, int
     }
 }
 
-// short conv along the chunk rows + x update (mode: push a fresh residual
-// block, or add); row t reads rows t-1..t-3 or the slot's conv history;
-// u = own + peer (the TP2 sum, peer over P2P, f32) folded into the conv.
-// One thread per column walking CV_R rows: each partial element is read once,
-// the 3 previous inputs stay in registers
+// The short conv along the chunk rows, folded into the x update. push moves x into a
+// fresh residual block, otherwise the conv is added to x. Row t reads rows t-1..t-3 or
+// the slot's conv history, and u = own + peer is the TP2 sum, its peer part read over
+// P2P. One thread per column walks CV_R rows, so each input is read once.
 struct pfcv { const float * own, * peer; const float * w; float * hrg; float * x, * blk; int m, push; };
 constexpr int CV_R = 32;
 static __global__ __launch_bounds__(256) void k_pf_conv2(pfcv a) {
@@ -479,8 +474,8 @@ static __global__ __launch_bounds__(256) void k_pf_conv2(pfcv a) {
     }
 }
 
-// the 3 conv history rows become the chunk's last 3 inputs (rows below the
-// chunk start come from the old history); peer == nullptr for the K / V convs
+// Roll the conv history forward: its 3 rows become the chunk's last inputs, and rows
+// below the chunk start come from the old history. peer is null for K and V.
 static __global__ __launch_bounds__(256) void k_pf_commit(const float * src, const float * peer, float * hrg, int w, int m) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= w) return;
@@ -495,11 +490,10 @@ static __global__ __launch_bounds__(256) void k_pf_commit(const float * src, con
     for (int r = 0; r < 3; r++) hrg[(size_t) r * CHL + c] = v[r];
 }
 
-// router as a tiled f32 GEMM, K split RT_S ways for occupancy: block (16
-// rows, one K split) x 128 experts, 2 rows x 4 experts per thread, K chunks
-// of 32 in LDS; partials [RT_S][m][NE]. k_pf_topk then sums the splits in
-// order (deterministic), sigmoid, top NE_USED by p + bias with a wave argmax
-// (ties: the lowest expert, as the serial first-max loop), p / sum(p) * scale
+// The router as a tiled f32 GEMM, with K split RT_S ways for occupancy: one block per
+// (16 rows, one K split) over 128 experts, 2 rows x 4 experts per thread, K chunks of
+// 32 in LDS. k_pf_topk sums the partials in order, which keeps the result
+// deterministic, applies sigmoid, then picks the top NE_USED by p + bias and scales by 1/sum.
 constexpr int RT_R = 16, RT_K = 32, RT_S = 4;
 static __global__ __launch_bounds__(256) void k_pf_router2(const float * f, const float * wr, float * part, int m) {
     __shared__ float sF[RT_R][RT_K + 1], sW[NE][RT_K + 1];
@@ -536,7 +530,7 @@ static __global__ __launch_bounds__(256) void k_pf_router2(const float * f, cons
             for (int c = 0; c < 4; c++) part[((size_t) blockIdx.y * m + r) * NE + te + 32 * c] = acc[i][c];
     }
 }
-// one wave per row
+// One 64-lane wave per row.
 static __global__ __launch_bounds__(256) void k_pf_topk(const float * part, const float * bias, float scale,
                                                         int * ids, float * wts, int m) {
     const int lane = threadIdx.x & 63, r = blockIdx.x * 4 + (threadIdx.x >> 6);
@@ -570,10 +564,9 @@ static __global__ __launch_bounds__(256) void k_pf_topk(const float * part, cons
     }
 }
 
-// counting sort of the 8m (row, expert) pairs by expert: start offsets,
-// perm (pair -> slot), inv (pair -> slot too); within an expert the order is
-// arbitrary (each pair's results are independent; the row gather is what is
-// deterministic)
+// Counting sort of the chunk's (row, expert) pairs by expert: start offsets, perm and
+// inv (both pair to slot). The order inside an expert is arbitrary because each pair's
+// result stands alone; only the row gather has to stay deterministic.
 static __global__ __launch_bounds__(256) void k_pf_sort(const int * ids, int np, int * start, int * perm, int * inv) {
     __shared__ int cnt[NE], cur[NE], st[NE];
     const int tid = threadIdx.x;
@@ -592,10 +585,9 @@ static __global__ __launch_bounds__(256) void k_pf_sort(const int * ids, int np,
 }
 
 // ---- grouped expert GEMM ----
-// One tile per (expert, BN pairs). The tile table is built on device from the
-// counting sort; a GEMM block covers 64 weight rows of that expert and the
-// tile's pairs, staging weights and gathered activation rows in LDS per four
-// sub-blocks (128 K values), as the shared pf_gemm does.
+// One tile per (expert, BN pairs), with the tile table built on device from the counting
+// sort. A GEMM block covers 64 weight rows of that expert and the tile's pairs, staging
+// weights and gathered rows in LDS four sub-blocks (128 K values) at a time, as pf_gemm does.
 
 template <int BN>
 static __global__ __launch_bounds__(256) void k_pf_tiles(const int * start, int4 * tm, int * ntl) {
@@ -616,9 +608,9 @@ static __global__ __launch_bounds__(256) void k_pf_tiles(const int * start, int4
     }
 }
 
-// two tile lists: BN-wide tiles (full ones, and a remainder over BN/2) and
-// BN/2-wide tiles for remainders up to BN/2; counts ntl[0], ntl[1]
-constexpr int TM_B = PF_NP / 16 + NE;      // list B offset in tm (list A: up to np / 16 + NE tiles)
+// Two tile lists: A holds the BN-wide tiles (the full ones plus a remainder above BN/2),
+// and B the BN/2-wide tiles for remainders up to BN/2; ntl counts both.
+constexpr int TM_B = PF_NP / 16 + NE;      // list B offset in tm; list A: np / 16 + NE tiles
 template <int BN>
 static __global__ __launch_bounds__(256) void k_pf_tiles2(const int * start, int4 * tm, int * ntl) {
     __shared__ int offa[NE], offb[NE];
@@ -641,10 +633,10 @@ static __global__ __launch_bounds__(256) void k_pf_tiles2(const int * start, int
     }
 }
 
-// tile_meta: {expert, first pair slot, count}. GATHER: the activation rows come
-// from the chunk's row planes through the sorted pair list (gate_up); else the
-// planes are already slot-major (down). Blocks past the tile count exit.
-// fused SITU output of the gate_up GEMM: int8 planes [NGRP_FF][np][128] + scales
+// tile_meta is {expert, first pair slot, count}. With GATHER the activation rows come
+// from the chunk's row planes through the sorted pair list, as gate_up needs them;
+// otherwise they are already slot-major, as down has them. Blocks past the count exit.
+// Fused SITU output of gate_up: int8 planes [NGRP_FF][np][128] plus scales.
 struct pf_situo { unsigned char * q = nullptr; float * qs = nullptr; int np = 0; float beta = 0.f, lb = 0.f; };
 
 template <int BN, int GATHER, int NTT, int FS = 0>
@@ -669,8 +661,8 @@ static __device__ __forceinline__ void moe_gemm_body(
     const unsigned wrow = (unsigned) min(row0 + t / 4, N - 1);
     const unsigned w_off = wrow * (unsigned) K + (t % 4) * 32u;
     const unsigned wd_off = wrow * (unsigned) nkb + t % 4;
-    // this thread's staging slots; lanes past the tile's count read the last
-    // pair and are dropped in the epilogue (as pf_gemm clamps its rows)
+    // this thread's staging slots. Lanes past the tile's count read the last pair and
+    // are dropped in the epilogue, as pf_gemm clamps its rows
     unsigned xo[NXF], xsc[NXF];
     bool xok[NXF];
 #pragma unroll
@@ -705,7 +697,7 @@ static __device__ __forceinline__ void moe_gemm_body(
         }
     };
     auto store = [&]() {
-        // K slot XOR the row group: the row groups sharing a wave hit distinct banks
+        // K slot XOR the row group: row groups in one wave hit distinct banks
         const int ks = (t % 4) ^ ((t / 4 / RR) & 3);
         sWlo[t / 4][ks] = pwlo; sWhi[t / 4][ks] = pwhi; sWd[t % 4][t / 4] = pwd;
 #pragma unroll
@@ -759,10 +751,11 @@ static __device__ __forceinline__ void moe_gemm_body(
         __syncthreads();
     }
     if constexpr (FS) {
-        // tile rows 0..31 are gate rows 32*bx.., rows 32..63 their up rows (gu_row):
-        // both halves to LDS; every thread then does SITU + the per-32 quant (one group per pair)
+        // tile rows 0..31 hold gate rows and rows 32..63 their up rows (gu_row). Stage
+        // both halves in LDS; every thread then applies SITU and the per-32 quant, one
+        // group per pair
         __shared__ float sA[32][BN + 1];          // gate [j][slot]
-        float * sU = (float *) sX;                 // up [slot][j ^ slot] (the staging buffer is free now)
+        float * sU = (float *) sX;                 // up [slot][j ^ slot], the staging buffer is free
 #pragma unroll
         for (int n = 0; n < NH; n++) {
             const int slot = tx + NT * n;
@@ -793,7 +786,7 @@ static __device__ __forceinline__ void moe_gemm_body(
     for (int n = 0; n < NH; n++) {
         const int slot = tx + NT * n;
         if (slot >= cnt) continue;
-        if (row0 + 64 > N) {                       // partial weight tile (N % 64 != 0): per-row guard
+        if (row0 + 64 > N) {                       // partial weight tile (N % 64 != 0): guard each row
 #pragma unroll
             for (int r = 0; r < RR; r++) if (row0 + rb + r < N) C[(size_t) (tl.y + slot) * ldc + row0 + rb + r] = acc[r][n];
             continue;
@@ -815,8 +808,8 @@ static __global__ __launch_bounds__(256, BN <= 32 ? 3 : 2) void k_pf_moe_gemm(
     moe_gemm_body<BN, GATHER, NTT, FS>(tm[blockIdx.y], W, sw, perm, Ag, sag, Mp, K, C, ldc, N, so);
 }
 
-// dense projections through the same tile body: one launch for up to 6 jobs
-// (blockIdx.z), token tiles of 64 from blockIdx.y; a job's last weight tile may be partial
+// Dense projections through the same tile body. One launch runs up to 8 jobs along
+// blockIdx.z, with 64-row token tiles along blockIdx.y; a job's last weight tile may be partial.
 struct dgjob { const char * W; const __half * sw; const int8_t * A; const float * as; float * C; int ldc, N, K; };
 struct dgjobs { dgjob j[8]; };
 static __global__ __launch_bounds__(256, 2) void k_pf_dgemm(dgjobs J, int m) {
@@ -826,8 +819,8 @@ static __global__ __launch_bounds__(256, 2) void k_pf_dgemm(dgjobs J, int m) {
     moe_gemm_body<64, 0, 16>(make_int4(0, a0, min(64, m - a0), 0), g.W, g.sw, nullptr, g.A, g.as, PF_M, g.K, g.C, g.ldc, g.N);
 }
 
-// per row, the weighted sum of its pairs' partials in the router's selection
-// order (deterministic; no atomics) -> the card's partial for the exchange
+// Per row, the weighted sum of its pairs' partials in the router's selection order. That
+// order fixes the rounding and there are no atomics, so the sum is deterministic.
 static __global__ __launch_bounds__(256) void k_pf_moe_reduce(const float * y, const int * inv, const float * wts, float * out) {
     const int r = blockIdx.x;
     const int * iv = inv + (size_t) r * NE_USED;
@@ -850,16 +843,16 @@ struct pf_card {
     float * Gb;                        // [4][PF_M][GRANK]
     float * F, * FN, * PART[2];        // [PF_M][D]
     float * QR, * GR, * Q, * RR, * SK, * KR, * VR, * DK, * DV, * TB;
-    pf_plane INP[3], FF, AT;           // input planes (K = D), ffn (K = D), attn out (K = QL)
+    pf_plane INP[3], FF, AT;           // input planes (K = D), ffn (K = D), attn output (K = QL)
     unsigned char * APQ; float * APS;  // per-pair situ planes [PF_NP][FFL], [PF_NP][FFL/32]
     float * GP, * YD;                  // controller K-split partials [CT_S][4][PF_M][GRANK], expert down out [PF_NP][D]
     int * IDS; float * WTS;            // [PF_M][NE_USED]
     int * PERM, * INV, * START;        // [PF_NP], [PF_NP], [NE + 1]
     int * TOK;
-    int4 * TM; int * NTL;              // expert tiles: {expert, first pair, count}, count
+    int4 * TM; int * NTL;              // expert tiles {expert, first pair, count}, and their count
 };
 
-// rows of out (row stride ostride) = RMSNorm(x; w)
+// out rows with stride ostride = RMSNorm(x; w), one block per row
 static __global__ __launch_bounds__(256) void k_pf_rmsw(const float * x, const float * w, float * out, int ostride, float eps) {
     __shared__ float red[16];
     const float * xr = x + (size_t) blockIdx.x * D;
@@ -876,18 +869,18 @@ struct ink2_pf {
     ink2_engine * E = nullptr;
     std::atomic<bool> * abort = nullptr;
     pf_card B[2];
-    int bnx = 0;                       // exchange parity (double-buffered partials)
-    // the DSpark drafter's target features per prompt row, [row][4][D]: the residual
-    // entering applications 5, 23, 41 and the head input output_norm(mix(blocks, x; out_q)).
-    // dtaps: card 0, the chunk's rows from 0, then on_chunk(p0, m) (the drafter's context fill)
+    int bnx = 0;                       // exchange parity, the partials are double-buffered
+    // The DSpark drafter's target features per prompt row, [row][4][D]: the residual
+    // entering applications 5, 23 and 41, and the head input output_norm(mix(blocks, x;
+    // out_q)). Card 0 fills the rows from row 0, then runs on_chunk(p0, m).
     float * dtaps = nullptr;
     std::function<void(int, int)> on_chunk;
     float * tapd = nullptr;            // card 0: one chunk's head mixes
-    // the prompt's image rows: irow[pos] (host, per prompt position, -1: a token) indexes
-    // img[c] (each card's copy, [rows][D]); null: text only
+    // The prompt's image rows. irow[pos] on the host, one entry per prompt position, is
+    // -1 for a token and otherwise indexes img[c], each card's [rows][D] copy; null is text only.
     const int * irow = nullptr;
     const float * img[2] = {};
-    int * irw[2] = {};                 // the chunk's irow on each card
+    int * irw[2] = {};                 // the chunk's irow, one per card
     bool tapping() const { return dtaps != nullptr; }
     void tap(int k, int p0, int m) {
         if (!tapping()) return;
@@ -965,14 +958,12 @@ struct ink2_pf {
         return true;
     }
 
-    // ---- launch helpers (current device = card c)
-    // ---- one application: all m chunk rows of positions pos0..pos0+m-1
-    // through state slot `slot` of physical layer ip
-    // ---- launch helpers (current device = card c)
+    // ---- launch helpers (current device = card c), then one application: all m chunk
+    // rows of positions pos0..pos0+m-1 through state slot `slot` of physical layer ip
     dgjob djob(const qw & W, const unsigned char * av, const float * as, float * C, int ldc) {
         return dgjob{W.v, W.s, (const int8_t *) av, as, C, ldc, (int) W.N, (int) W.K};
     }
-    // several dense GEMMs in one launch (up to 8 jobs)
+    // several dense GEMMs in one launch, up to 8 jobs
     void dgemm(int c, std::initializer_list<dgjob> js, int m) {
         dgjobs J{};
         int n = 0, mx = 0;
@@ -1002,7 +993,8 @@ struct ink2_pf {
     template <int BN, int G>
     void moe_gemm(pf_card & b, hipStream_t st, const qw & W, const unsigned char * aq, const float * as,
                   int Mp, int K, float * C, int ldc, int N, int yt, const int4 * tm, const int * ntl, const pf_situo & so) {
-        // 4 x 4 (rows x pairs) per thread: 16 pair lanes; the gate_up GEMM (G = 1) ends in the fused SITU
+        // 4 rows x 4 pairs per thread, so 16 pair lanes. The gate_up GEMM (G = 1) ends
+        // in the fused SITU
         if constexpr (G == 1)
             k_pf_moe_gemm<BN, G, 16, 1><<<dim3(N / 64, yt), 256, 0, st>>>(tm, ntl, W.v, W.s, b.PERM, (const int8_t *) aq, as, Mp, K, C, ldc, N, so);
         else
@@ -1076,7 +1068,7 @@ struct ink2_pf {
                 k_pf_ctrl_up2<<<dim3((m + 63) / 64, D / 64, 3), 256, 0, st>>>(Ua);
                 for (int j = 0; j < 3; j++) in[j] = b.CT + (size_t) j * PF_M * D;
             }
-            // norm + int8 quant per stream, then the Q8 GEMMs
+            // norm and int8 quant per stream, then the Q8 GEMMs
             const int ik = full || msg ? 1 : 0, ivv = full || msg ? 2 : 0;
             if (full) {
                 normq(c, in[0], L.qn, b.INP[0], m);
@@ -1094,7 +1086,7 @@ struct ink2_pf {
                                 djob(L.rel, b.INP[0].q, b.INP[0].s, b.RR, HQL * DREL), djob(L.k, b.INP[1].q, b.INP[1].s, b.KR, KVL),
                                 djob(L.v, b.INP[2].q, b.INP[2].s, b.VR, KVL), djob(L.sink, b.INP[0].q, b.INP[0].s, b.SK, HQL),
                                 djob(L.kcp, b.INP[1].q, b.INP[1].s, b.DK, HKVL * NCONV), djob(L.vcp, b.INP[2].q, b.INP[2].s, b.DV, HKVL * NCONV)}, m);
-            // head post: clips, tau, bias tables, K/V convs into the cache
+            // head post with clips, tau and bias tables, then the K/V convs into the cache
             pfhp h{};
             h.qr = b.QR; h.rr = b.RR; h.kr = b.KR; h.vr = b.VR;
             h.dk = full ? b.DK : nullptr; h.dv = full ? b.DV : nullptr;
@@ -1108,7 +1100,7 @@ struct ink2_pf {
             k_pf_head_post<<<dim3(HQL + 2 * HKVL, m), 128, 0, st>>>(h);
             commit(c, b.KR, nullptr, h.hist + H_K, KVL, m);
             commit(c, b.VR, nullptr, h.hist + H_V, KVL, m);
-            // attention, then attn_output (row-parallel: partials per card)
+            // attention, then attn_output; rows are split, so each card keeps a partial
             pfat t{};
             t.q = b.Q; t.gate = b.GR; t.kc = K.kc[slot]; t.vc = K.vc[slot];
             t.pos0 = pos0; t.full = full; t.oq = b.AT.q; t.os = b.AT.s;
@@ -1164,12 +1156,12 @@ struct ink2_pf {
             }
             pf_norm_quant<<<m, 256, 0, st>>>(f, D, L.ffn, E.hp.eps, D, (int8_t *) b.FF.q, b.FF.s, PF_M, b.FN, 0);
             {
-                k_pf_router2<<<dim3((m + RT_R - 1) / RT_R, RT_S), 256, 0, st>>>(b.FN, L.gin, b.YD, m);   // YD: scratch until the down GEMM
+                k_pf_router2<<<dim3((m + RT_R - 1) / RT_R, RT_S), 256, 0, st>>>(b.FN, L.gin, b.YD, m);   // YD is scratch until the down GEMM
                 k_pf_topk<<<(m + 3) / 4, 256, 0, st>>>(b.YD, L.pb, E.hp.route_scale, b.IDS, b.WTS, m);
             }
             k_pf_sort<<<1, 256, 0, st>>>(b.IDS, np, b.START, b.PERM, b.INV);
             moe_tiles(c, bn);
-            pf_situo so;            // SITU fused into the gate_up GEMM's epilogue -> the down GEMM's planes
+            pf_situo so;            // SITU fused into the gate_up GEMM's epilogue, feeding the down GEMM's planes
             so.q = b.APQ; so.qs = b.APS; so.np = np; so.beta = E.hp.situ_beta; so.lb = E.hp.situ_lin_beta;
             moe(c, bn, 1, L.gu, b.FF.q, b.FF.s, PF_M, D, nullptr, GUL, GUL, yt, so);
             moe(c, bn, 0, L.dn, b.APQ, b.APS, np, FFL, b.YD, D, D, yt);
@@ -1192,7 +1184,7 @@ struct ink2_pf {
         }
     }
 
-    // the head for the chunk's last row only (decode kernels, row offsets)
+    // The head for the chunk's last row only, using the decode kernels on row offsets
     void head_last(const ink2_engine::seq & S, int m) {
         ink2_engine & E = *this->E;
         const size_t off = (size_t)(m - 1) * D;
@@ -1214,8 +1206,8 @@ struct ink2_pf {
         for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(E.C[c].st)); }
     }
 
-    // ---- the batched prefill of prompt rows a .. n-1 (rows below a already in
-    // the KV and conv history); logits: the head on row n-1. false if aborted
+    // ---- the batched prefill of prompt rows a .. n-1. Rows below a are already in
+    // the KV and conv history. logits asks for the head on row n-1; false if aborted
     bool prefill(const int32_t * prompt, int a, int n, bool logits) {
         ink2_engine & E = *this->E;
         for (int p0 = a; p0 < n; p0 += PF_M) {
@@ -1257,7 +1249,7 @@ struct ink2_pf {
                 }
                 for (int ip = LOOP0; ip < LOOP1; ip++) {
                     const int slot = pass == 0 ? ip : NL + (pass - 1) * (LOOP1 - LOOP0) + (ip - LOOP0);
-                    if ((pass == 1 && ip == 11) || (pass == 2 && ip == 17)) tap(pass, p0, m);   // visits 23, 41
+                    if ((pass == 1 && ip == 11) || (pass == 2 && ip == 17)) tap(pass, p0, m);   // visits 23 and 41
                     layer(slot, ip, p0, m, S);
                 }
             }

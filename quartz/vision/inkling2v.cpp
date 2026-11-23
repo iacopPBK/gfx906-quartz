@@ -1,13 +1,11 @@
-// inkling2v image encoder (see inkling2v.h), as llama.cpp's mtmd inkling2v graph:
-// patches of 20 px (the image at its own size, padded to a multiple of 40 with
-// -1 before the normalization), + the 32 x 32 position table resized bilinearly
-// (half-pixel centers) to the patch grid, a CLS row first, pre-LayerNorm, 23
-// pre-norm layers (LayerNorm, attention with q / k 2D RoPE: dims 0..31 by the
-// column, 32..63 by the row, 1-based, CLS at 0; layer scales on both branches;
-// GELU-erf FFN), then the CLS row dropped, 2 x 2 patches concatenated
-// ((dy, dx) = (0,0), (0,1), (1,0), (1,1)) and the 2-layer GELU-erf MLP.
-// rocBLAS f16 GEMMs with f32 accumulation; attention as two batched GEMMs per
-// query chunk with an f32 softmax between. One card (the encoder is 0.3 B).
+// inkling2v image encoder, see inkling2v.h, matching llama.cpp's mtmd inkling2v graph.
+// 20 px patches, the image at its own size padded to a multiple of 40 with -1 before the
+// normalization, plus the 32 x 32 position table resized bilinearly to the patch grid. A
+// CLS row comes first, then pre-LayerNorm and 23 pre-norm layers: LayerNorm, attention
+// with q / k 2D RoPE on 1-based positions (CLS at 0), layer scales on both branches, then
+// a GELU-erf FFN. The CLS row is dropped, 2 x 2 patches are concatenated and a 2-layer
+// GELU-erf MLP follows. Attention is two batched rocBLAS f16 GEMMs with f32 accumulation
+// per query chunk, an f32 softmax between. One card: the encoder is 0.3 B.
 #include "inkling2v.h"
 #include "loader.h"
 #include "core/devices.h"
@@ -20,7 +18,7 @@
 #include <hip/hip_fp16.h>
 #include <rocblas/rocblas.h>
 
-#include "stb/stb_image.h"   // the implementation is in qwen3vl.cpp
+#include "stb/stb_image.h"   // implementation in qwen3vl.cpp
 
 #include <algorithm>
 #include <chrono>
@@ -39,13 +37,12 @@ namespace inkling2v {
 static constexpr int V_D = 1024, V_H = 16, V_HD = 64, V_PATCH = 20, V_MERGE = 2, V_GRID = 32, V_K = 3 * V_PATCH * V_PATCH;
 static constexpr int V_FF = 4096, V_MM = 4 * V_D;
 static constexpr float V_THETA = 10000.f;
-static constexpr size_t V_SBUF = (size_t) 64 << 20;     // attention scores per chunk (floats)
+static constexpr size_t V_SBUF = (size_t) 64 << 20;     // score buffer per chunk, floats
 
-// ------------------------------------------------------------- kernels ----
+// ---- kernels ----
 
-// pixels (w0 x h0, RGB) -> patch rows [N][1200] f16, patch n = py * pw + px, columns
-// (c, ky, kx) as the conv kernel [1024][3][20][20]; outside the image: -1 (the
-// reference pads the 0..255 pixels with -1, then normalizes)
+// Pixels (w0 x h0, RGB) to patch rows [N][1200] f16, patch n = py * pw + px, columns in
+// (c, ky, kx) conv order. Outside the image the pixel is -1, like the reference padding.
 __global__ void __launch_bounds__(256) v_patchify(const unsigned char * __restrict__ rgb, int w0, int h0, int pw,
                                                   __half * __restrict__ P) {
     const int n = blockIdx.x, py = n / pw, px = n % pw;
@@ -57,8 +54,8 @@ __global__ void __launch_bounds__(256) v_patchify(const unsigned char * __restri
     }
 }
 
-// row 0: CLS + its position; rows 1 .. N: += the position table at the patch,
-// bilinear as ggml_interpolate (half-pixel centers, clamped) when the grid is not 32 x 32
+// Row 0 gets CLS plus its position. Rows 1 .. N add the position table sampled at the
+// patch, bilinear with half-pixel centers and clamping as ggml_interpolate.
 __global__ void __launch_bounds__(256) v_pos(float * __restrict__ x, const float * __restrict__ cls,
                                              const float * __restrict__ cls_pos, const float * __restrict__ grid,
                                              int pw, int ph) {
@@ -82,7 +79,7 @@ __global__ void __launch_bounds__(256) v_pos(float * __restrict__ x, const float
         xr[d] += a[d] * (1 - dx) * (1 - dy) + b[d] * dx * (1 - dy) + c[d] * (1 - dx) * dy + e[d] * dx * dy;
 }
 
-// LayerNorm of one f32 row of V_D (weight + bias); out f32 (may alias x) or f16
+// LayerNorm of one f32 row of V_D with weight and bias; out may alias x, f32 or f16.
 template <typename T>
 __global__ void __launch_bounds__(256) v_ln(const float * __restrict__ x, const float * __restrict__ w,
                                             const float * __restrict__ b, float eps, T * __restrict__ out) {
@@ -113,8 +110,8 @@ __global__ void __launch_bounds__(256) v_ln(const float * __restrict__ x, const 
     }
 }
 
-// q / k / v (f32 [N][V_D] each, + bias) -> f16; q and k with the 2D RoPE (ggml mode 0:
-// adjacent pairs): dims 0..31 at the column position, 32..63 at the row position
+// Adds the q / k / v biases, applies the 2D RoPE to q and k (ggml mode 0, adjacent
+// pairs) and writes f16. Dims 0..31 use the column position, 32..63 the row position.
 __global__ void __launch_bounds__(256) v_qkv(const float * __restrict__ y, size_t plane, const float * __restrict__ qb,
                                              const float * __restrict__ kb, const float * __restrict__ vb, int pw,
                                              __half * __restrict__ Q, __half * __restrict__ K, __half * __restrict__ V) {
@@ -122,9 +119,9 @@ __global__ void __launch_bounds__(256) v_qkv(const float * __restrict__ y, size_
     const int pwr = r == 0 ? 0 : (r - 1) % pw + 1, phr = r == 0 ? 0 : (r - 1) / pw + 1;
     const float * yq = y + (size_t) r * V_D, * yk = yq + plane, * yv = yq + 2 * plane;
     const size_t o = (size_t) r * V_D;
-    for (int idx = threadIdx.x; idx < V_D / 2; idx += 256) {      // one pair per thread
-        const int h = idx / (V_HD / 2), j = idx % (V_HD / 2);     // pair j of head h
-        const int half = j / 16, i = j % 16;                      // half 0: column, 1: row; pair i of it
+    for (int idx = threadIdx.x; idx < V_D / 2; idx += 256) {   // one pair per thread
+        const int h = idx / (V_HD / 2), j = idx % (V_HD / 2);   // pair j of head h
+        const int half = j / 16, i = j % 16;   // half 0: column, 1: row, pair i of it
         const float p = (float) (half == 0 ? pwr : phr);
         const float ang = p * powf(V_THETA, -2.f * (float) i / 32.f);
         const float cs = cosf(ang), sn = sinf(ang);
@@ -137,7 +134,7 @@ __global__ void __launch_bounds__(256) v_qkv(const float * __restrict__ y, size_
     }
 }
 
-// rows of n scores (already scaled) -> softmax as f16
+// Softmax of rows of n already-scaled scores, written as f16.
 __global__ void __launch_bounds__(256) v_softmax(const float * __restrict__ s, int n, __half * __restrict__ p) {
     __shared__ float red[4];
     const float * r = s + (size_t) blockIdx.x * n;
@@ -160,7 +157,7 @@ __global__ void __launch_bounds__(256) v_softmax(const float * __restrict__ s, i
     for (int j = threadIdx.x; j < n; j += 256) o[j] = __float2half(expf(r[j] - m) * il);
 }
 
-// x += ls * (y + b)  (b, ls per column of V_D; either may be null)
+// x += ls * (y + b), with b and ls per column of V_D and either possibly null.
 __global__ void __launch_bounds__(256) v_resid(float * __restrict__ x, const float * __restrict__ y, const float * __restrict__ b,
                                                const float * __restrict__ ls, size_t n) {
     const size_t i = (size_t) blockIdx.x * 256 + threadIdx.x;
@@ -173,7 +170,7 @@ __global__ void __launch_bounds__(256) v_resid(float * __restrict__ x, const flo
 
 __device__ __forceinline__ float v_gelu_erf(float v) { return 0.5f * v * (1.f + erff(v * 0.70710678118654752f)); }
 
-// out = gelu_erf(y + b) as f16 (b may be null); grid (d / 256, rows)
+// out = gelu_erf(y + b) as f16, b possibly null; grid is (d / 256, rows).
 __global__ void __launch_bounds__(256) v_bias_gelu(const float * __restrict__ y, const float * __restrict__ b,
                                                    int d, __half * __restrict__ out) {
     const int i = blockIdx.x * 256 + threadIdx.x;
@@ -182,8 +179,8 @@ __global__ void __launch_bounds__(256) v_bias_gelu(const float * __restrict__ y,
     out[o] = __float2half(v_gelu_erf(y[o] + (b ? b[i] : 0.f)));
 }
 
-// the patch rows (x rows 1 ..) of each 2 x 2 block concatenated -> [T][4 V_D] f16,
-// token t = by * (pw / 2) + bx, part (dy, dx) at (2 dy + dx) V_D
+// Concatenates the patch rows (x rows 1 ..) of each 2 x 2 block into [T][4 V_D] f16, with
+// token t = by * (pw / 2) + bx and part (dy, dx) at offset (2 dy + dx) V_D.
 __global__ void __launch_bounds__(256) v_merge(const float * __restrict__ x, int pw, __half * __restrict__ M) {
     const int t = blockIdx.x, bw = pw / V_MERGE, by = t / bw, bx = t % bw;
     for (int e = threadIdx.x; e < V_MM; e += 256) {
@@ -193,7 +190,7 @@ __global__ void __launch_bounds__(256) v_merge(const float * __restrict__ x, int
     }
 }
 
-// --------------------------------------------------------------- host ----
+// ---- host ----
 
 namespace {
 struct vlayer {
@@ -221,7 +218,7 @@ struct qz_vision {
     double ms = 0;
 };
 
-// the projector type: clip.projector_type, or clip.vision.projector_type (newer converters)
+// The projector type: clip.projector_type if set, else clip.vision.projector_type.
 static std::string proj_type(const qz_gguf & g) {
     const std::string t = g.str("clip.projector_type");
     return t.empty() ? g.str("clip.vision.projector_type") : t;
@@ -277,7 +274,7 @@ qz_vision * qz_vision_load(const char * path) {
     v->cls = f32("v.class_embd", V_D); v->cls_pos = f32("v.class_position_embd.weight", V_D);
     v->pos = (const float *) get("v.position_embd.weight", GGML_TYPE_F32, V_D, (int64_t) V_GRID * V_GRID * V_D);
     v->pre_w = f32("v.pre_ln.weight", V_D); v->pre_b = f32("v.pre_ln.bias", V_D);
-    v->mm1_w = f16("mm.1.weight", V_MM, V_MM); v->mm1_b = f32("mm.1.bias", V_MM);   // biases: optional
+    v->mm1_w = f16("mm.1.weight", V_MM, V_MM); v->mm1_b = f32("mm.1.bias", V_MM);
     const qz_dev_tensor * m2 = v->ld.get("mm.2.weight");
     if (!m2 || m2->type != GGML_TYPE_F16 || m2->ne0 != V_MM) return fail("missing mm.2.weight");
     v->n_out = (int) m2->ne1;
@@ -336,8 +333,8 @@ int qz_vision_encode_rgb(qz_vision * v, const unsigned char * rgb, int w, int h,
     const auto t0 = std::chrono::steady_clock::now();
     const int al = V_PATCH * V_MERGE;
     auto up = [&](int a) { return (a + al - 1) / al * al; };
-    // the image at its own size; past the token limit scaled down (calc_size_preserved_ratio,
-    // align 40, Pillow bicubic), as the reference
+    // The image at its own size; past the token limit it is scaled down by
+    // calc_size_preserved_ratio (align 40, Pillow bicubic), as the reference does.
     std::vector<unsigned char> img;
     int w0 = w, h0 = h;
     const int64_t maxp = (int64_t) v->max_tok * al * al;
@@ -372,7 +369,8 @@ int qz_vision_encode_rgb(qz_vision * v, const unsigned char * rgb, int w, int h,
     v_pos<<<N, 256, 0, s>>>(v->x, v->cls, v->cls_pos, v->pos, pw, ph);
     v_ln<float><<<N, 256, 0, s>>>(v->x, v->pre_w, v->pre_b, v->eps, v->x);
     const size_t nd = (size_t) N * V_D;
-    const int qc = (int) std::min<size_t>(N, V_SBUF / ((size_t) V_H * N));       // queries per attention chunk
+    // Queries per attention chunk, limited by the score buffer.
+    const int qc = (int) std::min<size_t>(N, V_SBUF / ((size_t) V_H * N));
     const float scale = 1.f / std::sqrt((float) V_HD), one = 1.f, zero = 0.f;
     for (const vlayer & l : v->L) {
         v_ln<__half><<<N, 256, 0, s>>>(v->x, l.ln1_w, l.ln1_b, v->eps, v->h);
@@ -381,7 +379,7 @@ int qz_vision_encode_rgb(qz_vision * v, const unsigned char * rgb, int w, int h,
         v_qkv<<<N, 256, 0, s>>>(v->y, nd, l.q_b, l.k_b, l.v_b, pw, v->Q, v->K, v->V);
         for (int q0 = 0; q0 < N; q0 += qc) {
             const int nq = std::min(qc, N - q0);
-            // S[h][i][j] = scale q_i . k_j  (column-major: keys x queries per head)
+            // S[h][i][j] = scale * q_i . k_j, column-major over keys x queries per head.
             VBLAS(rocblas_gemm_strided_batched_ex(v->blas, rocblas_operation_transpose, rocblas_operation_none, N, nq, V_HD, &scale,
                                                   v->K, rocblas_datatype_f16_r, V_D, V_HD,
                                                   v->Q + (size_t) q0 * V_D, rocblas_datatype_f16_r, V_D, V_HD, &zero,
@@ -389,7 +387,7 @@ int qz_vision_encode_rgb(qz_vision * v, const unsigned char * rgb, int w, int h,
                                                   v->S, rocblas_datatype_f32_r, N, (rocblas_stride) nq * N, V_H,
                                                   rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0));
             v_softmax<<<V_H * nq, 256, 0, s>>>(v->S, N, v->Pa);
-            // O[i][h 64 + d] = sum_j P[h][i][j] V[j][h 64 + d]
+            // O[i][h * 64 + d] = sum_j P[h][i][j] V[j][h * 64 + d]
             VBLAS(rocblas_gemm_strided_batched_ex(v->blas, rocblas_operation_none, rocblas_operation_none, V_HD, nq, N, &one,
                                                   v->V, rocblas_datatype_f16_r, V_D, V_HD,
                                                   v->Pa, rocblas_datatype_f16_r, N, (rocblas_stride) nq * N, &zero,

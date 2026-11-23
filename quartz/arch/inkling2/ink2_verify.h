@@ -1,49 +1,44 @@
-// inkling2 verify: the speculative decoding round's VR = 8 rows (the anchor token
-// and the drafter's 7 drafts, at positions pos .. pos + 7) through all 48
-// applications and the head, in one launch per card. Every row is the plain
-// decode computation on its own copy of the per-token activations (a constant
-// byte stride RS from row 0, ink2_engine::alloc) and the bodies are the decode
-// ones, so each row is bit-identical to a sequential ink2_cycle at its position:
-// row r sees the KV rows <= pos + r (its own K / V rows are in the cache before
-// the attention phase) and the conv history window of item 2.
+// inkling2 verify kernel. Runs the VR = 8 rows of a speculative round (the anchor
+// and 7 drafts, positions pos .. pos + 7) through the 48 layer applications and the
+// head, in one launch per card. Each row runs the decode bodies on its own copy of
+// the activations (byte stride RS from row 0), so it is bit-identical to a single
+// ink2_cycle step at its position. Row r sees KV rows up to pos + r; its own K and V
+// are written before the attention phase.
 //
-// The row replicas are built on the host (ink2_engine::vplan): the application
-// table holds one entry per (row, application) with every activation pointer
-// shifted by the row's stride, so the chain / grid bodies run unchanged.
-// Included from ink2_engine.h after ink2_cycle.h.
+// The host builds the row replicas in ink2_engine::vplan: one table entry per (row,
+// application), every activation pointer shifted by the row's stride, so the chain and
+// grid bodies run unchanged. Included from ink2_engine.h after ink2_cycle.h.
 #pragma once
 
-// the bodies round like ink2_cycle.h (fp contract on), restored at the end
+// fp contract(on) so the bodies round like ink2_cycle.h; contract(fast) again at the end
 #pragma clang fp contract(on)
 
 #define VR_NI __device__ __forceinline__
 constexpr int VR = 8;
 #ifndef VG_S
 #define VG_S 2
-#endif                     // the verify rows: the anchor + 7 drafts
+#endif
 
-struct vtok { int t[VR]; float tau[VR]; };        // per row: the token, its tau (host tau_at)
+struct vtok { int t[VR]; float tau[VR]; };        // tau from the host's tau_at
 
-// The verify arguments: the decode args (tab -> the VR-row table, cpart -> VR
-// groups, aq3 / hq / ... as row-0 pointers) plus the row-replicated buffers.
+// The verify arguments: the decode args with tab at the VR-row table, cpart at the VR
+// groups, aq3 / hq / ... at row 0, plus the row-replicated buffers.
 struct vargs {
     cyc_args A;
-    int rs, rsf;                          // the activation row stride: bytes, floats
-    float * uh;                           // [NAPP][VR][CHL]: each row's conv input
-    float * LOGV;                         // [VR][nvalid]: the head logits per row
-    float * vtap;                         // card 0: the rows' [4][D] drafter features, else null
-    float * hist;                         // the histories' base (the table's hist pointers are the slot's)
-    float * ws;                           // the attention waves' states (v_attn_a / v_attn_b)
+    int rs, rsf;                          // the activation row stride, in bytes and floats
+    float * uh;                           // [NAPP][VR][CHL], each row's conv input
+    float * LOGV;                         // [VR][nvalid], the head logits per row
+    float * vtap;                         // card 0's [VR][4][D] drafter features, else null
+    float * hist;                         // base of the histories [NAPP][3][CHL]. Table pointers per slot.
+    float * ws;                           // the wave states of v_attn_a and v_attn_b
 };
 
-// one entry of the VR-row table (row r's application ai)
 #define VROW(tab, r, ai) ((CK appk *) (tab) + (size_t) (r) * napp + (ai))
 
-// The conv history sequence of a verify row (item 2): s[0..2] are the slot's
-// history (oldest first), s[3 + k] is row k's conv input u_k. Row r reads
-// h0 = s[r], h1 = s[r + 1], h2 = s[r + 2], so it needs rows r - 3 .. r - 1 at
-// most: their u is still in memory (the raw projection for the K / V convs, the
-// rows' TP2 sums for the post convs), so no row waits on another.
+// The conv history sequence of a verify row: s[0..2] are the slot's history, oldest
+// first, s[3 + k] is row k's conv input u_k. Row r reads h0 = s[r], h1 = s[r + 1] and
+// h2 = s[r + 2], so it needs rows r - 3 .. r - 1 at most. Their u is still in memory, so
+// no row waits: the raw projection for the K and V convs, the TP2 sums for the post convs.
 VR_NI float v_s3(const float * hbase, const float * own0, const float * peer0, int i, int k, int rsf) {
     if (k < 3) return hbase[(size_t) k * CHL + i];
     const int q = k - 3;
@@ -75,7 +70,7 @@ VR_NI void v_cxconv(const float * own0, const float * peer0, const float * w, fl
     }
 }
 
-// d_xconv_blk<512> with the verify window (the last ffn sum, one block per row)
+// d_xconv_blk<512> with the verify window, one block per row for the last ffn sum
 VR_NI void v_xconv_b0(const float * own0, const float * peer0, const float * w, const float * hbase, float * x, float * blk,
                       int tid, int r, int rsf, float * uhrow) {
     constexpr int NT = 512, NEL = (D + NT - 1) / NT;
@@ -84,7 +79,7 @@ VR_NI void v_xconv_b0(const float * own0, const float * peer0, const float * w, 
     float4 wi[NEL];
     #pragma unroll
     for (int k = 0; k < NEL; k++) {
-        const int i = min(tid + NT * k, D - 1);          // clamped: unconditional loads, the stores guarded
+        const int i = min(tid + NT * k, D - 1);          // clamped: unconditional loads, guarded stores
         u[k] = own0[(size_t) r * rsf + i] + __builtin_nontemporal_load(peer0 + (size_t) r * D + i);
         h0[k] = v_s3(hbase, own0, peer0, i, r, rsf);
         h1[k] = v_s3(hbase, own0, peer0, i, r + 1, rsf);
@@ -105,9 +100,9 @@ VR_NI void v_xconv_b0(const float * own0, const float * peer0, const float * w, 
     }
 }
 
-// d_head_post with the verify K / V conv (the window over the rows' raw
-// projections; the history is not written), the row's u into uh
-// bsum<1>(x, red, 2) of a 128-thread group (its own LDS pair): the block's 4 groups at once
+// d_head_post with the verify K / V conv, whose window runs over the rows' raw projections
+// and never writes the history. v_gsum2 is bsum<1>(x, red, 2) per 128-thread group, each on
+// its own LDS pair, for the block's 4 groups at once.
 VR_NI float v_gsum2(float x, float * red, int grp) {
     x = qz_wsum_dpp(x);
     __syncthreads();
@@ -197,13 +192,12 @@ VR_NI void v_head_post(CK hpost * e, int pos, float tau, int v, int tid, int r, 
 }
 
 
-// ---- the wave sums of many values at once. qz_gemv_core's per-row result is the
-// xor butterfly over the 64 lanes (QZ_GEMV_WSUM); v_tsum<N, W> runs it for N values
-// over W lanes together: at each level (offset o = W/2 .. 1) a lane keeps half of its
-// values (the upper half where lane & o) and adds its partner's copy of them, so
-// every value gets the butterfly's additions (a + b with the same pairs: the same
-// bits) at N/2 + N/4 + .. exchanges instead of N per level. Value k ends in the lanes
-// with (lane >> (log2 W - log2 N)) % N == k.
+// ---- the wave sums of many values at once. qz_gemv_core's per-row result is the xor
+// butterfly over the 64 lanes (QZ_GEMV_WSUM). v_tsum<N, W> runs it for N values over W
+// lanes at once: at each level, offset o = W/2 .. 1, a lane keeps the half of its values
+// that lane & o selects and adds its partner's copy. Every value gets the same additions
+// over the same pairs, so the same bits, in N/2 + N/4 + .. exchanges instead of N per
+// level. Value k ends in the lanes where (lane >> (log2 W - log2 N)) % N == k.
 template <int O> VR_NI float v_xor(float x) {
     if constexpr (O == 32) return __shfl_xor(x, 32, 64);
     else if constexpr (O == 16) return __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), 0x1F | (16 << 10)));
@@ -238,7 +232,7 @@ template <int N, int W = 64> VR_NI int v_tsum_k(int lane) {
     while ((1 << ln) < N) ln++;
     return (lane >> (lw - ln)) & (N - 1);
 }
-// qz_gemv_core<T, S, RS>'s per-lane sums (its T > QZ_GEMV_BUF_TMAX walk) without the wave sum
+// the per-lane sums of qz_gemv_core<T, S, RS>'s unbuffered walk, without the wave sum
 template <int T, int S, int RS = 0> VR_NI void v_core_acc(
         const unsigned char * a_vals, const float * a_scal, int lda, int lsa, int n_u,
         const char * w_vals, const __half * w_scal, int ldw, int lsw, int N, int r0, int lane, float (&acc)[T][S]) {
@@ -246,9 +240,9 @@ template <int T, int S, int RS = 0> VR_NI void v_core_acc(
     for (int t = 0; t < T; t++)
         #pragma unroll
         for (int s = 0; s < S; s++) acc[t][s] = 0.f;
-    // 64 < n_u <= 64 + 64 / T: the tail units (u >= 64, n_u - 64 of them) run one row per
-    // lane over the whole wave and go back to their lanes by shuffles (lane u - 64 adds
-    // the product last, as the plain walk's second step)
+    // 64 < n_u <= 64 + 64 / T: the n_u - 64 tail units (u >= 64) run one row per lane over
+    // the whole wave, then return by shuffles. Lane u - 64 adds the product last, as the
+    // plain walk's second step does.
     const int nt = n_u - 64;
     const bool tail = nt > 0 && T * nt <= 64;
     for (int u = lane; u < (tail ? 64 : n_u); u += 64) {
@@ -284,7 +278,7 @@ template <int T, int S, int RS = 0> VR_NI void v_core_acc(
     }
     if (tail) {                                                             // wave-uniform
         const int tt = lane / nt, u = 64 + lane % nt;
-        float q[S], sa = 0.f;                       // the products' d * sw and sa: the owner lane
+        float q[S], sa = 0.f;                       // d * sw per s and the sa: the owner lane
         #pragma unroll                              // fuses the add as the walk does (contract on)
         for (int s = 0; s < S; s++) q[s] = 0.f;
         if (tt < T) {
@@ -317,11 +311,10 @@ template <int T, int S, int RS = 0> VR_NI void v_core_acc(
 }
 
 
-// a K = D row pair for all VR rows (v_core_acc's values): v_wload issues the pair's
-// weights (the caller loads the next pair while v_wdot computes this one), lane L
-// sums its unit L, the 8 tail units 64 .. 71 run one row per 8 lanes and go back to
-// lanes 0 .. 7 by shuffles (d * sw and sa apart: the owner lane fuses the add as the
-// plain walk does); v_wdot returns v_tsum's value (row, s) = lane >> 2
+// a K = D row pair for all VR rows, with v_core_acc's values. v_wload issues the pair's
+// weights, so the next pair loads while v_wdot computes this one. Lane L sums its unit L.
+// The 8 tail units 64 .. 71 run one row per 8 lanes and return by shuffles, d * sw and sa
+// apart, so the owner lane fuses the add as the plain walk does.
 struct v_wbuf { qz_v4u w0[2], w1[2], t0[2], t1[2]; float sw[2], tw[2]; };
 VR_NI void v_wload(v_wbuf & b, const char * wv, const __half * ws, size_t row0, size_t row1, int lane) {
     constexpr int NU = D / 32;
@@ -379,8 +372,8 @@ VR_NI float v_wdot(const v_wbuf & b, const unsigned char * la, const float * ls,
 }
 
 
-// d_router for the VR rows at once: a wave per expert, its weights loaded once, each
-// row's sum in d_router's order, the row sums by v_tsum (the xor butterfly's pairs)
+// d_router for the VR rows at once: a wave per expert, its weights loaded once. Each row's
+// sum follows d_router's order, and v_tsum reduces the row sums on the butterfly's pairs.
 VR_NI void v_router(const float * F0, const float * wr, const float * bias, float * H0, int rs, int e, int lane) {
     F0 = qz_gp(F0); wr = qz_gp(wr); bias = qz_gp(bias); H0 = qz_gp(H0);
     float s[VR];
@@ -408,8 +401,8 @@ VR_NI void v_router(const float * F0, const float * wr, const float * bias, floa
         ps[e] = p; ps[NE + e] = p + bias[e];
     }
 }
-// v_pick_all by a wave per row: 8 rounds of the wave max of (p + bias, NE - 1 - id)
-// (the rank order: max first, ties to the lower id; -0 folded into +0 as == does)
+// v_pick_all by a wave per row: 8 rounds of the wave max of (p + bias, NE - 1 - id).
+// That key sorts max first, ties to the lower id, and folds -0 into +0 as == does.
 VR_NI unsigned long long v_pkey(float x, int id) {
     unsigned u = __float_as_uint(x + 0.f);
     u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
@@ -448,8 +441,8 @@ VR_NI void v_pick_w(const float * H0, int rsf, float scale, int * sids, float * 
     __syncthreads();
 }
 
-// The experts the VR rows picked, each once: dex[0 .. nd-1] ascending ids, dmk[u] the
-// rows that picked dex[u] (bit r). Built identically by every block (after v_pick_all).
+// The experts the VR rows picked, each once: dex[0 .. nd-1] ascending, dmk[u] the rows
+// that picked dex[u] as bit r. Every block builds it identically, after v_pick_all.
 struct vdist { int nd; int dex[VR * NE_USED]; unsigned dmk[VR * NE_USED]; };
 VR_NI void v_distinct(const int * sids, vdist & dd, int tid) {
     __shared__ int wc[2];
@@ -471,25 +464,24 @@ VR_NI void v_distinct(const int * sids, vdist & dd, int tid) {
     if (tid == 0) dd.nd = wc[0] + wc[1];
     __syncthreads();
 }
-// row r's slot of expert e (it picked it)
+// row r's slot of expert e, which it picked
 VR_NI int v_slot(const int * sids, int r, int e) {
     int k = 0;
     #pragma unroll
     for (int q = 0; q < NE_USED; q++) k = sids[r * NE_USED + q] == e ? q : k;
     return k;
 }
-// gate | up + SITU + quant over the distinct experts (c_up_situ_w's values for every
-// row that picked the expert): a wave owns an (expert, 32-activation quant group) and
-// walks its 32 (gate, up) row pairs for all VR rows at once (the weights read once,
-// the next pair's in flight), the SITU values in the wave's LDS tile, then the wave
-// quantizes the group of each row that picked the expert into its slot
+// gate | up + SITU + quant over the distinct experts, c_up_situ_w's values for every row
+// that picked the expert. A wave owns one (expert, 32-activation quant group) and walks its
+// 32 gate and up row pairs for all VR rows at once, weights read once, keeps the SITU
+// values in its LDS tile, then quantizes each picking row's group into its slot.
 VR_NI void v_up_dd(const char * wv, const __half * ws, const int * sids, const vdist & dd,
                    const unsigned char * av0, const float * as0, float beta, float lb,
                    unsigned char * hq0, float * hs0, int tid, int rs, int rsf) {
     asm volatile ("" : "+v"(tid));
     av0 = qz_gp(av0); as0 = qz_gp(as0); hq0 = qz_gp(hq0); hs0 = qz_gp(hs0);
     const int wave = tid >> 6, lane = tid & 63, nw = gridDim.x * 8;
-    // the VR activation rows (int8 + scales) in the dynamic LDS: every task reads them
+    // the VR activation rows (int8 and scales) in dynamic LDS, read by every task
     unsigned char * la = (unsigned char *) cyc_lds;                       // [VR][D]
     float * ls = cyc_lds + VR * D / 4;                                     // [VR][D / 32]
     __syncthreads();
@@ -521,7 +513,7 @@ VR_NI void v_up_dd(const char * wv, const __half * ws, const int * sids, const v
             v_wload(B, wv, ws, r0 + a + 1, r0 + a + 33, lane);
             float val = v_wdot(A, la, ls, lane, acc), upv = __shfl_down(val, 4, 64);
             if (wl) lq[vr * 32 + a] = situ_v(val, upv, beta, lb);
-            // unconditional (the last one unused): a conditional reload here miscompiled (NaN)
+            // unconditional on purpose: a conditional reload here miscompiles (NaN)
             v_wload(A, wv, ws, r0 + min(a + 2, 31), r0 + min(a + 2, 31) + 32, lane);
             val = v_wdot(B, la, ls, lane, acc); upv = __shfl_down(val, 4, 64);
             if (wl) lq[vr * 32 + a + 1] = situ_v(val, upv, beta, lb);
@@ -545,11 +537,10 @@ VR_NI void v_up_dd(const char * wv, const __half * ws, const int * sids, const v
         __builtin_amdgcn_wave_barrier();                                    // the tile is rewritten by the next group
     }
 }
-// the down rows over the distinct experts: c_moe_down_q's quads and per-(row, slot)
-// values (4 experts per wave, 16 lanes each; see the task loop), each expert's 4
-// weight rows loaded once for the rows that picked it (its own row list), the rows'
-// SITU activations staged in LDS; then per row the same k-order fold of wk * acc.
-// LDS: lacc [VR][MD_Q][NE_USED][4], then the activations (VER_LDS)
+// the down rows over the distinct experts, c_moe_down_q's quads and per-(row, slot) values.
+// Each expert's 4 weight rows load once for the rows that picked it, from its own row list,
+// the rows' SITU activations staged in LDS. Then per row the same k-order fold of wk *
+// acc. LDS: lacc [VR][MD_Q][NE_USED][4], then the activations (VER_LDS).
 constexpr int VER_LDS = (VR * MD_Q * NE_USED * 4) * 4 + VR * NE_USED * FFL + VR * NE_USED * (FFL / 32) * 4;
 static_assert(VER_LDS >= CYC_LDS, "verify's dynamic LDS covers the decode's");
 VR_NI void v_down_dd(const char * wv, const __half * ws, const int * sids, const float * swts, const vdist & dd,
@@ -561,7 +552,7 @@ VR_NI void v_down_dd(const char * wv, const __half * ws, const int * sids, const
     const int wave = tid >> 6, lane = tid & 63, gq = lane >> 4, l = lane & 15;
     const int q0 = blockIdx.x * NQ / gridDim.x, q1 = (blockIdx.x + 1) * NQ / gridDim.x;
     const int np = (dd.nd + 3) / 4;
-    // the VR rows' SITU activations (all NE_USED slots) staged in LDS after the partials
+    // the VR rows' SITU activations, all NE_USED slots, staged in LDS after the partials
     unsigned char * la = (unsigned char *) (lacc + VR * LR);
     float * ls = (float *) (la + VR * NE_USED * FFL);
     for (int i = tid; i < VR * NE_USED * FFL / 16; i += 512) {
@@ -577,10 +568,10 @@ VR_NI void v_down_dd(const char * wv, const __half * ws, const int * sids, const
         const int nq = min(MD_Q, q1 - c0);
         #pragma unroll 1
         for (int task = wave; task < nq * np; task += 8) {
-            // 4 experts per wave, 16 lanes each: lane l sums unit l; units 16, 17 (the
-            // 4 rows' tail, lanes l < 8: row l / 2, unit 16 + l % 2) are added to lanes
-            // 0, 1 first: c_moe_down_q's first shfl_down level (a_i + a_(i+16), + 0
-            // above unit 17), then the 16-lane levels as the xor butterfly
+            // 4 experts per wave, 16 lanes each, lane l summing unit l. Units 16 and 17,
+            // the 4 rows' tail in lanes l < 8 as row l / 2 and unit 16 + l % 2, go first to
+            // lanes 0 and 1: c_moe_down_q's first shfl_down level, a_i + a_(i+16) plus 0
+            // above unit 17. Then the 16-lane levels as the xor butterfly.
             const int qd = task / np, ui = 4 * (task % np) + gq;
             const bool live = ui < dd.nd;                                   // 16-lane uniform
             const int e = live ? dd.dex[ui] : dd.dex[0];
@@ -651,9 +642,9 @@ VR_NI void v_down_dd(const char * wv, const __half * ws, const int * sids, const
     }
 }
 
-// c_gemv2 over the VR rows at once (activation row t at av + t rs, output at y + t rsf;
-// yp0: the peer inbox rows, stride D): the weights are read once, each row's value is
-// c_gemv2's (qz_gemv_core's per-row order does not depend on T)
+// c_gemv2 over the VR rows at once: activation row t at av + t rs, output at y + t rsf,
+// yp0 the peer inbox rows at stride D. Weights are read once, and each row's value is
+// c_gemv2's, since qz_gemv_core's per-row order does not depend on T.
 template <int S> VR_NI void v_gemv(CK gjobs * J, int hb, int rs, int rsf, float * yp0) {
     static_assert(S == 2 || S == 4, "8 S rows per unit, 32 per job block");
     const int wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
@@ -687,8 +678,8 @@ template <int S> VR_NI void v_gemv(CK gjobs * J, int hb, int rs, int rsf, float 
         }
     }
 }
-// c_ctrl_down_all over the VR rows: each (job, row pair) loads its weights once and
-// runs the decode's per-row sums for every row in turn (row t: cur / msg / g + t rsf)
+// c_ctrl_down_all over the VR rows. Each (job, row pair) loads its weights once and runs
+// the decode's per-row sums for every row in turn, row t at cur / msg / g + t rsf.
 template <int NJ> VR_NI void v_ctrl_down(CK cjob * cj, int rsf, int tid) {
     asm volatile ("" : "+v"(tid));
     __shared__ float red[2 * 4 * 2];
@@ -736,8 +727,8 @@ template <int NJ> VR_NI void v_ctrl_down(CK cjob * cj, int rsf, int tid) {
     }
     __syncthreads();
 }
-// c_ctrl_up_all over the VR rows: each weight chunk loaded once, the VR rows' sums in
-// c_ctrl_up_all's k order (g and the forget sums of all rows in the dynamic LDS)
+// c_ctrl_up_all over the VR rows. Each weight chunk loads once, the VR rows' sums in
+// c_ctrl_up_all's k order. g and the forget sums of all rows sit in dynamic LDS.
 template <int NJ> VR_NI void v_ctrl_up(CK cjob * cj, int rsf, int tid) {
     asm volatile ("" : "+v"(tid));
     float * g = cyc_lds;                                   // [VR][NJ][GRANK]
@@ -785,18 +776,17 @@ template <int NJ> VR_NI void v_ctrl_up(CK cjob * cj, int rsf, int tid) {
     }
 }
 
-// The attention of the VR rows in two phases. A: unit (KV head, split, decode wave
-// w2), wave w = row w: exactly decode wave w2's groups (sp * 8 + w2) * 4 + lane / 16
-// of d_attn (the key loop, the xor joins), the wave's state stored to ws; a wave whose
-// 4 groups have no keys (lo + group > pos) skips (its state would be (-inf, 0, 0),
-// which every att_join leaves unchanged). B (after a grid barrier): unit (row, KV
-// head), thread (head, dim): d_attn's folds in their order (per split from its first
-// non-empty wave, then the sink and the splits), the gate and the quant.
-// ws: [VR][HKVL][ATT_SPL][8][GQ][ATT_PW]
-constexpr size_t VWS = (size_t) HKVL * ATT_SPL * 8 * GQ * ATT_PW;
+// The attention of the VR rows in two phases. Phase A, one wave per unit (KV head,
+// split, decode wave w2) with wave w = row w, runs exactly decode wave w2's groups
+// (sp * 8 + w2) * 4 + lane / 16 of d_attn, the key loop and the xor joins, and stores the
+// wave's state to ws. A wave whose 4 groups have no keys (lo + group > pos) skips, its
+// state being (-inf, 0, 0), which every att_join leaves unchanged. Phase B, after a grid
+// barrier: unit (row, KV head), thread (head, dim), d_attn's folds in their order, per
+// split from its first non-empty wave, then the sink and the splits, the gate and the quant.
+constexpr size_t VWS = (size_t) HKVL * ATT_SPL * 8 * GQ * ATT_PW; // ws: [VR][HKVL][ATT_SPL][8][GQ][ATT_PW]
 VR_NI void v_attn_a(CK appk * tab, int napp, int ai, int pos, int v, float * ws, int tid) {
     asm volatile ("" : "+v"(tid));
-    const int kvh = v % HKVL, sp = v / (HKVL * 8), w2 = (v / HKVL) % 8;   // the KV head minor: the units with keys spread over the grid
+    const int kvh = v % HKVL, sp = v / (HKVL * 8), w2 = (v / HKVL) % 8;   // KV head minor, so the units with keys spread over the grid
     const int wave = tid >> 6, lane = tid & 63, li = lane & 15, row = wave;
     CK attn_args * ea = &((CK appk *) tab + (size_t) row * napp + ai)->at;
     const int full = ea->full, rp = pos + row;
@@ -898,12 +888,12 @@ VR_NI void v_attn_b(CK appk * tab, int napp, int ai, int pos, int u, const float
     float M = 0.f, L = 1.f, O = 0.f;                       // the sink: logit 0, value 0
     #pragma unroll 1
     for (int sp = 0; sp < ATT_SPL; sp++) {
-        if (lo + sp * 32 > rp) break;                      // this split and the later ones: no keys
+        if (lo + sp * 32 > rp) break;                      // no keys here or in the later splits
         const float * B = W + (size_t) sp * 8 * GQ * ATT_PW;
-        const int nw = min(8, (rp - lo - sp * 32) / 4 + 1);   // the non-empty waves (wave 0 is: lo + 32 sp <= rp)
+        const int nw = min(8, (rp - lo - sp * 32) / 4 + 1);   // the non-empty waves, wave 0 never empty
         float sm[8], sl[8], so[8];
         #pragma unroll
-        for (int w2 = 0; w2 < 8; w2++) {                    // all in flight (the empty waves' slots are not used)
+        for (int w2 = 0; w2 < 8; w2++) {                    // all in flight, the empty waves' slots unused
             const float * S = B + (size_t) w2 * GQ * ATT_PW;
             sm[w2] = S[0]; sl[w2] = S[1]; so[w2] = S[2 + d];
         }
@@ -918,8 +908,7 @@ VR_NI void v_attn_b(CK appk * tab, int napp, int ai, int pos, int u, const float
     quant32(y, qz_gp(ea->oq), qz_gp(ea->os), i);
 }
 
-// the conv history commit: new hist[k][ch] = s[m + k] for the m committed rows
-// (s[0..2] the old history, s[3 + j] row j's u from uh)
+// The conv history commit: hist[k][ch] = s[m + k], with s[3 + j] row j's u from uh.
 static __global__ void k_vcommit(float * hist, const float * uh, int m) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= NAPP * CHL) return;
@@ -936,11 +925,10 @@ static __global__ void k_vcommit(float * hist, const float * uh, int m) {
     for (int k = 0; k < 3; k++) h[(size_t) k * CHL] = nv[k];
 }
 
-// the round. Per application: the row's chain work on chain group r = blocks
-// 4 r .. 4 r + 3 (as ink2_cycle's block 0 .. CG - 1, in the same order), then the
-// grid's phases for all VR rows: the qkv / out GEMVs, the head posts, the
-// attention, the router, the experts. The TP2 exchange is one flag per exchange
-// with all VR rows pushed to the disjoint inbox region 2 D + (parity * VR + r) D.
+// Per application the row's chain work runs on chain group r, blocks 4 r .. 4 r + 3, as
+// ink2_cycle's blocks 0 .. CG - 1 in the same order. Then the grid's phases for all VR
+// rows: the qkv and out GEMVs, the head posts, the attention, the router, the experts. One
+// TP2 flag per exchange, rows at the disjoint inbox region 2 D + (parity * VR + r) D.
 __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const vargs * Vg, vtok tv, int pos, int head) {
     __shared__ int sids[VR * NE_USED];
     __shared__ float swts[VR * NE_USED];
@@ -955,7 +943,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
     const bool chain = cr < VR;
     const int tr = chain ? cr : 0;
     unsigned int xs = *Vp->A.xseq;
-    // VTS(j): block 0's own clock as phase j (no barrier: the in-phase marks pick / distinct / up)
+    // pick, distinct and up run in one phase, with no grid barrier between them
     // the embedding: chain group r's leader block, then the group's sync
     if (chain && cw == 0)
         d_embed(Vp->A.ev, Vp->A.es, tv.t[tr], Vp->A.embd_norm, Vp->A.eps,
@@ -978,8 +966,8 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         float * const xr = (float *) ((char *) Av.X + (size_t) tr * rs);
         float * const pr = (float *) ((char *) Av.P + (size_t) tr * rs);
 
-        // ---- P0 (the row's chain group): the previous ffn sum + conv, the pass copies,
-        // the res mix (+ norms), the msg mix and norms
+        // ---- P0, the row's chain group: the previous ffn sum and conv, the pass copies,
+        // the res mix and norms, the msg mix and norms
         if (chain) {
             if (ai > 0) {
                 CK appk * ep = er - 1;
@@ -997,7 +985,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
                     if (er->mres_m == 1) c_cmix<1, false>(&er->mres, er->qres, er->res_out, nullptr, 0.f, g, ce, tid);
                     else c_cmix<3, false>(&er->mres, er->qres, er->res_out, nullptr, 0.f, g, ce, tid);
                 }
-                // the msg mix (decode: chain group 2 when !pre; it reads OUT, which a pass copy writes when pre)
+                // the msg mix, chain group 2 when !pre. It reads OUT, which a pass copy writes when pre.
                 if (msg) c_cmix<4, false>(&er->mmsg, er->qmsg, er->msg_out, nullptr, 0.f, g, ce, tid);
                 if (!msg) {
                     if (nna == 1) c_cnorm<1>(er->na.j, Av.eps, g, ce, tid);
@@ -1017,7 +1005,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
             }
             cyc_barrier(vbst, ++kb);
         }
-        // ---- attention: the qkv GEMVs, the head posts (+ the cache rows), the attention
+        // ---- attention: the qkv GEMVs, the head posts with the cache rows, the attention
         for (int v = blockIdx.x; v < 4 / VG_S * e0->nga; v += nb) v_gemv<VG_S>(&e0->ga, v, rs, rsf, nullptr);
         cyc_barrier(vbst, ++kb);
         static_assert(HQL % 4 == 0 && HKVL % 4 == 0, "a block's 4 units of one kind (q / k / v)");
@@ -1034,7 +1022,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         for (int v = blockIdx.x; v < 4 / VG_S * e0->ngo; v += nb) v_gemv<VG_S>(&e0->go, v, rs, rsf, Av.xin_peer + 2 * D + (size_t) (xs & 1) * VR * D);
         __threadfence_system();
         cyc_barrier(vbst, ++kb);
-        // ---- P1 (the row's chain group): the attention sum + conv, the ffn mix (+ norm)
+        // ---- P1, the row's chain group: the attention sum and conv, the ffn mix and norm
         if (chain) {
             cyc_xwait(Av, xs);
             const int slot = (int) ((er->hsa - Vq->hist) / (3 * CHL));
@@ -1071,7 +1059,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         cyc_barrier(vbst, ++kb);
     }
     const int wave = tid_k >> 6, lane = tid_k & 63;
-    // the last ffn sum + conv (the window), one block per row
+    // the last ffn sum and conv, with the window, one block per row
     if (blockIdx.x < VR) {
         const int r = blockIdx.x;
         CK appk * ep = (CK appk *) Vp->A.tab + (size_t) r * napp + (napp - 1);
@@ -1100,7 +1088,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
             d_norm_quant(hn, Vp->A.eps, tid_k, tid_k < 256);
         }
         cyc_barrier(vbst, ++kb);
-        {   // the VR-row head GEMV: c_head_gemv's rows and values, the softcap on rows < nvalid
+        {   // the VR-row head GEMV, c_head_gemv's rows and values, softcap on rows < nvalid
             const int N = Vp->A.hg.N, NV = Vp->A.nvalid;
             const int rsf_ = rsf;
             constexpr int S_ = 4;

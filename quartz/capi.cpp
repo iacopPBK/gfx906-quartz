@@ -1,4 +1,4 @@
-// C API: picks the architecture from the GGUF and forwards to its qz_ctx.
+// C API. qz_create picks the architecture from the GGUF, the rest forwards.
 #include "arch.h"
 #include "core/devices.h"
 #include "gguf.h"
@@ -74,6 +74,6 @@ double qz_image_last_ms(const qz_ctx * c) { return c ? c->image_last_ms() : 0.0;
 
 void qz_abort(qz_ctx * c) { if (c) c->abort(); }
 
-void qz_destroy(qz_ctx * c) { delete c; }   // device memory is released at process exit
+void qz_destroy(qz_ctx * c) { delete c; }   // device buffers are freed at process exit
 
 }

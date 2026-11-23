@@ -1,4 +1,4 @@
-// Device memory ledger (per card, tagged by the innermost qz_mem_scope) and an
+// Device memory ledger, per card and tagged by the innermost qz_mem_scope, plus an
 // arena that packs buffers under QZ_ARENA_BIG into 256 MB chunks.
 #pragma once
 
@@ -16,7 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
-// "HH:MM:SS " in local time: the engine's routine lines start like the server's own
+// prints "HH:MM:SS " in local time, so the engine's lines match the server's
 static inline void qz_stamp(FILE * f) {
     const time_t t = time(nullptr);
     struct tm tm;
@@ -24,7 +24,7 @@ static inline void qz_stamp(FILE * f) {
     fprintf(f, "%02d:%02d:%02d ", tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
-#define QZ_MEM_CARDS qz_dev_max     // devices.h: the ledger is per HIP ordinal
+#define QZ_MEM_CARDS qz_dev_max     // from devices.h; the ledger is per HIP ordinal
 
 struct qz_mem_ledger {
     struct rec { int card; size_t bytes; std::string tag; };
@@ -32,14 +32,14 @@ struct qz_mem_ledger {
     std::unordered_map<void *, rec> live;
     std::map<std::string, size_t> by[QZ_MEM_CARDS];
     size_t tracked[QZ_MEM_CARDS] = {};
-    long long base[QZ_MEM_CARDS] = { -1, -1, -1, -1, -1, -1, -1, -1 };   // used bytes before the engine's first buffer
+    long long base[QZ_MEM_CARDS] = { -1, -1, -1, -1, -1, -1, -1, -1 };   // used bytes before the engine allocates
 };
 inline qz_mem_ledger & qz_mem() { static qz_mem_ledger l; return l; }
 
 #define QZ_ARENA_CHUNK ((size_t) 256 << 20)
 #define QZ_ARENA_BIG   ((size_t) 64 << 20)
 #define QZ_ARENA_ALIGN ((size_t) 256)
-#define QZ_ARENA_GUARD ((size_t) 64 << 10)   // never handed out: a read just past a chunk's last buffer stays mapped
+#define QZ_ARENA_GUARD ((size_t) 64 << 10)   // never handed out, absorbs overruns past a buffer
 
 struct qz_arena {
     struct chunk { char * base; std::map<size_t, size_t> live; };   // offset -> size
@@ -78,8 +78,8 @@ inline hipError_t qz_arena_alloc(void ** p, size_t bytes, int dev) {
     return hipSuccess;
 }
 
-// true if p was the arena's (then released after a device sync, its chunk
-// too if empty)
+// true if p came from the arena. It is released after a device sync, and so is its
+// chunk once that is empty.
 inline bool qz_arena_free(void * p) {
     qz_arena & A = qz_arena_get();
     std::lock_guard<std::mutex> g(A.mu);
@@ -135,8 +135,8 @@ inline hipError_t qz_dmalloc(T ** p, size_t bytes, const char * sub = nullptr) {
     return e;
 }
 
-// hipDeviceMallocUncached pages (the cross-card inboxes: a peer's writes
-// must land in HBM, not behind this card's L2)
+// hipDeviceMallocUncached pages, for the cross-card inboxes: a peer's writes must
+// land in HBM, not behind this card's L2
 template <class T>
 inline hipError_t qz_dmalloc_uncached(T ** p, size_t bytes, const char * sub = nullptr) {
     const hipError_t e = hipExtMallocWithFlags((void **) p, bytes, hipDeviceMallocUncached);
@@ -162,7 +162,7 @@ inline hipError_t qz_dfree(void * p) {
     return hipFree(p);
 }
 
-// the cards' used memory before the engine allocates, so the report can tell
+// used memory on each card before the engine allocates, so the report can tell
 // the baseline from untracked growth
 inline void qz_mem_baseline(int n_cards) {
     qz_mem_ledger & L = qz_mem();
@@ -177,7 +177,7 @@ inline void qz_mem_baseline(int n_cards) {
     (void) hipSetDevice(dev0);
 }
 
-// one line per card: used / total, free, the four largest tag groups and the
+// one line per card with used / total, free, the four largest tag groups and the
 // rest
 inline void qz_mem_report(FILE * f, int n_cards, double min_gb = 0.05) {
     qz_mem_ledger & L = qz_mem();

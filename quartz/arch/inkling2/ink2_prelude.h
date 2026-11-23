@@ -1,6 +1,6 @@
-// Everything the inkling2 headers include from outside the arch, at global
-// scope; the arch's TUs include this first, then their own headers inside
-// namespace ink2 (see docs/adding-a-model.md).
+// Everything the inkling2 headers include from outside the arch, at global scope. The
+// arch's TUs include this first, then their own headers inside namespace ink2 (see
+// docs/adding-a-model.md).
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -24,9 +24,9 @@
 #include "core/sampler.h"
 #include "vision/inkling2v.h"
 #include "kernels/dev.h"
-// the GEMV core's per-row wave sum: lane 0 of the shfl_down tree adds the same
-// pairs as the xor butterfly (its cone: lanes i < off pair with i + off = i ^ off),
-// here with the in-row levels as DPP
+// The GEMV core's per-row wave sum. Lane 0 of the shfl_down tree adds the same pairs as
+// the xor butterfly: its cone pairs lanes i < off with i + off = i ^ off. In-row levels
+// are DPP here.
 #define QZ_GEMV_WSUM(x) (x) = qz_wsum_dpp(x)
 #include "kernels/gemv.h"
 #include "kernels/topk.h"

@@ -1,12 +1,12 @@
-// Q8_0 repack into GEMV planes: values [N][K] int8 (K contiguous) and scales
-// [N][K/32] fp16. Host code.
+// Q8_0 repack into the GEMV planes, values as [N][K] int8 with K contiguous and
+// scales as [N][K/32] fp16. Host code only.
 #pragma once
 
 #include <cstdint>
 #include <cstring>
 
-// one row of K values from raw Q8_0 blocks ([f16 scale][32 x int8] per block,
-// K % 32 == 0) -> K/4 little-endian value dwords + K/16 scale bytes
+// unpacks one row of K values from raw Q8_0 blocks, each a f16 scale followed by
+// 32 int8, into K/4 little-endian value dwords and K/16 scale bytes. K % 32 == 0.
 static inline void qz_repack_row_q8(const uint8_t * raw_row, int K,
                                     uint32_t * vals, uint16_t * scales) {
     const int nblk = K / 32;

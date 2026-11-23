@@ -1,16 +1,16 @@
-// TP2 exchange between the two cards: per-block flags, the row-parallel
-// GEMV push and the combine. XA is the arch's args struct; it carries the
-// exchange pointers and its width as XA::DM (a multiple of 32).
+// TP2 exchange between the two cards: per-block flags, the row-parallel GEMV push
+// and the combine. XA is the arch's args struct: it holds the exchange pointers
+// and its width as XA::DM, a multiple of 32.
 #pragma once
 
 #include "kernels/gemv.h"
 
 // ---- TP2 exchange ----------------------------------------------
-// push partials to the peer inbox (slot tok & 1), wait for its flag, y = p0 + p1
+// push partials to the peer inbox in slot tok & 1, wait for its flag, then y = p0 + p1
 #define QZ_XSPIN 2000000000ll     // clock64 ticks before a wait gives up
 
-// per-block exchange flags: block b only needs the peer's block b push (slot 0
-// doubles as the head-merge flag)
+// per-block exchange flags. Block b only needs the peer's push of block b, and slot
+// 0 doubles as the head-merge flag.
 template <class XA> __device__ __forceinline__ void qz_xflag_b(const XA & A, unsigned int tok, int b) {
     __threadfence_system();
     __hip_atomic_store(A.xflag_peer + b, tok, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -28,16 +28,16 @@ template <class XA> __device__ __forceinline__ void qz_xwait_b(const XA & A, uns
     }
 }
 
-// block 0's flag (the whole-card exchange): set it / wait (one thread) for the
-// peer's >= tok. Past the spin limit, or once any wait gave up, a wait sets the
-// abort word and returns so the launch drains.
+// block 0's flag, the whole-card exchange: set it, or wait in one thread for the
+// peer's flag to reach tok. Past the spin limit, or once any wait gave up, a wait
+// sets the abort word and returns so the launch drains.
 template <class XA> __device__ __forceinline__ void qz_xflag(const XA & A, unsigned int tok) { qz_xflag_b(A, tok, 0); }
 template <class XA> __device__ __forceinline__ void qz_xwait(const XA & A, unsigned int tok) { qz_xwait_b(A, tok, 0); }
 
-// row-parallel GEMV over the card's K slice: the block's slabs stage in LDS and
-// push after the loop (one fence); activations optionally staged in LDS region 0
-// CX: the exchange buffers' row capacity (the cycle's rows, or the verify's);
-// LX: LDS activation staging (off for the verify: it does not fit)
+// row-parallel GEMV over the card's K slice. The block's slabs stage in LDS and are
+// pushed after the loop, under one fence. CX is the row capacity of the exchange
+// buffers, the cycle's rows or the verify's. LX stages the activations in LDS
+// region 0, off for the verify, where they do not fit.
 template <int T, int CX, bool LX = T <= 4, class XA> __device__ __forceinline__ void qz_gemv_xpush_t(
         const unsigned char * a_vals, const float * a_scal, int K,
         const char * w_vals, const __half * w_scal, const XA & A, unsigned int tok, float * stage,
@@ -81,13 +81,13 @@ template <int T, int CX, bool LX = T <= 4, class XA> __device__ __forceinline__ 
     __threadfence_system();
 }
 
-// after qz_gemv_xpush_t: flag the peer, wait for its flag, y = p0 + p1 over this
-// block's slabs; BX = false drops the trailing grid barrier (standalone launch)
+// after qz_gemv_xpush_t: flag the peer, wait for its flag and sum y = p0 + p1 over
+// this block's slabs. BX = false drops the trailing grid barrier.
 template <int T, int CX, bool BX = true, class XA> __device__ __forceinline__ void qz_xfinish_t(
         qz_barrier_state * bst, int & kb, const XA & A, unsigned int tok, float * y) {
     const int tid = threadIdx.x;
     const int par = tok & 1;
-    __syncthreads();                 // every thread's remote stores are fenced (push)
+    __syncthreads();                 // every thread's remote stores are fenced by the push
     if (tid == 0) { qz_xflag_b(A, tok, blockIdx.x); qz_xwait_b(A, tok, blockIdx.x); }
     __syncthreads();
     const float * src = A.xin_mine + (size_t) par * CX * XA::DM;
@@ -103,18 +103,18 @@ template <int T, int CX, bool BX = true, class XA> __device__ __forceinline__ vo
     if constexpr (BX) qz_grid_barrier(bst, ++kb);
 }
 
-// one row-parallel phase with its exchange: gemv + push, then flag, wait
-// and combine
+// one row-parallel phase with its exchange: the GEMV and the push, then the flag,
+// the wait and the combine
 template <int T, int CX, bool LX = T <= 4, bool BX = true, class XA> __device__ __forceinline__ void qz_xrow_t(
         qz_barrier_state * bst, int & kb, const XA & A, unsigned int tok,
         const unsigned char * a_vals, const float * a_scal, int K,
         const char * w_vals, const __half * w_scal, float * stage, float * y, unsigned char * lds0) {
     qz_gemv_xpush_t<T, CX, LX>(a_vals, a_scal, K, w_vals, w_scal, A, tok, stage, lds0);
-    // BX forwarded: a standalone launch has no barrier state
+    // BX is forwarded, since a standalone launch has no barrier state
     qz_xfinish_t<T, CX, BX>(bst, kb, A, tok, y);
 }
 
-// head merge: larger value wins, ties to the lower token id
+// head merge. The larger value wins, and a tie goes to the lower token id.
 __device__ __forceinline__ int qz_xpick(float ov, int oi, float pv, int pi) {
     return (pv > ov || (pv == ov && pi < oi)) ? pi : oi;
 }

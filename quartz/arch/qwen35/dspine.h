@@ -1,3 +1,4 @@
+// DSpine drafter context cache: RMSNorm, Q8, GEMV and ring kernels, plus their loader.
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -21,7 +22,7 @@
 #define DS_W 8192             // attention window
 #ifndef DS_RING
 #define DS_RING 12288         // ring slots (position mod DS_RING), past the window so a resumed
-                              // request does not read rows an earlier request wrote
+                              // request never reads rows an earlier request wrote
 #endif
 #define DS_NKV 8              // draft kv heads
 #define DS_NQ 32              // draft q heads
@@ -30,7 +31,7 @@
 #define DS_TR 12                // batched-row cap of the context fill (the served block size)
 
 // --------------------------------------------------------------- device ----
-// RMSNorm of `nrows` rows, one warp per row (in place is fine)
+// RMSNorm of nrows rows, one warp per row. In place is fine.
 __global__ void __launch_bounds__(256) ds_rms(const float * x, const float * w, float * y, int nrows, int n, float eps) {
     const int r = (blockIdx.x << 2) + (threadIdx.x >> 6), lane = threadIdx.x & 63;
     if (r >= nrows) return;
@@ -40,13 +41,12 @@ __global__ void __launch_bounds__(256) ds_rms(const float * x, const float * w, 
     for (int i = lane; i < n; i += 64) ss += xr[i] * xr[i];
     #pragma unroll
     for (int off = 32; off > 0; off >>= 1) ss += __shfl_down(ss, off, 64);
-    ss = __shfl(ss, 0, 64);        // lane 0 holds the total; every lane normalizes with it
+    ss = __shfl(ss, 0, 64);        // lane 0 holds the total, and every lane normalizes with it
     const float inv = rsqrtf(ss / (float) n + eps);
     for (int i = lane; i < n; i += 64) yr[i] = xr[i] * inv * w[i];
 }
 
-// quantize `nrows` f32 rows (row stride n) into Q8 planes (trunk requant
-// semantics; one warp per (row, unit))
+// quantize nrows f32 rows of stride n into Q8 planes with the trunk's requant rules
 __global__ void __launch_bounds__(256) ds_qrows(const float * x, unsigned char * q, float * s,
                                                 int nrows, int n) {
     const int n32 = n / 32;
@@ -66,8 +66,7 @@ __global__ void __launch_bounds__(256) ds_qrows(const float * x, unsigned char *
     if (l == 0) s[(size_t) r * n32 + uu] = d16;
 }
 
-// T-row GEMV over a [N, w_k] Q8 plane: a wave per slab of S rows, W slabs per
-// block; a row's result does not depend on T
+// T-row GEMV over a [N, w_k] Q8 plane. A row's result does not depend on T.
 template <int T, int S, int W>
 __global__ void __launch_bounds__(64 * W) ds_gemvT(const unsigned char * a_vals, const float * a_scal, int a_k,
                                                    const char * w_vals, const __half * w_scal, int w_k, int N,
@@ -88,8 +87,7 @@ __global__ void __launch_bounds__(64 * W) ds_gemvT(const unsigned char * a_vals,
     }
 }
 
-// k head norm + rope + ring store (row (p0 + r) mod W): one block of 128 per
-// (local head, row)
+// k head norm, rope and ring store; one block of 128 per local head and row
 __global__ void __launch_bounds__(128) ds_k_head_rows(const float * k, const float * knw, const float * inv,
                                                        float * kring, int h0, int hn, int p0) {
     __shared__ float red[4], qs[DS_HD], rinv;
@@ -115,8 +113,8 @@ __global__ void __launch_bounds__(128) ds_k_head_rows(const float * k, const flo
     }
 }
 
-// scatter f32 rows (a v gemv batch, [rows][len]) into a position ring
-// [W][NKV*HD] at offset `off`, one block per row (handles the wrap)
+// scatter f32 rows ([rows][len]) into the ring [DS_RING][NKV*HD] at offset off.
+// One block per row, the wrap included.
 __global__ void __launch_bounds__(256) ds_ring_scatter(const float * src, float * ring,
                                                        int len, int off, int p0, int rows) {
     const int r = blockIdx.x, t = threadIdx.x;
@@ -137,7 +135,7 @@ struct qz_ds_ctx {
     const unsigned short * k_s[DS_FL] = {}, * v_s[DS_FL] = {};
     const float * knw[DS_FL] = {};                      // attn_k_norm [HD]
     const float * inv = nullptr;                        // rope inv_freq [HD/2]
-    float * ring_k[DS_FL] = {}, * ring_v[DS_FL] = {};   // [W][NKV*HD] f32
+    float * ring_k[DS_FL] = {}, * ring_v[DS_FL] = {};   // [DS_RING][NKV*HD] f32
     int h0 = 0, hn = DS_NKV;                            // this device's kv heads
     // work buffers
     float * f32 = nullptr;                              // [5 * H]
@@ -157,8 +155,8 @@ struct qz_ds_ctx {
     qz_loader ld;                                    // owns the device tensors
 };
 
-// load just the context tensors (fc, hidden_norm, per-layer k / v, k_norm);
-// everything else is skipped in place on the loader.
+// load only the context tensors, fc, hidden_norm, per-layer k and v and k_norm; the
+// loader skips everything else in place.
 inline int qz_ds_ctx_load(qz_ds_ctx & d, const char * draft, int dev, int h0 = 0, int hn = DS_NKV) {
     d.dev = dev;
     d.h0 = h0;
@@ -230,8 +228,8 @@ inline int qz_ds_ctx_load(qz_ds_ctx & d, const char * draft, int dev, int h0 = 0
     return 0;
 }
 
-// context fill for a verify's committed rows: feat_rows [nrows][5H] (device)
-// at positions p0.., nrows <= DS_TR
+// context fill for the committed rows of a verify, feat_rows [nrows][5H] on device at
+// positions p0 .., nrows <= DS_TR
 inline void qz_ds_ctx_rows(qz_ds_ctx & d, const float * feat_rows, int p0, int nrows) {
     hipStream_t s = d.st;
     const int nr = d.hn * DS_HD;

@@ -1,9 +1,9 @@
-// T-row cycle kernel: one persistent launch runs T rows through the trunk and
-// lm_head and verifies on device; recurrent state commits lazily via a replay ring.
+// T-row cycle kernel. One persistent launch runs T rows through the trunk and the head
+// and verifies on device. The recurrent state commits lazily through a replay ring.
 #pragma once
 #include "flash9c.h"
 
-// per-card geometry (tp2.h); TR: the replay ring's row capacity
+// Per-card geometry (tp2.h). TR is the row capacity of the replay ring.
 template <int TR = QZ_TMAX> struct qz_geo {
     static constexpr int HV = QZ_HV / 2, HK = QZ_HK / 2, CCH = QZ_CCH / 2, G = QZ_G / 2, AQ = QZ_AQ / 2,
                          AKV = QZ_AKV / 2, HQ = QZ_HQ / 2, HKV = QZ_HKV / 2, FF = QZ_FF / 2;
@@ -11,8 +11,8 @@ template <int TR = QZ_TMAX> struct qz_geo {
                          RING_ALPH = 2 * TR * CCH + TR * HV, RING_PAR = 2 * TR * CCH + 2 * TR * HV;
 };
 
-// qz_dn_rows: one head's DN phase, n_rep replay rows from rp then T new rows from
-// rc; only the state recurrence is serial (n_rep <= CAP, the ring's capacity)
+// LDS scratch of qz_dn_rows: one head's DN phase over n_rep replay rows from rp, then
+// T new rows from rc. Only the state recurrence is serial; n_rep <= CAP, the ring size.
 template <int T, int CAP = QZ_TMAX> struct qz_dn_rows_lds {
     float q[CAP + T][QZ_S];
     float k[CAP + T][QZ_S];
@@ -22,12 +22,12 @@ template <int T, int CAP = QZ_TMAX> struct qz_dn_rows_lds {
     float beta[CAP + T], dec[CAP + T];
     float part[4][QZ_S];
     float d[QZ_S];
-    float opb[4][QZ_S];         // per-band o partials of the last row (summed during the next row)
-    float op[T][QZ_S];          // o of the new rows (band sum, same order)
+    float opb[4][QZ_S];         // last row's o partials per band, summed on the next row
+    float op[T][QZ_S];          // o of the new rows, band-summed in the same order
     float orr[T][2];            // rms partials of the new rows
 };
 
-// TR: the ring capacity rc / rp index into (QZ_TMAX, or 12 for the verify)
+// TR is the row capacity of the rc and rp rings: QZ_TMAX, or 12 for the verify.
 template <int T, int CAP = QZ_TMAX, int TR = QZ_TMAX> __device__ __forceinline__ void qz_dn_rows(
         float * st, int n_rep, const float * rp, const float * rc, const float * y_gate,
         const float * dt_bias, const float * ssm_a, const float * ssm_norm_w,
@@ -38,7 +38,7 @@ template <int T, int CAP = QZ_TMAX, int TR = QZ_TMAX> __device__ __forceinline__
     const int nr = n_rep + T;                       // rows, replay first
     const int wave = tid >> 6, lane = tid & 63;
     const float epsn = eps * (1.f / 128.f);
-    // prep: unit = (row, q/k, half), one wave each; v rows and beta/decay
+    // Prep: one unit is (row, q or k, half), one per wave. Also v rows and beta/decay.
     for (int u = wave; u < nr * 4; u += 8) {
         const int b = u >> 2, w = u & 3;
         const float * src = (b < n_rep ? rp + Gm::RING_CONV + (size_t) b * Gm::CCH : rc + Gm::RING_CONV + (size_t)(b - n_rep) * Gm::CCH);
@@ -47,7 +47,7 @@ template <int T, int CAP = QZ_TMAX, int TR = QZ_TMAX> __device__ __forceinline__
         if (w < 2) { x = src[kh * QZ_S + e]; L->q[b][e] = x; }
         else       { x = src[QZ_S * Gm::HK + kh * QZ_S + e]; L->k[b][e] = x; }
         float sq;
-        {   // unfused square + shuffle add, as the step's branch-guarded tree
+        {   // unfused square, then a shuffle tree as in the step kernel
             #pragma clang fp contract(off)
             sq = x * x;
         }
@@ -86,7 +86,7 @@ template <int T, int CAP = QZ_TMAX, int TR = QZ_TMAX> __device__ __forceinline__
     }
     __syncthreads();
 
-    // serial recurrence, state strip in registers
+    // Serial recurrence; the state strip stays in registers.
     const int j = tid & (QZ_S - 1), r = tid >> 7;
     float s[32];
     #pragma unroll
@@ -121,7 +121,7 @@ template <int T, int CAP = QZ_TMAX, int TR = QZ_TMAX> __device__ __forceinline__
     if (tid < QZ_S) L->op[T - 1][j] = L->opb[0][j] + L->opb[1][j] + L->opb[2][j] + L->opb[3][j];
     __syncthreads();
 
-    // tails: wave pair per new row, element e = half * 64 + lane
+    // Tails: a wave pair per new row, element e = half * 64 + lane.
     for (int w = wave; w < 2 * T; w += 8) {
         const int t = w >> 1, e = (w & 1) * 64 + lane;
         const float o = L->op[t][e];
@@ -140,7 +140,7 @@ template <int T, int CAP = QZ_TMAX, int TR = QZ_TMAX> __device__ __forceinline__
         const float inv2 = 1.f / sqrtf((L->orr[t][0] + L->orr[t][1]) * (1.f / 128.f) + eps);
         const float z_j = y_gate[(size_t) t * Gm::G + h * QZ_S + e];
         const float o = (L->op[t][e] * inv2) * ssm_norm_w[e] * (z_j / (1.f + expf(-z_j)));
-        // head requant, 32-lane units, one element per lane
+        // Head requant: 32-lane units, one element per lane.
         const int u = e >> 5, l = e & 31;
         float ax = fabsf(o);
         #pragma unroll
@@ -161,11 +161,11 @@ template <int T, int CAP = QZ_TMAX, int TR = QZ_TMAX> __device__ __forceinline__
 #include "kernels/xchg.h"
 
 // TP2 exchange staging: slabs per block (grid >= 40) x rows x 32 floats
-#define QZ_XSLAB 4                                   // slabs per block, grid >= 40
+#define QZ_XSLAB 4
 #define QZ_XSTAGE_BYTES (QZ_XSLAB * QZ_TMAX * 32 * 4)
 
-// T-row qkv GEMV + conv1d + silu: the window commits the previous cycle's
-// n_rep rows, then the T new rows run without committing
+// T-row qkv GEMV with conv1d and silu. The window commits the previous cycle's n_rep
+// rows, then the T new rows run without committing.
 template <int T> __device__ __forceinline__ void qz_gemv_qkv_conv_t(
         const unsigned char * a_vals, const float * a_scal, int K,
         const char * w_vals, const __half * w_scal, int N, float * y_qkv,
@@ -191,8 +191,7 @@ template <int T> __device__ __forceinline__ void qz_gemv_qkv_conv_t(
         if (lane < S && c < N) {
             const float * w = conv1d + c * 4;
             float c0_ = conv_state[c], c1_ = conv_state[N + c], c2_ = conv_state[2 * N + c];
-            // replay: the previous cycle's accepted raw rows enter the
-            // committed window
+            // Replay: the previous cycle's accepted raw rows enter the committed window.
             for (int t = 0; t < n_rep; t++) {
                 c0_ = c1_; c1_ = c2_; c2_ = prev_qkv[(size_t) t * N + c];
             }
@@ -201,7 +200,7 @@ template <int T> __device__ __forceinline__ void qz_gemv_qkv_conv_t(
                 conv_state[N + c] = c1_;
                 conv_state[2 * N + c] = c2_;
             }
-            // new rows: window advances in registers only (lazy commit)
+            // New rows: the window advances in registers only, the commit is lazy.
             #pragma unroll
             for (int t = 0; t < T; t++) {
                 y_qkv[(size_t) t * N + c] = cur[t];
@@ -213,8 +212,8 @@ template <int T> __device__ __forceinline__ void qz_gemv_qkv_conv_t(
     }
 }
 
-// T-row fused ffn gate/up + silu*up + requant; slot is [T][64] f32 in LDS,
-// wave t requantizes row t
+// T-row fused ffn gate/up, silu*up and requant. slot is [T][64] floats in LDS, and
+// wave t requantizes row t.
 template <int T> __device__ __forceinline__ void qz_gemv_ffn_fused_t(
         const unsigned char * a_vals, const float * a_scal, int K,
         const char * gv, const __half * gs,
@@ -259,8 +258,7 @@ template <int T> __device__ __forceinline__ void qz_gemv_ffn_fused_t(
     }
 }
 
-// residual row for a norm: xn = a + b (b may be null), ss = this thread's sum
-// of squares, optional copy to st
+// Residual row for a norm. Fills xn = a + b (b may be null) and st if given, returns ss.
 __device__ __forceinline__ float qz_res_row(const float * a, const float * b,
                                             float * xn, float * st, int tid) {
     float xr[QZ_D / 512];
@@ -280,8 +278,8 @@ __device__ __forceinline__ float qz_res_row(const float * a, const float * b,
     return ss;
 }
 
-// rms norm + requant of the row in xn: ss is this thread's partial over
-// i = tid + 512k (same order as the T=1 phases), nwr the norm weights
+// RMS norm and requant of the row in xn. ss is this thread's partial over i = tid +
+// 512k, summed in the same order as the T=1 phases; nwr holds the norm weights.
 __device__ __forceinline__ void qz_norm_requant_row(
         float * xn, const float (&nwr)[QZ_D / 512], float ss, float eps,
         unsigned char * qv, float * qs, float * red, int tid) {
@@ -296,8 +294,7 @@ __device__ __forceinline__ void qz_norm_requant_row(
         red[8] = 1.f / sqrtf(ms / QZ_D + eps);
     }
     __syncthreads();
-    // scale + requant in one pass: each 32-lane half-wave covers one unit;
-    // xn keeps the scaled row
+    // Scale and requant in one pass, one unit per half-wave; xn keeps the scaled row.
     const float rs = red[8];
     #pragma unroll
     for (int k = 0; k < QZ_D / 512; k++) {
@@ -316,8 +313,8 @@ __device__ __forceinline__ void qz_norm_requant_row(
 
 #include "rowops.h"
 
-// q (or k) head row: f16 staging in aq, per-head rms norm, rope at position
-// pos on dims (j, j+32), j < 32; rope'd row stays in aq
+// Head row of q or k: f16 staging in aq, per-head RMS norm, rope at position pos over
+// the dim pairs (j, j+32) with j < 32. The roped row stays in aq.
 __device__ __forceinline__ void qz_head_norm_rope(
         const float * src, const float * nw, int pos, float eps, __half * aq, float * red, int tid) {
     if (tid < QZ_HD) aq[tid] = __float2half(src[tid]);
@@ -347,8 +344,8 @@ __device__ __forceinline__ void qz_head_norm_rope(
     __syncthreads();
 }
 
-// cycle LDS: region 0 = T plane rows + the f32 norm row, overlaid by the K/V
-// tiles and the DN scratch; then red, aq, scores + sml, part, ffn slot [T][64]
+// Cycle LDS layout. Region 0 holds the T plane rows and the f32 norm row, overlaid by
+// the K/V tiles and the DN scratch. Then red, aq, scores, sml, part and fslot [T][64].
 template <int T> __host__ __device__ constexpr size_t qz_cycle_r0() {
     const size_t planes = (size_t) T * (QZ_D + (QZ_D / 32) * 4) + (size_t) QZ_D * 4;
     const size_t tiles = (size_t) 2 * 32 * QZ_HD * 2;
@@ -356,14 +353,14 @@ template <int T> __host__ __device__ constexpr size_t qz_cycle_r0() {
     const size_t dn = sizeof(qz_dn_lds) > sizeof(qz_dn_rows_lds<T>) ? sizeof(qz_dn_lds) : sizeof(qz_dn_rows_lds<T>);
     return ((r > dn ? r : dn) + 15) & ~(size_t) 15;
 }
-// fslot (and the TP2 xrow stage at fslot + T*64) must be 16 B aligned
+
 template <int T> constexpr bool qz_cycle_fslot_aligned() {
     return (qz_cycle_r0<T>() + 12 * 4 + (size_t) QZ_HD * 2 + 36 * 4 + (size_t) 8 * QZ_HD * 4) % 16 == 0 &&
            ((size_t) T * 64 * 4) % 16 == 0;
 }
 static_assert(qz_cycle_fslot_aligned<1>() && qz_cycle_fslot_aligned<2>() &&
               qz_cycle_fslot_aligned<3>() && qz_cycle_fslot_aligned<4>(), "cycle LDS: fslot not 16 B aligned");
-// the exchange GEMVs stage their activation slice in region 0
+// The exchange GEMVs stage their activation slice in region 0.
 template <int T> constexpr bool qz_cycle_r0_holds_xrow() {
     return qz_cycle_r0<T>() >= (size_t) T * (QZ_FF / 2) * (1 + 4 / 32.0) &&
            qz_cycle_r0<T>() >= (size_t) T * (QZ_G / 2) * (1 + 4 / 32.0);
@@ -371,13 +368,13 @@ template <int T> constexpr bool qz_cycle_r0_holds_xrow() {
 static_assert(qz_cycle_r0_holds_xrow<1>() && qz_cycle_r0_holds_xrow<2>() &&
               qz_cycle_r0_holds_xrow<3>() && qz_cycle_r0_holds_xrow<4>(), "cycle LDS: region 0 < xrow slice");
 template <int T> static size_t qz_cycle_smem() {
-    // + the fl9c reduce state (rw2, 64 floats); the TP2 push stage starts at
-    // the same place and runs QZ_XSTAGE_BYTES past the end (the launch adds them)
+    // Adds the fl9c reduce state (rw2, 64 floats). The TP2 push stage starts at the
+    // same place and runs QZ_XSTAGE_BYTES past the end; the launch adds that much.
     return qz_cycle_r0<T>() + 12 * 4 + (size_t) QZ_HD * 2 + 36 * 4 + (size_t) 8 * QZ_HD * 4 + (size_t) T * 64 * 4 + 64 * 4;
 }
 
-// one MTP block pass: T rows (token ptok[t], hidden ph + t*ph_str) at p0 + t;
-// HEAD runs the lm_head and folds row am_row's argmax into *am_out
+// One MTP block pass over T rows at positions p0 + t, with token ptok[t] and hidden
+// ph + t * ph_str. HEAD runs the lm_head and folds row am_row's argmax into *am_out.
 template <int T, bool HEAD>
 __device__ __forceinline__ void qz_mtp_pass(
         qz_barrier_state * bst, int & kb, qz_trunk_args & A, const qz_mtp_w * M,
@@ -398,12 +395,12 @@ __device__ __forceinline__ void qz_mtp_pass(
     __half * kt = (__half *) lds_raw;      // fl9c K / V tile (region 0)
     const qz_trunk_w * W = &M->L;
     int tid = threadIdx.x;
-    asm volatile ("" : "+v"(tid));           // per pass: see qz_cycle
+    asm volatile ("" : "+v"(tid));           // tid opacity, per pass; see qz_cycle
     const int n_u = QZ_D / 32;
     float nwr[QZ_D / 512];
 
-    // eh_proj input: block 0 requants [enorm(embed) | hnorm(h)] per row into
-    // a gmem concat plane (too big for LDS)
+    // eh_proj input: block 0 requants [enorm(embed) | hnorm(h)] per row into a gmem
+    // concat plane, which is too big for LDS.
     if (blockIdx.x == 0) {
         #pragma unroll
         for (int k = 0; k < QZ_D / 512; k++) nwr[k] = M->enorm[tid + 512 * k];
@@ -443,7 +440,7 @@ __device__ __forceinline__ void qz_mtp_pass(
     }
     qz_grid_barrier(bst, ++kb);
 
-    // inpSA = eh_proj @ concat, then attn_norm planes per row
+    // inpSA = eh_proj @ concat, then the attn_norm planes per row.
     qz_gemv_slice_t<T>(A.cat_vals, A.cat_scal, 2 * QZ_D, M->eh_vals, M->eh_scal, QZ_D, A.y_g);
     qz_grid_barrier(bst, ++kb);
     #pragma unroll
@@ -461,7 +458,7 @@ __device__ __forceinline__ void qz_mtp_pass(
                             act_scales + (size_t) t * n_u, red, tid);
     }
 
-    // projections, then q/k norm + rope at p0+t and arena rows
+    // Projections, then q/k norm and rope at p0 + t, then the arena rows.
     qz_gemv_slice_t<T>(act_vals, act_scales, QZ_D, W->q_vals, W->q_scal, Gm::AQ, A.y_q);
     qz_gemv_slice_t<T>(act_vals, act_scales, QZ_D, W->k_vals, W->k_scal, Gm::AKV, A.y_k, (Gm::AQ / 32) % 60);
     qz_gemv_slice_t<T>(act_vals, act_scales, QZ_D, W->v_vals, W->v_scal, Gm::AKV, A.y_v, ((Gm::AQ + Gm::AKV) / 32) % 60);
@@ -487,13 +484,12 @@ __device__ __forceinline__ void qz_mtp_pass(
     }
     qz_grid_barrier(bst, ++kb);
 
-    // attention (fl9c, flash9c.h): split-K, FL9_NS partials per (row, head),
-    // rows causal to p0+t
+    // fl9c attention: split-K, FL9_NS partials per (row, head), rows causal to p0 + t.
     {
         qz_fl9c_flash<T, Gm::HQ, Gm::HKV>(W->kv_k, W->kv_v, A.q_f16, A.pm, A.pl, A.pacc, p0,
                                           kt, (__half *) part, tid);
         qz_grid_barrier(bst, ++kb);
-        // per (row, head) merge, gate, requant
+        // Per (row, head) merge, gate, requant.
         for (int it = blockIdx.x; it < T * Gm::HQ; it += gridDim.x) {
             const int t = it / Gm::HQ;
             qz_fl9c_reduce<T, Gm::HQ>(A.pm, A.pl, A.pacc, A.y_q + (size_t) t * Gm::AQ + QZ_HD, 2 * QZ_HD,
@@ -504,8 +500,8 @@ __device__ __forceinline__ void qz_mtp_pass(
         qz_grid_barrier(bst, ++kb);
     }
 
-    // attn_output GEMV, then h = inpSA + core out (block 0 keeps the row),
-    // post norm planes
+    // attn_output GEMV, then h = inpSA + core out, then the post norm planes. Block 0
+    // keeps the row.
     qz_xrow_t<T, QZ_TMAX>(bst, kb, A, ++xs, A.pl_vals, A.pl_scal, Gm::G, W->out_vals, W->out_scal, fslot + T * 64, A.y_core, (unsigned char *) lds_raw);
     #pragma unroll
     for (int k = 0; k < QZ_D / 512; k++) nwr[k] = W->post_norm[tid + 512 * k];
@@ -523,14 +519,14 @@ __device__ __forceinline__ void qz_mtp_pass(
                             act_scales + (size_t) t * n_u, red, tid);
     }
 
-    // ffn fused gate/up + down GEMV, same as the trunk phases
+    // Fused ffn gate/up and down GEMV, as in the trunk phases.
     qz_gemv_ffn_fused_t<T>(act_vals, act_scales, QZ_D, W->fg_vals, W->fg_scal, W->fu_vals, W->fu_scal,
                            Gm::FF, A.ffn_q, A.ffn_sc, fslot);
     qz_grid_barrier(bst, ++kb);
     qz_xrow_t<T, QZ_TMAX>(bst, kb, A, ++xs, A.ffn_q, A.ffn_sc, Gm::FF, W->fd_vals, W->fd_scal, fslot + T * 64, A.y_ffn, (unsigned char *) lds_raw);
 
-    // head input: out = h + ffn out, shared_head_norm; the normed row is the
-    // next draft step's hidden (block 0 keeps it in mtp_h)
+    // Head input: out = h + ffn out through shared_head_norm. The normed row is the
+    // next draft step's hidden; block 0 keeps it in mtp_h.
     #pragma unroll
     for (int k = 0; k < QZ_D / 512; k++) nwr[k] = M->shnorm[tid + 512 * k];
     #pragma unroll
@@ -549,8 +545,8 @@ __device__ __forceinline__ void qz_mtp_pass(
     }
 
     if (HEAD) {
-        // only row am_row produces a draft: the head GEMV streams the same
-        // weights for one row as for T, so score just that one
+        // Only row am_row produces a draft. The head GEMV streams the same weights for
+        // one row as for T, so score just that row.
         const int hn = A.hrows;
         qz_gemv_slice_t<1>(act_vals + (size_t) am_row * QZ_D, act_scales + (size_t) am_row * n_u,
                            QZ_D, A.hd_vals, A.hd_scal, hn, A.mtp_yhead);
@@ -574,7 +570,7 @@ __device__ __forceinline__ void qz_mtp_pass(
                     const int ix = ((int *)(part + 512))[t2];
                     if (v > b0 || (v == b0 && ix < i0)) { b0 = v; i0 = ix; }
                 }
-                // merge with the peer's half: one pair, block 0 alone
+                // Merge with the peer's half: one pair, block 0 alone.
                 const unsigned int tok = xs + 1;
                 const int gid = i0 + A.tp_card * A.hrows;
                 float * ph = A.xhm_peer + (size_t)(tok & 1) * QZ_TMAX * 2;
@@ -589,8 +585,8 @@ __device__ __forceinline__ void qz_mtp_pass(
     }
 }
 
-// the cycle: tokens A.toks[0..T-1] at A.pos..; outputs y_head [T][V] and
-// out_tok[t] = argmax of row t
+// The cycle. Runs tokens A.toks[0..T-1] at A.pos.. and writes y_head [T][V] plus
+// out_tok[t], the argmax of row t.
 template <int T>
 __global__ void __launch_bounds__(512)
 qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
@@ -609,8 +605,8 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
     float * rw2 = fslot + T * 64;          // fl9c reduce state, later the TP2 push stage
     __half * kt = (__half *) lds_raw;      // fl9c K / V tile (region 0)
 
-    // tid is made opaque every layer so per-thread addresses are not hoisted
-    // out of the loop (they spilled)
+    // tid is made opaque every layer so per-thread addresses are not hoisted out of
+    // the loop; hoisting them spilled registers.
     const int tid_k = threadIdx.x;
     int tid = tid_k;
     const int n_u = QZ_D / 32;
@@ -626,23 +622,22 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
         const qz_trunk_w * W = &A.w[il];
         float * xprev = A.x_rows + (size_t)(il & 1) * T * QZ_D;
         float * xin = A.x_rows + (size_t)((il + 1) & 1) * T * QZ_D;
-        // recr rows live in this cycle's ring slot; the other slot holds the
-        // previous cycle's rows for replay
+        // recr rows: this cycle's ring slot; the other slot holds the rows to replay
         float * rcur = W->recr ? W->ring + (size_t) par * Gm::RING_PAR : nullptr;
         const float * rprev = W->recr ? W->ring + (size_t)(par ^ 1) * Gm::RING_PAR : nullptr;
-        // DSpine features: the residual after layers 1, 16, 31, 46, 61 = this layer's input
+        // DSpine features: the residual entering layers 2, 17, 32, 47 and 62
         const int fq = !A.fcap ? -1 : il == 2 ? 0 : il == 17 ? 1 : il == 32 ? 2 : il == 47 ? 3 : il == 62 ? 4 : -1;
 
-        // phase A: per row, h + previous ffn out (or the embedding) -> attn_norm
-        // -> requant split over the grid into A.nq_*, then copied to LDS
+        // Phase A: per row, h plus the previous ffn out (or the embedding) through
+        // attn_norm and requant, split over the grid into A.nq_*, then copied to LDS.
         for (int t = 0; t < T; t++) {
             unsigned char * qv = act_vals + (size_t) t * QZ_D;
             float * qs = act_scales + (size_t) t * n_u;
             float ss = 0.f;
             __syncthreads();
             if (il > 0) {
-                // all loads first (the xin store may alias them, which would
-                // serialize load -> store -> load), same sum order
+                // all loads first: the xin store may alias them and serialize load ->
+                // store -> load. Same sum order.
                 float xr[QZ_D / 512];
                 #pragma unroll
                 for (int k = 0; k < QZ_D / 512; k++) {
@@ -679,7 +674,7 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
         qz_grid_barrier(bst, ++kb);
         qz_planes_to_lds<T, QZ_D>(A.nq_vals, A.nq_scal, act_vals, act_scales, tid);
 
-        // phase B: core projections over T rows
+        // Phase B: core projections over T rows.
         if (W->recr) {
             qz_gemv_qkv_conv_t<T>(act_vals, act_scales, QZ_D, W->qkv_vals, W->qkv_scal, Gm::CCH,
                                   rcur + Gm::RING_QKV, W->conv_state, W->conv1d, rcur + Gm::RING_CONV,
@@ -695,8 +690,8 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
         qz_grid_barrier(bst, ++kb);
 
         if (W->recr) {
-            // phase D: replay the previous cycle's accepted rows and commit,
-            // then run the T new rows without storing the state
+            // Phase D: replay the previous cycle's accepted rows and commit, then run
+            // the T new rows without storing the state.
             if (blockIdx.x < Gm::HV) {
                 const int h = blockIdx.x;
                 const int j = tid & (QZ_S - 1), r = tid >> 7;
@@ -706,7 +701,7 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
             }
             qz_grid_barrier(bst, ++kb);
         } else {
-            // phase C: q rows (norm + rope at pos+t) and arena k/v rows
+            // Phase C: q rows (norm and rope at pos + t) and the arena k/v rows.
             for (int it = blockIdx.x; it < T * Gm::HQ; it += gridDim.x) {
                 const int t = it / Gm::HQ, h = it % Gm::HQ;
                 qz_head_norm_rope(A.y_q + (size_t) t * Gm::AQ + (size_t) h * 2 * QZ_HD, W->q_norm_w,
@@ -727,13 +722,13 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
             }
             qz_grid_barrier(bst, ++kb);
 
-            // phase D: attention (fl9c, flash9c.h): split-K, FL9_NS partials
-            // per (row, head), rows causal to pos+t
+            // Phase D: fl9c attention, split-K with FL9_NS partials per (row, head),
+            // rows causal to pos + t.
             qz_fl9c_flash<T, Gm::HQ, Gm::HKV>(W->kv_k, W->kv_v, A.q_f16, A.pm, A.pl, A.pacc, A.pos,
                                               kt, (__half *) part, tid);
             qz_grid_barrier(bst, ++kb);
 
-            // phase E: per (row, head) merge, gate, requant
+            // Phase E: per (row, head) merge, gate, requant.
             for (int it = blockIdx.x; it < T * Gm::HQ; it += gridDim.x) {
                 const int t = it / Gm::HQ;
                 qz_fl9c_reduce<T, Gm::HQ>(A.pm, A.pl, A.pacc, A.y_q + (size_t) t * Gm::AQ + QZ_HD, 2 * QZ_HD,
@@ -745,11 +740,11 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
 
         }
 
-        // phase F: core-out GEMV off the gmem planes
+        // Phase F: core-out GEMV off the gmem planes.
         qz_xrow_t<T, QZ_TMAX>(bst, kb, A, ++xs, A.pl_vals, A.pl_scal, Gm::G, W->out_vals, W->out_scal, fslot + T * 64, A.y_core, (unsigned char *) lds_raw);
 
-        // phase G: per row, h = x + core out -> post norm -> requant as phase A;
-        // T <= 3 prefetches the next row's y_core (slower at T = 4)
+        // Phase G: per row, h = x + core out, then post norm and requant as in phase A.
+        // T <= 3 prefetches the next row's y_core; that is slower at T = 4.
         constexpr bool PF = T <= 3;
         float gb[QZ_D / 512];
         if constexpr (PF)
@@ -781,20 +776,20 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
         qz_grid_barrier(bst, ++kb);
         qz_planes_to_lds<T, QZ_D>(A.nq_vals, A.nq_scal, act_vals, act_scales, tid);
 
-        // phase H/I: fused gate/up + silu*up + requant, T rows
+        // Phases H and I: fused gate/up, silu*up and requant over T rows.
         qz_gemv_ffn_fused_t<T>(act_vals, act_scales, QZ_D, W->fg_vals, W->fg_scal, W->fu_vals, W->fu_scal,
                                Gm::FF, A.ffn_q, A.ffn_sc, fslot);
         qz_grid_barrier(bst, ++kb);
 
-        // FFN residual is h: promote the x rows, spread over the grid
+        // The FFN residual is h, so promote the x rows in place, spread over the grid.
         for (int i = blockIdx.x * 512 + tid; i < T * QZ_D; i += gridDim.x * 512)
             xin[i] = xin[i] + A.y_core[i];
 
-        // phase J: ffn down GEMV
+        // Phase J: ffn down GEMV.
         qz_xrow_t<T, QZ_TMAX>(bst, kb, A, ++xs, A.ffn_q, A.ffn_sc, Gm::FF, W->fd_vals, W->fd_scal, fslot + T * 64, A.y_ffn, (unsigned char *) lds_raw);
     }
 
-    // head: per row, x_out = h + ffn out -> out_norm -> planes; lm_head GEMV
+    // Head: per row, x_out = h + ffn out, then out_norm and the planes.
     {
         float * xlast = A.x_rows + (size_t)(A.n_layer & 1) * T * QZ_D;
         #pragma unroll
@@ -805,8 +800,8 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
             ss = qz_res_row(xlast + (size_t) t * QZ_D, A.y_ffn + (size_t) t * QZ_D, xn, nullptr, tid);
             qz_norm_requant_row(xn, nwr, ss, A.eps, act_vals + (size_t) t * QZ_D,
                                 act_scales + (size_t) t * n_u, red, tid);
-            // the normed row is the trunk h_nextn: the MTP catch-up input.
-            // Pure copy after the requant, trunk arithmetic untouched.
+            // The normed row is the trunk's h_nextn, the MTP catch-up input. This is a
+            // pure copy after the requant; the trunk arithmetic is untouched.
             if (A.mtp && blockIdx.x == 0)
                 for (int i = tid; i < QZ_D; i += 512)
                     A.h_nextn[(size_t) t * QZ_D + i] = xn[i];
@@ -817,7 +812,7 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
     qz_grid_barrier(bst, ++kb);
     const unsigned int htok = ++xs;
 
-    // argmax per row: block t folds row t
+    // Argmax per row: block t folds row t.
     if (blockIdx.x < T) {
         const float * yh = A.y_head + (size_t) blockIdx.x * hn;
         float bv = -3.4028235e38f;
@@ -837,7 +832,7 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
                 const int ix = ((int *)(part + 512))[t2];
                 if (v > b0 || (v == b0 && ix < i0)) { b0 = v; i0 = ix; }
             }
-            // own pair to y_part (block 0 merges), the same pair to the peer
+            // own pair to y_part, where block 0 merges, and the same pair to the peer
             const int gid = i0 + A.tp_card * A.hrows;
             A.y_part[2 * blockIdx.x] = b0;
             A.y_part[2 * blockIdx.x + 1] = __int_as_float(gid);
@@ -846,8 +841,8 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
             __threadfence_system();
         }
     }
-    // greedy verify: accept rows while row t's argmax equals row t+1's draft;
-    // the next cycle starts from the bonus token
+    // Greedy verify: accept rows while row t's argmax equals row t+1's draft. The next
+    // cycle resumes at the bonus token.
     qz_grid_barrier(bst, ++kb);
     if (blockIdx.x == 0 && tid == 0) {
         qz_xflag(A, htok);
@@ -873,8 +868,8 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
     }
 }
 
-// MTP draft kernel (right after qz_cycle, no host sync): catch-up over the
-// accepted rows, then drafts the next cycle's tokens into ctl[3..]
+// MTP draft pass, run right after qz_cycle with no host sync. Catches up over the
+// accepted rows, then drafts the next cycle's tokens into ctl[3..].
 template <int N> __device__ __forceinline__ void qz_mtp_catchup(
         qz_barrier_state * bst, int & kb, qz_trunk_args & A, int bonus, unsigned int & xs) {
     int ptk[N];
@@ -897,13 +892,13 @@ qz_mtp(qz_barrier_state * bst, qz_trunk_args A) {
         for (int t = 0; t < T; t++) pzt[t] = A.toks[0];
         qz_mtp_pass<T, false>(bst, kb, A, A.mtp, 0, pzt, nullptr, 0, 0, nullptr, xs);
     }
-    // catch-up over the accepted prefix only (n_acc is uniform: ctl[0])
+    // catch-up over the accepted prefix only; n_acc comes from ctl[0] and is uniform
     if (n_acc == 1)      qz_mtp_catchup<1>(bst, kb, A, bonus, xs);
     else if (n_acc == 2) qz_mtp_catchup<2>(bst, kb, A, bonus, xs);
     else if (n_acc == 3) { if constexpr (T >= 3) qz_mtp_catchup<3>(bst, kb, A, bonus, xs); }
     else                 { if constexpr (T >= 4) qz_mtp_catchup<4>(bst, kb, A, bonus, xs); }
     int hrow = n_acc - 1;            // hidden row feeding the draft chain
-    int tn = T;                      // next cycle's rows
+    int tn = T;                      // rows in the next cycle
     if (A.mtp_t > 0 && A.mtp_t < T) tn = A.mtp_t;
     else if (A.mtp_t < 0) {          // -(Tc + 8 * slack)
         const int tc = (-A.mtp_t) & 7, slack = (-A.mtp_t) >> 3;
@@ -911,7 +906,7 @@ qz_mtp(qz_barrier_state * bst, qz_trunk_args A) {
     }
     if (A.mtp_t != 0 && blockIdx.x == 0 && threadIdx.x == 0) A.ctl[7] = tn;   // ctl holds 8 ints
     for (int i = 1; i <= tn - 2; i++) {
-        qz_grid_barrier(bst, ++kb);   // d_i's store (last pass argmax) is
+        qz_grid_barrier(bst, ++kb);   // d_i is stored by the last pass's argmax,
                                       // behind that pass's final barrier
         const int pdt[1] = { A.ctl[2 + i] };
         qz_mtp_pass<1, true>(bst, kb, A, A.mtp, A.pos + n_acc + i, pdt,

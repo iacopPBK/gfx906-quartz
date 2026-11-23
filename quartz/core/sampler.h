@@ -1,5 +1,5 @@
-// Host sampler: llama.cpp's sampler chain over the exact per-row top-K
-// candidates (kernels/topk.h) of every card, plus the C API's spec conversion.
+// Host sampler: llama.cpp's sampler chain over the exact per-row top-K candidates of
+// both cards (kernels/topk.h), plus the C API spec conversion.
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -15,8 +15,8 @@
 #include "capi.h"
 #include "kernels/topk.h"
 
-// Sampled decode: llama.cpp's sampler chain (order codes 2 top-k, 3 top-p,
-// 4 min-p, 7 temperature), drafts accepted iff they equal the sample (exact).
+// Sampled decode: llama.cpp's sampler chain, with order codes 2 top-k, 3 top-p, 4 min-p
+// and 7 temperature. A draft is accepted only if it equals the sample, exactly.
 struct qz_sampling {
     float temp = 1.0f;
     int top_k = 0;
@@ -35,12 +35,12 @@ struct qz_sampler {
     std::vector<float2> tk[2];           // per card [rows][QZ_TOPK_NB][QZ_TOPK] (logit, id bits)
     std::vector<std::pair<float, int>> cand;
     void set(const qz_sampling * s) { smp = s; if (s) rng.seed(s->seed); }
-    int sample_row(int t);                              // one token from row t's candidates
-    // row t's chain: n candidate ids in cand with unnormalized weights w
+    int sample_row(int t);
+    // Row t's chain: ids in cand, unnormalized weights in w, n candidates returned.
     int row_chain(int t, std::vector<float> & w);
 };
 
-// qz_sampling_c -> the engine's spec; false if the chain is not one the engine samples exactly
+// C spec into qz_sampling. False when the engine cannot sample this chain exactly.
 inline bool qz_sampling_from_c(const qz_sampling_c * smp, qz_sampling & ms) {
     bool ok = smp->top_k >= 1 && smp->top_k <= QZ_TOPK && smp->n_order >= 1 && smp->n_order <= 8;
     bool seen_k = false;
@@ -74,7 +74,7 @@ inline int qz_sampler::row_chain(int t, std::vector<float> & w) {
     size_t n = std::min<size_t>(QZ_TOPK, cand.size());
     std::partial_sort(cand.begin(), cand.begin() + n, cand.end(), desc);
     cand.resize(n);
-    // the chain, as llama-sampler.cpp applies it to a sorted candidate array
+    // The chain, applied as llama-sampler.cpp does on a sorted candidate array.
     std::vector<float> & p = w;
     for (int k = 0; k < sp.n_order && n > 0; k++) {
         switch (sp.order[k]) {
@@ -120,7 +120,7 @@ inline int qz_sampler::row_chain(int t, std::vector<float> & w) {
 }
 
 inline int qz_sampler::sample_row(int t) {
-    // dist: softmax (float terms, double sum), one uniform draw, cumulative pick
+    // Softmax in float with a double sum, one uniform draw, then a cumulative pick.
     std::vector<float> p;
     const size_t n = (size_t) row_chain(t, p);
     std::uniform_real_distribution<double> u01(0.0f, 1.0f);

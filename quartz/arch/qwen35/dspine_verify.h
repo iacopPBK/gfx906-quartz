@@ -1,3 +1,5 @@
+// qwen35 verify: MV_T rows of one speculative round through the trunk on both cards,
+// then the head and mv_verify. Included by qwen35_model.cpp in namespace mv8 and mv12.
 #include <initializer_list>
 
 #include "core/devices.h"
@@ -120,8 +122,7 @@ __global__ void __launch_bounds__(512) mv_phase_dn(qz_trunk_args A, int il, int 
 
 
 // ------------------------------------------------------- verify GEMVs ----
-// T-row GEMVs: mv_gemv8P (T = 8), ds_gemvR (T = 12, dspine_block.h), up to 4 planes
-// per launch (ds_segs)
+// T-row GEMVs: mv_gemv8P for T = 8, ds_gemvR for T = 12 (dspine_block.h), up to 4 planes
 #ifndef MV_RL
 #define MV_RL 32
 #endif
@@ -137,21 +138,21 @@ __global__ void __launch_bounds__(512) mv_phase_dn(qz_trunk_args A, int il, int 
 #ifndef MV_PW
 #define MV_PW 16
 #endif
-#define MV_PU (65536 / (MV_T * 32))              // units staged by mv_gemv8P (MV_T * 32 * 256 = 64 KB)
+#define MV_PU (65536 / (MV_T * 32))              // units staged by mv_gemv8P: 64 KB, MV_T * 32 bytes each
 template <int S, int NW>
 __global__ void __launch_bounds__(64 * NW) mv_gemv8P(const unsigned char * a_vals, const float * a_scal, int K,
                                                     ds_segs G, int ngr) {
     extern __shared__ uint4 lsa[];
     const int lane = threadIdx.x & 63, wave = threadIdx.x >> 6, tid = threadIdx.x;
     const int n_u = K / 32, lsw = K / 32, ldw = K;
-    const int nst = min(n_u, MV_PU);           // staged units; the rest (down's last 16) from global
+    const int nst = min(n_u, MV_PU);           // staged units; the rest, the down layer's last 16, come from global
     for (int i = tid; i < MV_T * nst * 2; i += 64 * NW) {
         const int t = i / (nst * 2), r = i % (nst * 2);
         lsa[((size_t) t * 2 + (r & 1)) * nst + (r >> 1)] = *(const uint4 *)(a_vals + (size_t) t * K + r * 16);
     }
     __syncthreads();
     const __amdgpu_buffer_rsrc_t ra = __builtin_amdgcn_make_buffer_rsrc((void *) a_vals, (short) 0, MV_T * K, 0x00027000);
-    const int gw = __builtin_amdgcn_readfirstlane(blockIdx.x * NW + wave);   // wave-uniform: segment state in SGPRs
+    const int gw = __builtin_amdgcn_readfirstlane(blockIdx.x * NW + wave);   // wave-uniform, so the segment state stays in SGPRs
     for (int g = gw; g < ngr; g += gridDim.x * NW) {
         int i = 0;
         #pragma unroll
@@ -174,7 +175,7 @@ __global__ void __launch_bounds__(64 * NW) mv_gemv8P(const unsigned char * a_val
             rv[s] = __builtin_amdgcn_make_buffer_rsrc((void *)(w_vals + (size_t) r * ldw), (short) 0, n_u * 32, 0x00027000);
             rs[s] = __builtin_amdgcn_make_buffer_rsrc((void *)(w_scal + (size_t) r * lsw), (short) 0, n_u * 2, 0x00027000);
         }
-        // one unit step; GL: activations from global (the units past nst)
+        // one unit step; GL takes the activations from global (the units past nst)
         auto step = [&](int u, auto gl) {
             float sag[MV_T];
             #pragma unroll
@@ -236,8 +237,7 @@ __global__ void __launch_bounds__(64 * NW) mv_gemv8P(const unsigned char * a_val
 }
 
 
-// mv_gemv8P stages MV_PU units of the rows in LDS and reads the rest (at most
-// 64 per lane) from global memory: every K the verify uses must fit that
+// mv_gemv8P stages MV_PU units per row in LDS, the rest (max 64 per lane) from global
 static_assert(MV_T > 8 || (QZ_D / 32 <= MV_PU + 64 && QZ_G / 64 <= MV_PU + 64 && QZ_FF / 64 <= MV_PU + 64),
               "verify GEMV: a K too wide for mv_gemv8P");
 inline void mv_gemv8P_launch(hipStream_t st, const unsigned char * a, const float * as, int K,
@@ -253,8 +253,7 @@ inline void mv_gemv8P_launch(hipStream_t st, const unsigned char * a, const floa
     } else
         mv_gemv8P<MV_PS, MV_PW><<<dim3(60), dim3(64 * MV_PW), (size_t) MV_T * 32 * std::min(K / 32, MV_PU), st>>>(a, as, K, G, b);
 }
-// down at > 8 rows: T x 8704 activations do not fit 64 KB, so the grid splits
-// K in MV_DKC chunks; chunk c's partial lands at y + c T N (y_part sized for it)
+// down at > 8 rows: T x 8704 activations exceed 64 KB, so MV_DKC chunks land at y + c T N
 #ifndef MV_DKC
 #define MV_DKC 2
 #endif
@@ -323,7 +322,7 @@ __global__ void __launch_bounds__(512) mv_xfin(qz_trunk_args A, unsigned int tok
 __global__ void __launch_bounds__(256) mv_ffn_act(qz_trunk_args A, int il, const float * yg, const float * yu, int N) {
     unsigned char * ffn_q = A.ffn_q;
     float * ffn_sc = A.ffn_sc;
-    {   // the phase's residual promote xin += y_core, spread over the grid
+    {   // the phase's residual promote, xin += y_core, spread over the grid
         float * xin = A.x_rows + (size_t) ((il + 1) & 1) * MV_T * QZ_D;
         for (int i = blockIdx.x * 256 + threadIdx.x; i < MV_T * QZ_D; i += gridDim.x * 256)
             xin[i] = xin[i] + A.y_core[i];
@@ -378,7 +377,7 @@ __global__ void __launch_bounds__(512) mv_phase_rope(qz_trunk_args A, int il, in
 }
 
 #include "flash9.h"
-// the verify attention: flash9.h's split-K kernel + its reduce
+// the verify attention: flash9.h's split-K kernel and its reduce
 inline void mv_fl9_init() {
     using Gm = qz_geo<MV_T>;
     CHECK(hipFuncSetAttribute((const void *) mv_fl9_k<Gm::HQ, Gm::HKV>, hipFuncAttributeMaxDynamicSharedMemorySize, FL9_LDS));
@@ -471,14 +470,14 @@ struct mv_ctx {
     hipStream_t st = nullptr;
     qz_trunk_args Ah = {};                // host staging, passed by value per launch
     bool part_shared = false;              // pm / pl / pacc carved from the engine's scratch (not freed here)
-    float * ring8 = nullptr;               // [n_recr][2 slots][RING_PAR(TR = 8)]
+    float * ring8 = nullptr;               // [n_recr][2 slots][qz_geo<MV_TR>::RING_PAR]
     float * xhm = nullptr;                 // head-merge inbox [2 slots][MV_T*2]
     float * g8a = nullptr, * g8b = nullptr; // ffn gate / up outputs [MV_T][FF per card]
     unsigned int * xflag = nullptr;        // [64] exchange flags
     int * ctl_d = nullptr;                // [8] ctl (both cards compute it)
     int * toks_d = nullptr;                // [MV_T] the round's row tokens
     long long * st_d = nullptr;            // the flash clock-counter dummy
-    std::vector<qz_trunk_w> wh;            // host copy of the engine's per-layer
+    std::vector<qz_trunk_w> wh;            // host copy of the engine's per-layer weights
     qz_trunk_w * w_d = nullptr;             // ring pointers patched, device copy
 };
 

@@ -1,6 +1,6 @@
 """Per-architecture chat dialects: how a model's generated text splits into
-reasoning, content and tool calls (whole answers and streamed), keyed on the
-GGUF general.architecture."""
+reasoning, content and tool calls, whole or streamed, keyed on the GGUF
+general.architecture."""
 import json
 import re
 import uuid
@@ -12,7 +12,7 @@ def _call(name, args):
 
 
 def _param_types(tools):
-    """{function name: {parameter: JSON schema type}} from the request's tools."""
+    """JSON schema type per function name and parameter, from the request's tools."""
     types = {}
     for t in tools or []:
         f = t.get("function", t) if isinstance(t, dict) else {}
@@ -22,7 +22,8 @@ def _param_types(tools):
 
 
 class Dialect:
-    """The interface; a stream gets send callbacks reasoning(s), content(s), calls(list), each -> bool (False: client gone)."""
+    """The interface. A stream gets the callbacks reasoning(s), content(s) and
+    calls(list), each returning bool, where False means the client is gone."""
     special_pieces = False      # decode control tokens into the text (the parser reads them)
 
     def think_open(self, rendered):
@@ -30,11 +31,11 @@ class Dialect:
         return False
 
     def parse(self, text, think_open, tools):
-        """A whole answer -> (reasoning or None, content, tool calls)."""
+        """Split a whole answer into (reasoning or None, content, tool calls)."""
         raise NotImplementedError
 
     def stream(self, think_open, tools, reasoning, content, calls):
-        """An object with feed(s) -> bool and close() -> the tool calls sent."""
+        """The streaming parser. feed(s) -> bool, close() -> the tool calls sent."""
         raise NotImplementedError
 
     def flags(self, text, think_open, content, calls):
@@ -43,7 +44,8 @@ class Dialect:
 
 
 class Qwen(Dialect):
-    """<think> ... </think> reasoning (opened by the template), XML or JSON <tool_call> blocks."""
+    """Reasoning sits between the <think> and </think> tags the template opens, and
+    tool calls come in XML or JSON <tool_call> blocks."""
     TOOL_OPEN = "<tool_call>"
 
     def think_open(self, rendered):
@@ -51,7 +53,8 @@ class Qwen(Dialect):
 
     @staticmethod
     def split_reasoning(text, think_open):
-        """With thinking open, text up to </think> (all of it if it never comes) is reasoning."""
+        """With thinking open, the text up to </think> is reasoning, all of it if the
+        tag never comes."""
         if not think_open:
             return None, text
         if "</think>" in text:
@@ -61,16 +64,16 @@ class Qwen(Dialect):
 
     @classmethod
     def parse_tool_calls(cls, text, tools):
-        """XML (or JSON) tool calls -> (content before the first call, OpenAI tool_calls);
-        values parse as JSON unless the schema says string."""
+        """Split XML or JSON tool calls off the text, giving the content before the first
+        call and OpenAI tool_calls; values parse as JSON unless the schema says string."""
         i = text.find(cls.TOOL_OPEN)
         if i < 0:
             return text, []
         content = text[:i].rstrip()
         types = _param_types(tools)
         calls = []
-        # a closing tag ends its element only where the next tag of the structure (or the
-        # end) follows it, so values that contain the tags themselves (code, docs) survive
+        # </tool_call> closes the element only when the next <tool_call> or the end
+        # follows, so values that contain the tag itself (code, docs) survive
         for blk in re.finditer(r"<tool_call>(.*?)(?:</tool_call>\s*(?=<tool_call>|$)|$)", text[i:], re.S):
             body = blk.group(1)
             name, args = None, {}
@@ -128,7 +131,7 @@ class _QwenStream:
         self.d, self.tools = d, tools
         self.send_r, self.send_c, self.send_calls = reasoning, content, calls
         self.think, self.buf = think_open, ""                # reasoning until </think>
-        self.on, self.pend, self.tail = False, "", ""        # tools: content up to <tool_call>, the rest held
+        self.on, self.pend, self.tail = False, "", ""        # tools: content up to <tool_call> is sent, the rest held
 
     def _content(self, s):
         if not self.tools:
@@ -184,9 +187,10 @@ class _QwenStream:
 
 
 class Inkling(Dialect):
-    """Model messages as control-token blocks: <|message_model|>[name]<|content_KIND|>body<|end_message|>,
-    KIND thinking / text / invoke_tool_json ({"name", "args"}) / invoke_tool_text; the answer ends
-    with <|content_model_end_sampling|>."""
+    """Model messages are control-token blocks:
+    <|message_model|>[name]<|content_KIND|>body<|end_message|>, with KIND one of
+    thinking, text, invoke_tool_json ({"name", "args"}) or invoke_tool_text. The
+    answer ends with <|content_model_end_sampling|>."""
     special_pieces = True
     _KIND = {"<|content_thinking|>": "think", "<|content_text|>": "text",
              "<|content_invoke_tool_json|>": "tool_json", "<|content_invoke_tool_text|>": "tool_text"}
