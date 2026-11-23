@@ -18,6 +18,20 @@ inline double ink2_ctx_bytes(int ctx, int card, bool ds) {
 // 2026-11-23 at 262144: 20.6 GB per card (this estimate: 20.9)
 constexpr double INK_PF_FIXED = 1.5e9, INK_PF_DS0 = 0.25e9, INK_PF_DS1 = 0.2e9, INK_PF_HEADROOM = 0.25e9;
 
+// the vision encoder (QZ_MMPROJ, set by the server's --mmproj) on card 0: its weights (the
+// file) and its activations at the 4096-token image limit
+constexpr double INK_PF_VIS = 1.15e9;
+inline double ink2_vis_bytes() {
+    const char * p = getenv("QZ_MMPROJ");
+    if (!p) return 0;
+    FILE * f = fopen(p, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    const double b = (double) ftell(f);
+    fclose(f);
+    return b + INK_PF_VIS;
+}
+
 // the drafter's weights on card c (its TP2 slices; the Markov chain's tensors on card 0), 0 if unreadable
 inline double ink2_ds_weight_bytes(const char * path, int c) {
     qz_gguf g;
@@ -40,7 +54,8 @@ inline int ink2_vram_check(const qz_gguf & g, int ctx, const char * dspark) {
         if (hipSetDevice(qz_dev_of(c)) != hipSuccess || hipMemGetInfo(&fr, &tot) != hipSuccess) return 0;
         w[c] = (double) L.need_bytes; free_b[c] = (double) fr; total_b[c] = (double) tot;
         need[c] = w[c] + ink2_ctx_bytes(ctx, c, ds) + INK_PF_FIXED + INK_PF_HEADROOM +
-                  (ds ? ink2_ds_weight_bytes(dspark, c) + (c == 0 ? INK_PF_DS0 : INK_PF_DS1) : 0.0);
+                  (ds ? ink2_ds_weight_bytes(dspark, c) + (c == 0 ? INK_PF_DS0 : INK_PF_DS1) : 0.0) +
+                  (c == 0 ? ink2_vis_bytes() : 0.0);
     }
     (void) hipSetDevice(qz_dev_of(0));
     fprintf(stderr, "inkling2: memory per card: weights %.1f + context %.1f (ctx %d)%s + buffers %.1f = %.1f / %.1f GB; free %.1f and %.1f GB\n",

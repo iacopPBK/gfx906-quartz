@@ -34,8 +34,8 @@ must be gfx906 with peer access; `core/devices.h` picks the pair at start.
    (`arch/qwen35/qwen35_cycle.hip`, `arch/qwen35/engine.h`). Every block of the kernel stays resident
    and synchronizes through a grid barrier, which is why the GPU must have 60
    CUs.
-5. **Images.** With `--mmproj`, images are encoded on card 0 (`vision/qwen3vl.cpp`)
-   and their rows replace the image placeholder tokens in the prompt.
+5. **Images.** With `--mmproj`, images are encoded (`vision/qwen3vl.cpp`, split over
+   both cards) and their rows replace the image placeholder tokens in the prompt.
 
 ## Drafters
 
@@ -80,4 +80,7 @@ own engine; its forward pass is written down in [inkling2.md](inkling2.md).
   partials summed on both); each row's
   token is picked (greedy or sampled) as one plain step would pick it.
   The switch falls back to one token per step while that is faster.
+- **Images** are encoded on card 0 by `vision/inkling2v.cpp` (rocBLAS GEMMs);
+  their rows replace the template's image placeholder in the prefill, without
+  the embedding norm. Image prompts decode like text, DSpark included.
 - **Memory** is checked at start by `ink2_preflight.h`.

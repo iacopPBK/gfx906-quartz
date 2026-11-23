@@ -12,6 +12,7 @@ architectures alone.
 | `general.architecture` | Directory | Model | Notes |
 |---|---|---|---|
 | `qwen35` | `quartz/arch/qwen35/` | Swift-1.5-Qwen3.8-27B Q8_0 (with the nextn block) | TP2, MTP and DSpine, prefix cache, qwen3vl image input |
+| `inkling2_loop` | `quartz/arch/inkling2/` | Inkling-2-Mini Q8_0 | TP2, DSpark, prefix cache, inkling2v image input |
 
 ## Layout
 

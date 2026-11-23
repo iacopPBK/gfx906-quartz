@@ -37,6 +37,13 @@ static __global__ __launch_bounds__(256) void k_pf_embed(const int * tok, const 
     for (int k = 0; k < D / 256; k++) x[(size_t) row * D + t + k * 256] = v[k] * r * w[t + k * 256];
 }
 
+// image rows: row r of the chunk takes image row irow[r] as is (no embedding norm), irow < 0 keeps the token's
+static __global__ __launch_bounds__(256) void k_pf_img(const int * irow, const float * img, float * x) {
+    const int r = irow[blockIdx.x];
+    if (r < 0) return;
+    for (int i = threadIdx.x; i < D; i += 256) x[(size_t) blockIdx.x * D + i] = img[(size_t) r * D + i];
+}
+
 // mix(blocks, cur, query), one row per block: the states are [PF_M][D] batch
 // buffers at the same row; MQ query columns land in out[j*ostr + row]. The
 // row's state values stay in registers (one read of each state)
@@ -878,6 +885,11 @@ struct ink2_pf {
     float * dtaps = nullptr;
     std::function<void(int, int)> on_chunk;
     float * tapd = nullptr;            // card 0: one chunk's head mixes
+    // the prompt's image rows: irow[pos] (host, per prompt position, -1: a token) indexes
+    // img[c] (each card's copy, [rows][D]); null: text only
+    const int * irow = nullptr;
+    const float * img[2] = {};
+    int * irw[2] = {};                 // the chunk's irow on each card
     bool tapping() const { return dtaps != nullptr; }
     void tap(int k, int p0, int m) {
         if (!tapping()) return;
@@ -1217,6 +1229,11 @@ struct ink2_pf {
                 pf_card & b = B[c];
                 ICHECK(hipMemcpyAsync(b.TOK, prompt + p0, (size_t) m * 4, hipMemcpyHostToDevice, K.st));
                 k_pf_embed<<<m, 256, 0, K.st>>>(b.TOK, K.embd.v, K.embd.s, K.embd_norm, E.hp.eps, b.X);
+                if (irow && std::any_of(irow + p0, irow + p0 + m, [](int r) { return r >= 0; })) {
+                    if (!irw[c]) ICHECK(qz_dmalloc((void **) &irw[c], (size_t) PF_M * 4, "images"));
+                    ICHECK(hipMemcpyAsync(irw[c], irow + p0, (size_t) m * 4, hipMemcpyHostToDevice, K.st));
+                    k_pf_img<<<m, 256, 0, K.st>>>(irw[c], img[c], b.X);
+                }
             }
             ink2_engine::seq S;
             for (int il = 0; il < LOOP0; il++) { if (il == 5) tap(0, p0, m); layer(il, il, p0, m, S); }

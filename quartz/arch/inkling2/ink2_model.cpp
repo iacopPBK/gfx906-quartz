@@ -35,6 +35,111 @@ struct ink2_ctx : qz_ctx {
     ink2_dspark DS;
     bool ds_on = false;
     static constexpr int tail = 64;
+    // images (--mmproj, inkling2v): encoded rows cached by content (host), each card's
+    // copy of the current prompt's rows
+    struct img { uint64_t hash = 0; int id = 0, nx = 0, ny = 0; unsigned long use = 0; std::vector<float> rows; };
+    inkling2v::qz_vision * vis = nullptr;
+    std::vector<img> imgs;
+    unsigned long img_clock = 0;
+    int img_next = 0;
+    float * img_dev[2] = {};
+    size_t img_cap = 0;
+
+    ~ink2_ctx() override { if (vis) inkling2v::qz_vision_free(vis); }   // device memory is released at process exit
+    int vision_attach(const char * mmproj) override {
+        if (vis) return -1;
+        if (!inkling2v::qz_vision_is(mmproj)) { fprintf(stderr, "inkling2: %s is not an inkling2v projector\n", mmproj); return -1; }
+        vis = inkling2v::qz_vision_load(mmproj);
+        ICHECK(hipSetDevice(qz_dev_of(0)));
+        if (!vis) return -1;
+        if (inkling2v::qz_vision_n_embd(vis) != D) {
+            fprintf(stderr, "inkling2: projector width %d != model width %d\n", inkling2v::qz_vision_n_embd(vis), D);
+            inkling2v::qz_vision_free(vis); vis = nullptr; return -1;
+        }
+        return 0;
+    }
+    static uint64_t fnv(const void * b, size_t n) {
+        uint64_t h = 1469598103934665603ull;
+        for (size_t i = 0; i < n; i++) { h ^= ((const unsigned char *) b)[i]; h *= 1099511628211ull; }
+        return h;
+    }
+    int image_add(const void * bytes, size_t n, int * nx, int * ny) override {
+        if (!vis) return -1;
+        const uint64_t h = fnv(bytes, n) ^ (uint64_t) n;
+        for (auto & im : imgs)
+            if (im.hash == h) {
+                im.use = ++img_clock;
+                if (nx) *nx = im.nx;
+                if (ny) *ny = im.ny;
+                return im.id;
+            }
+        int gx = 0, gy = 0;
+        const int nt = inkling2v::qz_vision_encode(vis, bytes, n, &gx, &gy);
+        ICHECK(hipSetDevice(qz_dev_of(0)));
+        if (nt <= 0) return -1;
+        if ((int) imgs.size() >= 8) imgs.erase(std::min_element(imgs.begin(), imgs.end(), [](const img & a, const img & b) { return a.use < b.use; }));
+        img im;
+        im.hash = h; im.id = img_next++; im.nx = gx; im.ny = gy; im.use = ++img_clock;
+        im.rows.resize((size_t) nt * D);
+        if (inkling2v::qz_vision_copy_rows(vis, im.rows.data()) != nt) return -1;
+        imgs.push_back(std::move(im));
+        if (nx) *nx = gx;
+        if (ny) *ny = gy;
+        return imgs.back().id;
+    }
+    double image_last_ms() const override { return vis ? inkling2v::qz_vision_last_ms(vis) : 0.0; }
+    // the prompt's image rows: each run of IMG_PAD takes the next image, nx * ny long. irow per
+    // position (-1: a token), keys: the prefix-cache key per position (an image row's: its image's
+    // content hash and the row); the rows uploaded to both cards. false: the runs do not match
+    bool image_rows(const int32_t * p, int P, const int * ids, int n_images, std::vector<int> & irow, std::vector<uint64_t> & keys) {
+        std::vector<const img *> im(n_images);
+        size_t R = 0;
+        for (int k = 0; k < n_images; k++) {
+            for (auto & e : imgs) if (e.id == ids[k]) im[k] = &e;
+            if (!im[k]) { fprintf(stderr, "inkling2: image %d not in the cache\n", ids[k]); return false; }
+            R += (size_t) im[k]->nx * im[k]->ny;
+        }
+        if (p[P - 1] == IMG_PAD) return false;
+        irow.assign(P, -1);
+        int k = 0, row = 0;
+        for (int q = 0; q < P;) {
+            if (p[q] != IMG_PAD) { q++; continue; }
+            int e = q;
+            while (e < P && p[e] == IMG_PAD) e++;
+            if (k >= n_images || e - q != im[k]->nx * im[k]->ny) {
+                fprintf(stderr, "inkling2: image run of %d tokens at %d does not match image %d\n", e - q, q, k);
+                return false;
+            }
+            for (int i = 0; i < e - q; i++) {
+                irow[q + i] = row + i;
+                uint64_t x = im[k]->hash + 0x9e3779b97f4a7c15ull * (uint64_t) (i + 1);
+                x ^= x >> 31; x *= 0xbf58476d1ce4e5b9ull; x ^= x >> 29;
+                keys[q + i] = x | (1ull << 63);           // never a token id
+            }
+            row += e - q;
+            q = e;
+            k++;
+        }
+        if (k != n_images) { fprintf(stderr, "inkling2: %d images for %d image runs\n", n_images, k); return false; }
+        for (int c = 0; c < 2; c++) {
+            ICHECK(hipSetDevice(qz_dev_of(c)));
+            if (R > img_cap) {
+                if (img_dev[c]) (void) qz_dfree(img_dev[c]);
+                img_dev[c] = nullptr;
+                qz_mem_scope mem("images");
+                if (qz_dmalloc((void **) &img_dev[c], R * D * sizeof(float)) != hipSuccess) { img_cap = 0; return false; }
+            }
+            size_t off = 0;
+            for (int j = 0; j < n_images; j++) {
+                const size_t b = (size_t) im[j]->nx * im[j]->ny * D;
+                ICHECK(hipMemcpy(img_dev[c] + off, im[j]->rows.data(), b * sizeof(float), hipMemcpyHostToDevice));
+                off += b;
+            }
+        }
+        if (R > img_cap) img_cap = R;
+        ICHECK(hipSetDevice(qz_dev_of(0)));
+        return true;
+    }
 
     void info(qz_model_info * out) const override {
         memset(out, 0, sizeof(*out));
@@ -42,7 +147,9 @@ struct ink2_ctx : qz_ctx {
         snprintf(out->name, sizeof(out->name), "%s", name.c_str());
         out->n_vocab = VOCAB_REAL;
         out->max_ctx = E.ctx;
-        out->img_pad = -1;
+        out->img_pad = IMG_PAD;
+        out->vision = vis != nullptr;
+        out->dspine = ds_on;
     }
     int max_ctx() const override { return E.ctx; }
     void abort() override { abort_flag = true; }
@@ -51,14 +158,14 @@ struct ink2_ctx : qz_ctx {
         ICHECK(hipSetDevice(qz_dev_of(0)));
     }
 
-    int generate(const int32_t * prompt, int n_prompt, const int *, int n_images, int max_new,
+    int generate(const int32_t * prompt, int n_prompt, const int * images, int n_images, int max_new,
                  const int32_t * stop, int n_stop, qz_emit_cb cb, void * user,
                  qz_stats * out, const qz_sampling_c * smp) override {
         using clk = std::chrono::steady_clock;
         qz_stats st{};
         st.n_prompt = n_prompt;
         auto fin = [&](int rc) { if (out) *out = st; abort_flag = false; return rc; };
-        if (!prompt || n_prompt < 1 || n_images > 0) { st.stop = -1; return fin(-1); }
+        if (!prompt || n_prompt < 1 || n_images < 0 || (n_images && !images)) { st.stop = -1; return fin(-1); }
         if (n_prompt + max_new > E.ctx) { fprintf(stderr, "inkling2: %d + %d tokens exceed the context %d\n", n_prompt, max_new, E.ctx); st.stop = -1; return fin(-1); }
         qz_sampling ms;
         qz_sampler sam;
@@ -90,6 +197,12 @@ struct ink2_ctx : qz_ctx {
         h.sync = [&] { sync2(); };
         h.valid = [&](int s) { return hi < s - WIN + 1 + PF_RING; };
         std::vector<uint64_t> keys(prompt, prompt + n_prompt);
+        std::vector<int> irow;
+        if (n_images || std::find(prompt, prompt + n_prompt, IMG_PAD) != prompt + n_prompt) {
+            if (!image_rows(prompt, n_prompt, images, n_images, irow, keys)) { st.stop = -1; return fin(-1); }
+            EPF.irow = irow.data(); EPF.img[0] = img_dev[0]; EPF.img[1] = img_dev[1];
+        }
+        struct unset { ink2_pf & f; ~unset() { f.irow = nullptr; } } un{EPF};
         const int start = pc.prefill(prompt, n_prompt, keys, END_MESSAGE, PF_M, tail, h);
         if (start < 0) { st.stop = abort_flag ? 2 : -1; return fin(0); }
         st.n_cached = start;

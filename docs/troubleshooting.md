@@ -20,7 +20,7 @@ The server checks these in a second and exits with code 2.
 | Symptom | Cause and fix |
 |---|---|
 | `error: engine load failed … (the lines above say why …)` | The engine refused the setup. Read the lines above it: usually a Qwen target has no MTP (nextn) block, the model is not the supported geometry, or the cards lack free memory. |
-| `error: projector load failed` | The `--mmproj` file is not the `qwen3vl_merger` projector, or there is no memory left for it. |
+| `error: projector load failed` | The `--mmproj` file is not the model's projector (`qwen3vl_merger` for Qwen, `inkling2v` for Inkling), or there is no memory left for it. |
 | `card N … has X of 34.3 GB free and this start needs about Y GB` | Not enough free VRAM, checked before the weights load. The line under it names the largest `--max-ctx` that fits, and says when another process already holds memory. For Qwen, the default context with DSpine needs about 59 GB across the two cards; lower `--max-ctx` or drop `--dspine`. `QZ_NO_PREFLIGHT=1` loads anyway. |
 | `HIP 0 and HIP 1 are not a usable pair (no peer access …); usable pairs: none` | The cards cannot reach each other's memory over PCIe, so quartz cannot run on them. See [Cards](#cards) below. |
 | `peer check: … did not finish` or `… words arrived wrong` | A kernel on one card wrote into the other card's memory and the data did not arrive intact. quartz cannot run on that pair: check the PCIe topology and the platform's IOMMU and peer-to-peer settings. |

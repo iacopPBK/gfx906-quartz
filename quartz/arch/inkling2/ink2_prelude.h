@@ -22,6 +22,7 @@
 #include "arch.h"
 #include "core/cards.h"
 #include "core/sampler.h"
+#include "vision/inkling2v.h"
 #include <hip/hip_runtime.h>
 // the xor butterfly (32, 16, 8, 4, 2, 1) with the in-row levels as DPP: after
 // the xor-16 level a lane's value depends only on lane & 15, so row_ror:8 is

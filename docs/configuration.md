@@ -17,7 +17,7 @@ pi model and DSpine, `--max-ctx 32768`, a 2.7k-token prompt; they vary ±3%.
 |---|---|---|
 | `--model` | required | Target GGUF |
 | `--dspine` | unset | Draft GGUF: DSpine for Qwen (images stay on MTP), DSpark for Inkling |
-| `--mmproj` | unset | `qwen3vl_merger` projector; enables image input (Qwen only) |
+| `--mmproj` | unset | Vision projector: `qwen3vl_merger` for Qwen, `inkling2v` for Inkling; enables image input |
 | `--lib` | `build/bin/libquartz.so` | Engine library |
 | `--host`, `--port` | `127.0.0.1`, `8090` | Bind address, no authentication |
 | `--max-ctx` | `262144` | Context length, at least 1024; 262144 takes about 59 GB in total for Qwen with DSpine (see [requirements](requirements.md) for Inkling) |
@@ -42,7 +42,7 @@ The server sets
 | `QZ_NO_SWITCH` | unset | Set to `1` to keep the draft model for the whole answer. By default, with `--dspine`, Qwen switches between DSpine and MTP mid-answer on acceptance, and Inkling between DSpark rounds and one token per step on measured speed |
 | `QZ_SW_LO`, `QZ_SW_HI`, `QZ_SW_WIN` | Qwen: `3.8`, `3.4`, `128` | Leave DSpine below, leave MTP at or above this many tokens per round; window averaged. Each on its drafter's own scale, so `lo > hi` is intended |
 | `QZ_SW_LO`, `QZ_SW_WIN` | Inkling: `2.7`, `16` | The window (tokens) over which DSpark rounds are timed against the plain step; `lo` is the tokens per round to leave below while the plain step has not been timed yet |
-| `QZ_IMG_MIN_TOKENS`, `QZ_IMG_MAX_TOKENS` | `8`, `4096` | Fewest and most tokens an image resizes to; each token takes a context row |
+| `QZ_IMG_MIN_TOKENS`, `QZ_IMG_MAX_TOKENS` | `8`, `4096` | Fewest and most tokens an image resizes to; each token takes a context row. Inkling keeps an image at its own size (padded to 40 px) unless it is over the maximum, and has no minimum |
 
 ## Log
 

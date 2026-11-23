@@ -13,7 +13,7 @@ defaults and environment variables are in
 | Toolchain | ROCm: `hipcc`, HIP runtime, rocBLAS; a C++17 compiler | build, run |
 | Model (`--model`) | Qwen3.8-27B (or a fine-tune) as **Q8_0** GGUF, **with the nextn (MTP) block**, ~28 GB; or Inkling-2-Mini as **Q8_0** GGUF, ~28 GB | all |
 | Drafter (`--dspine`) | Qwen: DSpine draft GGUF, ~2.1 GB. Inkling: DSpark draft GGUF, ~0.4 GB | decode |
-| Projector (`--mmproj`) | `qwen3vl_merger` vision GGUF, ~0.9 GB (Qwen only) | images |
+| Projector (`--mmproj`) | Qwen: `qwen3vl_merger` vision GGUF, ~0.9 GB. Inkling: `inkling2v` vision GGUF, ~0.6 GB | images |
 | Runtime | Python 3 with `jinja2` | server |
 
 ## Hardware
@@ -36,8 +36,9 @@ defaults and environment variables are in
   sliding-window rings take a fixed 0.7 GB. The DSpark drafter is split over
   both cards like the target; its context cache adds 6 KB per token per card
   (1.6 GB at 262144). At the default context the cards hold 20.6 GB each, and
-  with DSpark 22.4 GB on card 0 and 22.2 GB on card 1. The start-up check is in
-  `arch/inkling2/ink2_preflight.h`.
+  with DSpark 22.4 GB on card 0 and 22.2 GB on card 1. The vision encoder
+  (`--mmproj`) takes up to about 1.8 GB more on card 0 (weights and buffers for a
+  4096-token image). The start-up check is in `arch/inkling2/ink2_preflight.h`.
 - **gfx906 only** (MI50, MI60). The kernels use gfx906 instructions and assume
   its 60 CUs and 64 KB of LDS; load aborts on a card where they do not fit.
 - **P2P setup.** The server sets `HSA_FORCE_FINE_GRAIN_PCIE=1` and
@@ -69,7 +70,8 @@ the nextn (MTP) block.
 - Inkling: the GGUF's `general.architecture` must be `inkling2_loop`, and its
   tensors must match [inkling2.md](inkling2.md) (checked at load). Without a
   drafter, decode runs one token per step. The DSpark draft reads the target's
-  embeddings and features, so it must match the target. No image input.
+  embeddings and features, so it must match the target. Images keep their own
+  size (padded to a multiple of 40 px); over 4096 tokens they are scaled down.
 
 ## Server
 

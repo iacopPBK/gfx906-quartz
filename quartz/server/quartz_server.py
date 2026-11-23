@@ -784,7 +784,7 @@ def main():
     ap.add_argument("--top-k", type=int, default=20, help="default top-k (1..64 when sampling)")
     ap.add_argument("--top-p", type=float, default=0.95, help="default top-p")
     ap.add_argument("--min-p", type=float, default=0.0, help="default min-p")
-    ap.add_argument("--mmproj", default=None, help="vision projector GGUF (qwen3vl_merger): image input in chat")
+    ap.add_argument("--mmproj", default=None, help="vision projector GGUF (Qwen: qwen3vl_merger, Inkling: inkling2v): image input in chat")
     ap.add_argument("--dspine", default=None, help="DSpine draft GGUF: decode with the block drafter")
     ap.add_argument("--progress", type=float, default=0, metavar="SECONDS",
                     help="log decode progress every SECONDS (0: off)")

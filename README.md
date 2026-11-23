@@ -101,6 +101,7 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 |:---|:---|
 | **Target** | [Inkling-2-Mini Q8_0](https://huggingface.co/bartowski/thinkingmachines_Inkling-2-Mini-GGUF) (`inkling2_loop`) |
 | **DSpark drafter** *(optional)* | An Inkling-2-Mini DSpark draft as Q8_0 GGUF, passed with `--dspine` |
+| **Vision projector** *(optional)* | The Inkling-2-Mini `inkling2v` mmproj (f16, ~0.6 GB), passed with `--mmproj` |
 
 | Feature | Details |
 |:---|:---|
@@ -108,6 +109,7 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 | **Megakernel execution** | Persistent decode loop over the 48 layer applications (24 layers, 12 of them looped 3 times) |
 | **Batched prefill** | 2048-token chunks, grouped expert GEMMs |
 | **Prefix cache** | Conv histories and sliding-window rings in the snapshots |
+| **Vision** | Image input at the image's own resolution, up to 4096 tokens |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/inkling-2-mini-bench-dark.svg">
@@ -143,8 +145,7 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 
 </details>
 
-Image input is not supported for Inkling yet. The forward pass quartz implements is in
-[docs/inkling2.md](docs/inkling2.md).
+The forward pass quartz implements is in [docs/inkling2.md](docs/inkling2.md).
 
 </details>
 
