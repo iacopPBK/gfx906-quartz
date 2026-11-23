@@ -148,10 +148,9 @@ template <int T, int CAP = QZ_TMAX, int TR = QZ_TMAX> __device__ __forceinline__
             ax = fmaxf(ax, __shfl_down(ax, off, 32));
         ax = __shfl(ax, 0, 32);                    // per-unit amax to all lanes
         const float dq = ax / 127.f;
-        const float id = dq != 0.f ? 1.f / dq : 0.f;
-        const float d16 = __half2float(__float2half(dq));
-        int q = (int) roundf(o * id);
-        if (q > 127) q = 127; else if (q < -127) q = -127;
+        const float id = qz_q8_inv(dq);
+        const float d16 = qz_q8_scale(dq);
+        int q = qz_q8_code(o, id);
         pl_vals[(size_t) t * Gm::G + (h * 4 + u) * 32 + l] = (unsigned char) q;
         if (l == 0) pl_scal[(size_t) t * (Gm::G / 32) + h * 4 + u] = d16;
     }
@@ -249,13 +248,12 @@ template <int T> __device__ __forceinline__ void qz_gemv_ffn_fused_t(
             #pragma unroll
             for (int off = 32; off > 0; off >>= 1) ax = fmaxf(ax, __shfl_xor(ax, off, 64));
             const float d = ax / 127.f;
-            const float id = d != 0.f ? 1.f / d : 0.f;
+            const float id = qz_q8_inv(d);
             if (lane < 32) {
-                int q = (int) roundf(xu * id);
-                if (q > 127) q = 127; else if (q < -127) q = -127;
+                int q = qz_q8_code(xu, id);
                 ffn_q[(size_t) wave * N + g * 32 + lane] = (unsigned char) q;
             }
-            if (lane == 0) ffn_sc[(size_t) wave * (N / 32) + g] = __half2float(__float2half(d));
+            if (lane == 0) ffn_sc[(size_t) wave * (N / 32) + g] = qz_q8_scale(d);
         }
         __syncthreads();
     }
@@ -308,16 +306,15 @@ __device__ __forceinline__ void qz_norm_requant_row(
         xn[i] = x;
         const float amax = qz_amax32(fabsf(x));
         const float d = amax / 127.f;
-        const float id = d != 0.f ? 1.f / d : 0.f;
-        int q = (int) roundf(x * id);
-        if (q > 127) q = 127; else if (q < -127) q = -127;
+        const float id = qz_q8_inv(d);
+        int q = qz_q8_code(x, id);
         qv[i] = (unsigned char) q;
-        if ((tid & 31) == 0) qs[i >> 5] = __half2float(__float2half(d));
+        if ((tid & 31) == 0) qs[i >> 5] = qz_q8_scale(d);
     }
     __syncthreads();
 }
 
-#include "kernels/rowops.h"
+#include "rowops.h"
 
 // q (or k) head row: f16 staging in aq, per-head rms norm, rope at position
 // pos on dims (j, j+32), j < 32; rope'd row stays in aq

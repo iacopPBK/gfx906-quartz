@@ -15,11 +15,6 @@ __device__ __forceinline__ float fl9_wmax(float v) {      // wave max, uniform
     v = qz_amax32(v);
     return fmaxf(fl9_rl(v, 0), fl9_rl(v, 32));
 }
-__device__ __forceinline__ float fl9_wsum(float v) {      // wave sum, every lane
-    #pragma unroll
-    for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
-    return v;
-}
 
 typedef unsigned int fl9_v4 __attribute__((ext_vector_type(4)));
 // rows a, b (8 dims each) -> [dim][2] pairs, 2 x 16 B at dst
@@ -209,7 +204,7 @@ __global__ void __launch_bounds__(512) mv_fl9_k(const __half * __restrict__ kv_k
     // one partial per (row, head): slot ((t FQ + kvh 6 + h) ns + sp)
     #pragma unroll
     for (int h = 0; h < 6; h++) {
-        const float l = fl9_wsum(l_ln[h]);
+        const float l = qz_wsum(l_ln[h]);
         const size_t slot = (size_t) (t * FQ + kvh * GQA + h) * ns + sp;
         if (tw < nrows) *(float4 *) (pacc + slot * QZ_HD + d0) = make_float4(ac[h][0], ac[h][1], ac[h][2], ac[h][3]);
         if (lane == 0 && tw < nrows) { pm[slot] = m_run[h]; pl[slot] = l; }
@@ -237,7 +232,7 @@ __global__ void __launch_bounds__(256) mv_fl9_red(const float * __restrict__ pm,
         const float M = fl9_wmax(mi);
         const float w = tid < ns && mi > QZ_FBIG ? __builtin_amdgcn_exp2f(mi - M) : 0.f;
         ws[tid] = w;
-        const float L = fl9_wsum(tid < ns ? w * pl[base + tid] : 0.f);
+        const float L = qz_wsum(tid < ns ? w * pl[base + tid] : 0.f);
         if (tid == 0) rinv = L > 0.f ? 1.f / L : 0.f;
     }
     __syncthreads();
@@ -251,9 +246,8 @@ __global__ void __launch_bounds__(256) mv_fl9_red(const float * __restrict__ pm,
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, 32));
     const float d = amax / 127.f;
-    const float id = d != 0.f ? 1.f / d : 0.f;
-    int q = (int) roundf(x * id);
-    if (q > 127) q = 127; else if (q < -127) q = -127;
+    const float id = qz_q8_inv(d);
+    int q = qz_q8_code(x, id);
     pl_vals[(size_t) t * G + (size_t) h * QZ_HD + tid] = (unsigned char) q;
-    if ((tid & 31) == 0) pl_scal[(size_t) t * (G / 32) + h * 8 + (tid >> 5)] = __half2float(__float2half(d));
+    if ((tid & 31) == 0) pl_scal[(size_t) t * (G / 32) + h * 8 + (tid >> 5)] = qz_q8_scale(d);
 }

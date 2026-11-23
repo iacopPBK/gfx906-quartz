@@ -14,6 +14,7 @@
 #include "gguf.h"
 #include "mem.h"
 #include "resize.h"
+#include "kernels/dev.h"
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -30,12 +31,10 @@
 #include <string>
 #include <vector>
 
-#define VCHK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { \
-    fprintf(stderr, "quartz_vision: HIP error %s at %s:%d\n", hipGetErrorString(e_), __FILE__, __LINE__); return -1; } } while (0)
-#define VBLAS(x) do { rocblas_status s_ = (x); if (s_ != rocblas_status_success) { \
-    fprintf(stderr, "quartz_vision: rocBLAS error %s at %s:%d\n", rocblas_status_to_string(s_), __FILE__, __LINE__); return -1; } } while (0)
 
 namespace inkling2v {
+
+#include "common.h"
 
 static constexpr int V_D = 1024, V_H = 16, V_HD = 64, V_PATCH = 20, V_MERGE = 2, V_GRID = 32, V_K = 3 * V_PATCH * V_PATCH;
 static constexpr int V_FF = 4096, V_MM = 4 * V_D;
@@ -172,12 +171,6 @@ __global__ void __launch_bounds__(256) v_resid(float * __restrict__ x, const flo
     x[i] += v;
 }
 
-// x[row][i] += b[i]; grid (d / 256, rows)
-__global__ void __launch_bounds__(256) v_bias(float * __restrict__ x, const float * __restrict__ b, int d) {
-    const int i = blockIdx.x * 256 + threadIdx.x;
-    if (i < d) x[(size_t) blockIdx.y * d + i] += b[i];
-}
-
 __device__ __forceinline__ float v_gelu_erf(float v) { return 0.5f * v * (1.f + erff(v * 0.70710678118654752f)); }
 
 // out = gelu_erf(y + b) as f16 (b may be null); grid (d / 256, rows)
@@ -227,16 +220,6 @@ struct qz_vision {
     int n_tok = 0;
     double ms = 0;
 };
-
-// Y[n][m] = X[n][k] . W[m][k]^T (+ beta Y), W f16 [m][k] (row stride ldw), X f16, Y f32 or f16
-static int vgemm(rocblas_handle blas, const __half * W, const __half * X, void * Y, bool y16, int m, int n, int k, float beta = 0.f) {
-    const float alpha = 1.f;
-    const rocblas_datatype yt = y16 ? rocblas_datatype_f16_r : rocblas_datatype_f32_r;
-    VBLAS(rocblas_gemm_ex(blas, rocblas_operation_transpose, rocblas_operation_none, m, n, k, &alpha,
-                          W, rocblas_datatype_f16_r, k, X, rocblas_datatype_f16_r, k, &beta,
-                          Y, yt, m, Y, yt, m, rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0));
-    return 0;
-}
 
 // the projector type: clip.projector_type, or clip.vision.projector_type (newer converters)
 static std::string proj_type(const qz_gguf & g) {
@@ -434,15 +417,6 @@ int qz_vision_encode_rgb(qz_vision * v, const unsigned char * rgb, int w, int h,
     if (nx_out) *nx_out = nx;
     if (ny_out) *ny_out = ny;
     return T;
-}
-
-int qz_vision_encode(qz_vision * v, const void * bytes, size_t n, int * nx, int * ny) {
-    int w = 0, h = 0, c = 0;
-    unsigned char * px = stbi_load_from_memory((const stbi_uc *) bytes, (int) n, &w, &h, &c, 3);
-    if (!px) { fprintf(stderr, "quartz_vision: cannot decode the image (%s)\n", stbi_failure_reason()); return -1; }
-    const int r = qz_vision_encode_rgb(v, px, w, h, nx, ny);
-    stbi_image_free(px);
-    return r;
 }
 
 }   // namespace inkling2v

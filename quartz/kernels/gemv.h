@@ -5,13 +5,14 @@
 #include "kernels/dev.h"
 
 // T-row GEMV core: acc[t][s] = row r0+s (clamped to N-1) . activation row t,
-// in lane 0; buffer loads for T <= QZ_GEMV_BUF_TMAX (bit-identical either way)
+// in lane 0; BUF: buffer loads (default for T <= QZ_GEMV_BUF_TMAX), else plain
+// global loads (bit-identical either way)
 #ifndef QZ_GEMV_BUF_TMAX
 #define QZ_GEMV_BUF_TMAX 3
 #endif
 #define QZ_GEMV_INL __forceinline__
 // RS > 0: rows r0 .. r0 + S/2 - 1 then r0 + RS .. r0 + RS + S/2 - 1 (two row groups)
-template <int T, int S, int RS = 0> __device__ QZ_GEMV_INL void qz_gemv_core(
+template <int T, int S, int RS = 0, bool BUF = (T <= QZ_GEMV_BUF_TMAX)> __device__ QZ_GEMV_INL void qz_gemv_core(
         const unsigned char * a_vals, const float * a_scal, int lda, int lsa, int n_u,
         const char * w_vals, const __half * w_scal, int ldw, int lsw, int N, int r0, int lane, float (&acc)[T][S]) {
     #pragma unroll
@@ -39,7 +40,7 @@ template <int T, int S, int RS = 0> __device__ QZ_GEMV_INL void qz_gemv_core(
             }
         }
     };
-    if constexpr (T > QZ_GEMV_BUF_TMAX) {
+    if constexpr (!BUF) {
         for (int u = lane; u < n_u; u += 64) {
             qz_v4u w0[S], w1[S];
             float sw[S];

@@ -781,12 +781,10 @@ static __device__ __forceinline__ void moe_gemm_body(
             const float amax = qz_amax32(fabsf(x));
             if (slot < cnt) {
                 const float d = amax / 127.f;
-                int v = amax == 0.f ? 0 : (int) roundf(x / d);
-                v = v > 127 ? 127 : (v < -127 ? -127 : v);
                 const int j = j0 + jj;
                 const size_t dd = (size_t) (j / 128) * so.np + tl.y + slot;
-                so.q[dd * 128 + j % 128] = (unsigned char) v;
-                if (jj == 0) so.qs[dd * 4 + (j % 128) / 32] = __half2float(__float2half(d));
+                so.q[dd * 128 + j % 128] = (unsigned char) qz_q8_code_div(x, amax, d);
+                if (jj == 0) so.qs[dd * 4 + (j % 128) / 32] = qz_q8_scale(d);
             }
         }
         return;

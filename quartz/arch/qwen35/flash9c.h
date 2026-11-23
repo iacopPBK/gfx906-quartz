@@ -177,7 +177,7 @@ __device__ __forceinline__ void qz_fl9c_flash(const __half * __restrict__ kv_k, 
     for (int j = 0; j < QW; j++) {
         if (j < nq) {
             const int qi = w + 8 * j, t = qi / GQA, hl = qi % GQA;
-            const float l = fl9_wsum(l_ln[j]);
+            const float l = qz_wsum(l_ln[j]);
             const size_t slot = (size_t) (t * HQ + kvh * GQA + hl) * NS + sp;
             *(float4 *) (pacc + slot * QZ_HD + d0) = make_float4(ac[j][0], ac[j][1], ac[j][2], ac[j][3]);
             if (lane == 0) { pm[slot] = m_run[j]; pl[slot] = l; }
@@ -202,7 +202,7 @@ __device__ __forceinline__ void qz_fl9c_reduce(const float * __restrict__ pm, co
         const float M = fl9_wmax(mi);
         const float wgt = tid < NS && mi > QZ_FBIG ? __builtin_amdgcn_exp2f(mi - M) : 0.f;
         if (tid < 32) ws[tid] = wgt;
-        const float L = fl9_wsum(tid < NS ? wgt * pl[base + tid] : 0.f);
+        const float L = qz_wsum(tid < NS ? wgt * pl[base + tid] : 0.f);
         if (tid == 0) ws[32] = L > 0.f ? 1.f / L : 0.f;
     }
     __syncthreads();
@@ -218,11 +218,10 @@ __device__ __forceinline__ void qz_fl9c_reduce(const float * __restrict__ pm, co
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, 32));
         const float d = amax / 127.f;
-        const float id = d != 0.f ? 1.f / d : 0.f;
-        int q = (int) roundf(x * id);
-        if (q > 127) q = 127; else if (q < -127) q = -127;
+        const float id = qz_q8_inv(d);
+        int q = qz_q8_code(x, id);
         gv_vals[(size_t) h * QZ_HD + tid] = (unsigned char) q;
-        if ((tid & 31) == 0) gv_scal[h * 8 + (tid >> 5)] = __half2float(__float2half(d));
+        if ((tid & 31) == 0) gv_scal[h * 8 + (tid >> 5)] = qz_q8_scale(d);
     }
     __syncthreads();
 }

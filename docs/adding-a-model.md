@@ -22,10 +22,10 @@ architectures alone.
 | `quartz/arch.h` | `qz_ctx`, the interface an arch implements; `qz_create_opts` | the create declaration per arch |
 | `quartz/arch/<arch>/` | the arch: engine, kernels, prefill, TP split, drafter, `qz_ctx` subclass | the arch only |
 | `quartz/core/` | host code with no arch knowledge: `sampler.h` (host sampling chain), `cards.h` (peer access, P2P inbox buffers, residency check), `prefix_cache.h` (snapshot slots and the chunked prefill driver) | shared |
-| `quartz/kernels/` | device building blocks templated on the arch's widths: Q8 GEMV, the inbox exchange, row ops, prefill GEMM / quant, top-k | shared |
+| `quartz/kernels/` | device building blocks templated on the arch's widths: `dev.h` (global-address hints, the int8 dot, DPP reads, wave sums, Q8 rounding), Q8 GEMV, the inbox exchange, prefill GEMM / quant, top-k | shared |
 | `quartz/loader.{h,cpp}`, `quartz/gguf.h`, `quartz/gguf_lite.h` | GGUF reading and the Q8_0 plane repack; the arch supplies the TP slice callback | shared |
 | `quartz/tokapi.cpp` | byte-level BPE; `TOK_PRES[]` maps `tokenizer.ggml.pre` to its regexes | one row per new pre-tokenizer |
-| `quartz/vision/<projector>.{h,cpp}` | image encoders, one namespace per `clip.projector_type`; an arch's `vision_attach` picks one | one encoder per projector |
+| `quartz/vision/<projector>.{h,cpp}` | image encoders, one namespace per `clip.projector_type`; an arch's `vision_attach` picks one. `vision/common.h` (GEMM, bias, image decode) and `vision/resize.h` are shared | one encoder per projector |
 | `quartz/server/quartz_server.py` | the OpenAI server; arch-neutral | — |
 | `quartz/server/dialects.py` | per-arch chat dialect: reasoning / content / tool-call parsing, streamed and whole | one class per arch |
 

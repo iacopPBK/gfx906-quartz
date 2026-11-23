@@ -120,9 +120,8 @@ __global__ void __launch_bounds__(512) mv_phase_dn(qz_trunk_args A, int il, int 
 
 
 // ------------------------------------------------------- verify GEMVs ----
-// T-row GEMVs: mv_gemv8P (T = 8), mv_gemvR (T = 12), up to 4 planes per launch
-struct mv_seg { const char * w; const __half * ws; int N; float * y; int b0; };
-struct mv_segs { mv_seg s[4]; int n; };
+// T-row GEMVs: mv_gemv8P (T = 8), ds_gemvR (T = 12, dspine_block.h), up to 4 planes
+// per launch (ds_segs)
 #ifndef MV_RL
 #define MV_RL 32
 #endif
@@ -141,7 +140,7 @@ struct mv_segs { mv_seg s[4]; int n; };
 #define MV_PU (65536 / (MV_T * 32))              // units staged by mv_gemv8P (MV_T * 32 * 256 = 64 KB)
 template <int S, int NW>
 __global__ void __launch_bounds__(64 * NW) mv_gemv8P(const unsigned char * a_vals, const float * a_scal, int K,
-                                                    mv_segs G, int ngr) {
+                                                    ds_segs G, int ngr) {
     extern __shared__ uint4 lsa[];
     const int lane = threadIdx.x & 63, wave = threadIdx.x >> 6, tid = threadIdx.x;
     const int n_u = K / 32, lsw = K / 32, ldw = K;
@@ -236,126 +235,21 @@ __global__ void __launch_bounds__(64 * NW) mv_gemv8P(const unsigned char * a_val
     }
 }
 
-template <int S, int NW, int LG>
-__global__ void __launch_bounds__(64 * NW) mv_gemvR(const unsigned char * a_vals, const float * a_scal, int K,
-                                                 mv_segs G, int ngr, int nkc = 1, size_t ystr = 0) {
-    constexpr int NQ = 64 / LG;
-    extern __shared__ uint4 lsa[];
-    const int lane = threadIdx.x & 63, wave = threadIdx.x >> 6, tid = threadIdx.x;
-    const int qd = lane / LG, ql = lane % LG;
-    const int lsw = K / 32, ldw = K;
-    // K chunks: blocks [c nb, (c+1) nb) take units [u0, u0 + n_u); chunk c's partial goes to y + c ystr
-    const int nb = gridDim.x / nkc, kc = blockIdx.x / nb, bl = blockIdx.x % nb;
-    const int u0 = kc * (K / 32) / nkc, n_u = (kc + 1) * (K / 32) / nkc - u0;
-    const int scb = (MV_T * n_u * 2 + 15) & ~15;
-    const int nst = min(n_u, (65536 - scb) / (MV_T * 32));
-    __half * lsc = (__half *) (lsa + (size_t) MV_T * 2 * nst);
-    for (int i = tid; i < MV_T * nst * 2; i += 64 * NW) {
-        const int t = i / (nst * 2), r = i % (nst * 2);
-        lsa[((size_t) t * 2 + (r & 1)) * nst + (r >> 1)] = *(const uint4 *)(a_vals + (size_t) t * K + u0 * 32 + r * 16);
-    }
-    for (int i = tid; i < MV_T * n_u; i += 64 * NW) {
-        const int t = i / n_u, u = i % n_u;
-        lsc[u * MV_T + t] = __float2half(a_scal[(size_t) t * lsw + u0 + u]);
-    }
-    __syncthreads();
-    const __amdgpu_buffer_rsrc_t ra = __builtin_amdgcn_make_buffer_rsrc((void *) a_vals, (short) 0, MV_T * K, 0x00027000);
-    const int gw = __builtin_amdgcn_readfirstlane(bl * NW + wave);
-    for (int g = gw; g < ngr; g += nb * NW) {
-        int i = 0;
-        #pragma unroll
-        for (int j = 1; j < 4; j++) if (j < G.n && g >= G.s[j].b0) i = j;
-        const char * w_vals = G.s[i].w;
-        const __half * w_scal = G.s[i].ws;
-        const int N = G.s[i].N;
-        float * y = G.s[i].y + (size_t) kc * ystr;
-        const int r0 = (g - G.s[i].b0) * S * NQ + qd * S;
-        float acc[MV_T][S];
-        #pragma unroll
-        for (int t = 0; t < MV_T; t++)
-            #pragma unroll
-            for (int s = 0; s < S; s++) acc[t][s] = 0.f;
-        const char * wr[S]; const __half * wsr[S];
-        #pragma unroll
-        for (int s = 0; s < S; s++) {
-            const int r = min(r0 + s, N - 1);
-            wr[s] = w_vals + (size_t) r * ldw + u0 * 32; wsr[s] = w_scal + (size_t) r * lsw + u0;
-        }
-        struct WB { qz_v4u w0[S], w1[S]; unsigned short sh[S]; };
-        auto ld = [&](int u, WB & b) {
-            #pragma unroll
-            for (int s = 0; s < S; s++) {
-                b.w0[s] = __builtin_nontemporal_load((const qz_v4u *)(wr[s] + u * 32));
-                b.w1[s] = __builtin_nontemporal_load((const qz_v4u *)(wr[s] + u * 32 + 16));
-                b.sh[s] = __builtin_nontemporal_load((const unsigned short *) (wsr[s] + u));
-            }
-        };
-        auto comp = [&](int u, const WB & b) {
-            float sw[S];
-            #pragma unroll
-            for (int s = 0; s < S; s++) sw[s] = __half2float(__ushort_as_half(b.sh[s]));
-            const bool st = u < nst;
-            #pragma unroll
-            for (int t = 0; t < MV_T; t++) {
-                uint4 a0, a1;
-                if (st) { a0 = lsa[((size_t) t * 2) * nst + u]; a1 = lsa[((size_t) t * 2 + 1) * nst + u]; }
-                else {
-                    a0 = __builtin_bit_cast(uint4, __builtin_amdgcn_raw_buffer_load_b128(ra, t * K + (u0 + u) * 32, 0, 0));
-                    a1 = __builtin_bit_cast(uint4, __builtin_amdgcn_raw_buffer_load_b128(ra, t * K + (u0 + u) * 32 + 16, 0, 0));
-                }
-                const float sa = __half2float(lsc[u * MV_T + t]);
-                #pragma unroll
-                for (int s = 0; s < S; s++) {
-                    int d = 0;
-                    DOT4(d, b.w0[s].x, a0.x); DOT4(d, b.w0[s].y, a0.y); DOT4(d, b.w0[s].z, a0.z); DOT4(d, b.w0[s].w, a0.w);
-                    DOT4(d, b.w1[s].x, a1.x); DOT4(d, b.w1[s].y, a1.y); DOT4(d, b.w1[s].z, a1.z); DOT4(d, b.w1[s].w, a1.w);
-                    acc[t][s] += (float) d * sw[s] * sa;
-                }
-            }
-        };
-        WB A, B;
-        int u = ql;
-        if (u < n_u) ld(u, A);
-        while (u < n_u) {
-            int un = u + LG;
-            if (un < n_u) ld(un, B);
-            comp(u, A);
-            u = un;
-            if (u >= n_u) break;
-            un = u + LG;
-            if (un < n_u) ld(un, A);
-            comp(u, B);
-            u = un;
-        }
-        #pragma unroll
-        for (int t = 0; t < MV_T; t++)
-            #pragma unroll
-            for (int s = 0; s < S; s++)
-                #pragma unroll
-                for (int off = LG / 2; off > 0; off >>= 1) acc[t][s] += __shfl_xor(acc[t][s], off, LG);
-        if (ql == 0)
-            #pragma unroll
-            for (int t = 0; t < MV_T; t++)
-                #pragma unroll
-                for (int s = 0; s < S; s++)
-                    if (r0 + s < N) y[(size_t) t * N + r0 + s] = acc[t][s];
-    }
-}
 
 // mv_gemv8P stages MV_PU units of the rows in LDS and reads the rest (at most
 // 64 per lane) from global memory: every K the verify uses must fit that
 static_assert(MV_T > 8 || (QZ_D / 32 <= MV_PU + 64 && QZ_G / 64 <= MV_PU + 64 && QZ_FF / 64 <= MV_PU + 64),
               "verify GEMV: a K too wide for mv_gemv8P");
 inline void mv_gemv8P_launch(hipStream_t st, const unsigned char * a, const float * as, int K,
-                             std::initializer_list<mv_seg> segs) {
-    mv_segs G = {};
+                             std::initializer_list<ds_seg> segs) {
+    ds_segs G = {};
     int b = 0;
-    for (const mv_seg & x : segs) { G.s[G.n] = x; G.s[G.n].b0 = b; b += (x.N + MV_PS - 1) / MV_PS; G.n++; }
+    for (const ds_seg & x : segs) { G.s[G.n] = x; G.s[G.n].b0 = b; b += (x.N + MV_PS - 1) / MV_PS; G.n++; }
     if constexpr (MV_T > 8 && MV_T <= 12) {
         constexpr int RPG = MV_RS * (64 / MV_RL);
         G = {}; b = 0;
-        for (const mv_seg & x : segs) { G.s[G.n] = x; G.s[G.n].b0 = b; b += (x.N + RPG - 1) / RPG; G.n++; }
-        mv_gemvR<MV_RS, MV_RW, MV_RL><<<dim3(60), dim3(64 * MV_RW), 65536, st>>>(a, as, K, G, b);
+        for (const ds_seg & x : segs) { G.s[G.n] = x; G.s[G.n].b0 = b; b += (x.N + RPG - 1) / RPG; G.n++; }
+        ds_gemvR<MV_T, MV_RS, MV_RW, MV_RL><<<dim3(60), dim3(64 * MV_RW), 65536, st>>>(a, as, K, K, G, b, 1, 0);
     } else
         mv_gemv8P<MV_PS, MV_PW><<<dim3(60), dim3(64 * MV_PW), (size_t) MV_T * 32 * std::min(K / 32, MV_PU), st>>>(a, as, K, G, b);
 }
@@ -367,9 +261,9 @@ inline void mv_gemv8P_launch(hipStream_t st, const unsigned char * a, const floa
 inline void mv_gemv_down_launch(hipStream_t st, const unsigned char * a, const float * as, int K,
                                 const char * w, const __half * ws, int N, float * y) {
     constexpr int RPG = MV_RS * (64 / MV_RL);
-    mv_segs G = {};
+    ds_segs G = {};
     G.s[0] = { w, ws, N, y, 0 }; G.n = 1;
-    mv_gemvR<MV_RS, MV_RW, MV_RL><<<dim3(60), dim3(64 * MV_RW), 65536, st>>>(a, as, K, G, (N + RPG - 1) / RPG, MV_DKC,
+    ds_gemvR<MV_T, MV_RS, MV_RW, MV_RL><<<dim3(60), dim3(64 * MV_RW), 65536, st>>>(a, as, K, K, G, (N + RPG - 1) / RPG, MV_DKC,
                                                                           (size_t) MV_T * N);
 }
 inline void mv_gemv8_launch(hipStream_t st, const unsigned char * a, const float * as, int K,
@@ -447,13 +341,12 @@ __global__ void __launch_bounds__(256) mv_ffn_act(qz_trunk_args A, int il, const
     #pragma unroll
     for (int off = 32; off > 0; off >>= 1) ax = fmaxf(ax, __shfl_xor(ax, off, 64));
     const float d = ax / 127.f;
-    const float id = d != 0.f ? 1.f / d : 0.f;
+    const float id = qz_q8_inv(d);
     if (lane < 32) {
-        int q = (int) roundf(xu * id);
-        if (q > 127) q = 127; else if (q < -127) q = -127;
+        int q = qz_q8_code(xu, id);
         ffn_q[(size_t) t * N + g * 32 + lane] = (unsigned char) q;
     }
-    if (lane == 0) ffn_sc[(size_t) t * (N / 32) + g] = __half2float(__float2half(d));
+    if (lane == 0) ffn_sc[(size_t) t * (N / 32) + g] = qz_q8_scale(d);
 }
 
 
@@ -715,7 +608,7 @@ inline int mv_init(mv_ctx & m, qz_engine & eng, int c, float * ring_share = null
         if (e_ != hipSuccess) { fprintf(stderr, "mv attr %d (size %d): %s\n", i, ls[i], hipGetErrorString(e_)); return 1; }
     }
     CHECK(hipFuncSetAttribute((const void *) mv_gemv8P<MV_PS, MV_PW>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536));
-    if (MV_T > 8 && MV_T <= 12) CHECK(hipFuncSetAttribute((const void *) mv_gemvR<MV_RS, MV_RW, MV_RL>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536));
+    if (MV_T > 8 && MV_T <= 12) CHECK(hipFuncSetAttribute((const void *) ds_gemvR<MV_T, MV_RS, MV_RW, MV_RL>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536));
     mv_fl9_init();
     return 0;
 }

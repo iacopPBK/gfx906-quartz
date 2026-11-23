@@ -85,14 +85,8 @@ template <class XA> __device__ __forceinline__ void cyc_xwait(const XA & A, unsi
 }
 
 // The phase wrappers. Pointers the kernel loads from the table are generic to the
-// compiler: flat loads / stores, which count in lgkmcnt too, so every LDS wait
-// (reductions, barriers) also waited for the outstanding global traffic. gp()
-// casts them to the global address space (inferred through the inlined bodies).
-template <class T> __device__ __forceinline__ T * gp(T * p) {
-    __builtin_assume(!__builtin_amdgcn_is_shared((const void *) p));
-    __builtin_assume(!__builtin_amdgcn_is_private((const void *) p));
-    return p;
-}
+// compiler, so the wrappers pass them through qz_gp() (kernels/dev.h): global
+// loads / stores, inferred through the inlined bodies.
 // the table and args are read through the constant address space: scalar loads
 #ifdef __HIP_DEVICE_COMPILE__
 #define CK const __attribute__((address_space(4)))
@@ -108,14 +102,14 @@ template <int MQ> CYC_NI void c_mix(CK sptrs * S, const float * q, float * o, in
     sptrs L;
     L.n = S->n;
     #pragma unroll
-    for (int s = 0; s < 6; s++) L.p[s] = gp(S->p[s]);
-    d_mix_lds<MQ>(L, gp(q), gp(o), tid, tid < 256, cyc_lds);
+    for (int s = 0; s < 6; s++) L.p[s] = qz_gp(S->p[s]);
+    d_mix_lds<MQ>(L, qz_gp(q), qz_gp(o), tid, tid < 256, cyc_lds);
 }
 CYC_NI void c_mix1(CK sptrs * S, const float * q, float * o, int tid) { c_mix<1>(S, q, o, tid); }
 // bsum<N>(v, red, 4) for each 256-thread half of the block on its own (red: 2 * 4 * N)
 template <int N> CYC_NI void hsum(float (&v)[N], float * red) {
     #pragma unroll
-    for (int k = 0; k < N; k++) v[k] = wsum_xor(v[k]);
+    for (int k = 0; k < N; k++) v[k] = qz_wsum_dpp(v[k]);
     const int w = (threadIdx.x >> 6) & 3, h = threadIdx.x >> 8;
     __syncthreads();
     if ((threadIdx.x & 63) == 0)
@@ -138,8 +132,8 @@ template <int NJ> CYC_NI void c_ctrl_down_all(CK cjob * cj, int tid) {
     constexpr int NV = D / 256, MR = 2;
     const int bpj = gridDim.x / NJ, j = blockIdx.x / bpj, bj = blockIdx.x % bpj, h = tid >> 8, t = tid & 255;
     if (j >= NJ) return;                                   // the leftover blocks (block-uniform)
-    const float * cur = gp(cj[j].cur), * msg = gp(cj[j].msg), * wd = gp(cj[j].wd);
-    float * g = gp(cj[j].g);
+    const float * cur = qz_gp(cj[j].cur), * msg = qz_gp(cj[j].msg), * wd = qz_gp(cj[j].wd);
+    float * g = qz_gp(cj[j].g);
     for (int r0 = bj; r0 < GRANK; r0 += 2 * MR * bpj) {
         float x[NV], y[NV], wa[MR][NV], wb[MR][NV];
         #pragma unroll
@@ -180,7 +174,7 @@ template <int NJ> CYC_NI void c_ctrl_down_all(CK cjob * cj, int tid) {
 template <int NJ> CYC_NI void c_ctrl_up_all(CK cjob * cj, int tid) {
     asm volatile ("" : "+v"(tid));
     __shared__ float g[NJ][GRANK], sf[256];
-    for (int i = tid; i < NJ * GRANK; i += 512) g[i / GRANK][i % GRANK] = gp(cj[i / GRANK].g)[i % GRANK];
+    for (int i = tid; i < NJ * GRANK; i += 512) g[i / GRANK][i % GRANK] = qz_gp(cj[i / GRANK].g)[i % GRANK];
     __syncthreads();
     constexpr int NR = NJ * D, KC = 32;
     const int r0 = blockIdx.x * NR / gridDim.x, r1 = (blockIdx.x + 1) * NR / gridDim.x;
@@ -189,7 +183,7 @@ template <int NJ> CYC_NI void c_ctrl_up_all(CK cjob * cj, int tid) {
         const int r = c0 + min(q, n - 1), j = r / D, i = r % D;
         float a = 0.f;
         if (tid < 2 * n) {
-            const float * w = gp(which ? cj[j].wft : cj[j].wgt) + i;
+            const float * w = qz_gp(which ? cj[j].wft : cj[j].wgt) + i;
             #pragma unroll 1
             for (int k0 = 0; k0 < GRANK; k0 += KC) {
                 float v[KC];
@@ -202,8 +196,8 @@ template <int NJ> CYC_NI void c_ctrl_up_all(CK cjob * cj, int tid) {
         }
         __syncthreads();
         if (tid < n) {
-            const float x = gp(cj[j].cur)[i], fo = sf[q], ga = a;
-            gp(cj[j].out)[i] = (x - tanhf(fo) * x) + tanhf(ga) * gp(cj[j].msg)[i];
+            const float x = qz_gp(cj[j].cur)[i], fo = sf[q], ga = a;
+            qz_gp(cj[j].out)[i] = (x - tanhf(fo) * x) + tanhf(ga) * qz_gp(cj[j].msg)[i];
         }
         __syncthreads();
     }
@@ -211,7 +205,7 @@ template <int NJ> CYC_NI void c_ctrl_up_all(CK cjob * cj, int tid) {
 CYC_NI void c_norm(CK njob * j, float eps, int tid) {
     asm volatile ("" : "+v"(tid));
     njob n;
-    n.x = gp(j->x); n.w = gp(j->w); n.y = j->y ? gp(j->y) : nullptr; n.q = gp(j->q); n.qs = gp(j->qs);
+    n.x = qz_gp(j->x); n.w = qz_gp(j->w); n.y = j->y ? qz_gp(j->y) : nullptr; n.q = qz_gp(j->q); n.qs = qz_gp(j->qs);
     d_norm_quant(n, eps, tid, tid < 256);
 }
 // half a 32-row virtual block (16 rows, S = 2 per wave): the same rows with the
@@ -225,24 +219,24 @@ CYC_NI void c_gemv2(CK gjobs * J, int hb, float * yp) {
     const int g = b - (k ? J->j[k - 1].g1 : 0);
     const int r0 = g * 32 + half * 16 + wave * 2;
     const int N = j->N;
-    float * y = gp(j->y);
+    float * y = qz_gp(j->y);
     float acc[1][2];
-    qz_gemv_rows_t<1, 2>(gp(j->av), gp(j->as), j->K, j->wv, j->ws, N, r0, lane, acc);
+    qz_gemv_rows_t<1, 2>(qz_gp(j->av), qz_gp(j->as), j->K, j->wv, j->ws, N, r0, lane, acc);
     if (lane == 0)
         #pragma unroll
-        for (int s = 0; s < 2; s++) if (r0 + s < N) { y[r0 + s] = acc[0][s]; if (yp) gp(yp)[r0 + s] = acc[0][s]; }
+        for (int s = 0; s < 2; s++) if (r0 + s < N) { y[r0 + s] = acc[0][s]; if (yp) qz_gp(yp)[r0 + s] = acc[0][s]; }
 }
 // the vocab GEMV: 32-row units over the grid (d_gemv's rows), the softcap applied
 // to the stored value on rows < nv (k_softcap's expression)
 CYC_NI void c_head_gemv(CK gjob * J, int nv, float cap) {
     const int wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
     const int N = J->N;
-    float * y = gp(J->y);
+    float * y = qz_gp(J->y);
     #pragma unroll 1
     for (int g = blockIdx.x; g * 32 < N; g += gridDim.x) {
         const int r0 = g * 32 + wave * 4;
         float acc[1][4];
-        qz_gemv_rows_t<1, 4>(gp(J->av), gp(J->as), J->K, J->wv, J->ws, N, r0, lane, acc);
+        qz_gemv_rows_t<1, 4>(qz_gp(J->av), qz_gp(J->as), J->K, J->wv, J->ws, N, r0, lane, acc);
         if (lane == 0)
             #pragma unroll
             for (int s = 0; s < 4; s++) {
@@ -255,7 +249,7 @@ CYC_NI void c_head_gemv(CK gjob * J, int nv, float cap) {
 // ---- the chain group: CG blocks share block 0's serial work (xconv, the pass
 // copies, a mix and its norms). Block w owns the columns 64 w + l + 256 k
 // (l < 64, k < D / 256): exactly wave w's share of every full-row sum in
-// d_mix_lds / d_norm_quant (per-lane sum over k, wsum_xor, waves 0 .. 3 added in
+// d_mix_lds / d_norm_quant (per-lane sum over k, qz_wsum_dpp, waves 0 .. 3 added in
 // order), so each block publishes its wave-w partials, the group syncs on flags,
 // and every block adds the CG partials in that order: the same bits. The
 // element-wise parts (output pass, y / quant, xconv, copies) take the owned
@@ -283,7 +277,7 @@ __device__ __forceinline__ void cg_put(float * p, float v) { *p = v; __threadfen
 // tap: also the new x (the DSpark drafter's feature: the residual entering the next application)
 CYC_NI void c_cxconv(const float * own, const float * peer, const float * w, float * hs, float * x, float * blk, int cw, int tid,
                      float * tap = nullptr) {
-    own = gp(own); peer = gp(peer); w = gp(w); hs = gp(hs); x = gp(x); blk = blk ? gp(blk) : nullptr; tap = tap ? gp(tap) : nullptr;
+    own = qz_gp(own); peer = qz_gp(peer); w = qz_gp(w); hs = qz_gp(hs); x = qz_gp(x); blk = blk ? qz_gp(blk) : nullptr; tap = tap ? qz_gp(tap) : nullptr;
     #pragma unroll
     for (int m = 0; m < 2; m++) {
         const int q = tid + 512 * m;
@@ -304,14 +298,14 @@ CYC_NI void c_cxconv(const float * own, const float * peer, const float * w, flo
 }
 // the pass copies on the owned columns
 CYC_NI void c_cpre(int pre, float * P, float * X, float * po, int cw, int tid) {
-    P = gp(P); X = gp(X);
+    P = qz_gp(P); X = qz_gp(X);
     #pragma unroll
     for (int m = 0; m < 2; m++) {
         const int q = tid + 512 * m;
         if (m == 0 || q < CQ) {
             const int i = ccol(cw, q);
             if (pre == 1) P[i] = X[i];
-            else { gp(po)[i] = X[i]; X[i] = P[i]; }
+            else { qz_gp(po)[i] = X[i]; X[i] = P[i]; }
         }
     }
 }
@@ -320,7 +314,7 @@ CYC_NI void c_cnorm_tail(int NJ, const float * v, CK njob * nj, float eps, const
     const int wave = tid >> 6, lane = tid & 63;
     float wv[CNK];                       // the norm weights in flight over the sync
     {
-        const float * wn = gp(nj[wave < NJ ? wave : 0].w);
+        const float * wn = qz_gp(nj[wave < NJ ? wave : 0].w);
         #pragma unroll
         for (int k = 0; k < CNK; k++) wv[k] = wn[ccol(g.w, lane + 64 * k)];
     }
@@ -328,7 +322,7 @@ CYC_NI void c_cnorm_tail(int NJ, const float * v, CK njob * nj, float eps, const
     if (wave < NJ)
         #pragma unroll
         for (int k = 0; k < CNK; k++) { const float x = v[wave * CQ + lane + 64 * k]; ss += x * x; }
-    ss = wsum_xor(ss);
+    ss = qz_wsum_dpp(ss);
     if (wave < NJ && lane == 0) cg_put(&g.cp[CP_N + g.w * 4 + wave], ss);
     cg_sync(g, ++ce);
     __shared__ float cpn[CG * 4];
@@ -340,8 +334,8 @@ CYC_NI void c_cnorm_tail(int NJ, const float * v, CK njob * nj, float eps, const
         for (int i = 0; i < CG; i++) a += cpn[i * 4 + wave];
         const float r = rsqrtf(a / D + eps);
         CK njob * j = nj + wave;
-        float * y = j->y ? gp(j->y) : nullptr;
-        unsigned char * qv = gp(j->q); float * qs = gp(j->qs);
+        float * y = j->y ? qz_gp(j->y) : nullptr;
+        unsigned char * qv = qz_gp(j->q); float * qs = qz_gp(j->qs);
         #pragma unroll
         for (int k = 0; k < CNK; k++) {
             const int i = ccol(g.w, lane + 64 * k);
@@ -361,7 +355,7 @@ template <int NJ> CYC_NI void c_cnorm(CK njob * nj, float eps, const cgrp & g, u
         #pragma unroll
         for (int m = 0; m < 2; m++) {
             const int q = tid + 512 * m;
-            if (m == 0 || q < CQ) v[j * CQ + q] = gp(nj[j].x)[ccol(g.w, q)];
+            if (m == 0 || q < CQ) v[j * CQ + q] = qz_gp(nj[j].x)[ccol(g.w, q)];
         }
     __syncthreads();
     c_cnorm_tail(NJ, v, nj, eps, g, ce, tid);
@@ -376,7 +370,7 @@ template <int MQ, bool NRM> CYC_NI void c_cmix(CK sptrs * S, const float * qy, f
     float * sq = sv + 6 * CQ;              // [MQ][CQ] queries
     float * so = sq + MQ * CQ;             // [MQ][CQ] outputs
     const int n = S->n, wave = tid >> 6, lane = tid & 63;
-    qy = gp(qy); out = gp(out);
+    qy = qz_gp(qy); out = qz_gp(out);
     __syncthreads();
     #pragma unroll
     for (int m = 0; m < 2; m++) {
@@ -384,7 +378,7 @@ template <int MQ, bool NRM> CYC_NI void c_cmix(CK sptrs * S, const float * qy, f
         if (m == 0 || q < CQ) {
             const int i = ccol(g.w, q);
             #pragma unroll
-            for (int s = 0; s < 6; s++) sv[s * CQ + q] = gp(S->p[s < n ? s : 0])[i];
+            for (int s = 0; s < 6; s++) sv[s * CQ + q] = qz_gp(S->p[s < n ? s : 0])[i];
             #pragma unroll
             for (int j = 0; j < MQ; j++) sq[j * CQ + q] = qy[(size_t) j * D + i];
         }
@@ -396,7 +390,7 @@ template <int MQ, bool NRM> CYC_NI void c_cmix(CK sptrs * S, const float * qy, f
         if (wave < 6)
             #pragma unroll
             for (int k = 0; k < CNK; k++) { const float v = sv[wave * CQ + lane + 64 * k]; r += v * v; }
-        r = wsum_xor(r);
+        r = qz_wsum_dpp(r);
         if (wave < 6 && lane == 0) cg_put(&g.cp[CP_1 + g.w * 6 + wave], r);
     }
     cg_sync(g, ++ce);
@@ -423,7 +417,7 @@ template <int MQ, bool NRM> CYC_NI void c_cmix(CK sptrs * S, const float * qy, f
             for (int j = 0; j < MQ; j++) r[j] += x * sq[j * CQ + lane + 64 * k];
         }
         #pragma unroll
-        for (int j = 0; j < MQ; j++) r[j] = wsum_xor(r[j]);
+        for (int j = 0; j < MQ; j++) r[j] = qz_wsum_dpp(r[j]);
         if (lane == 0)
             #pragma unroll
             for (int j = 0; j < MQ; j++) cg_put(&g.cp[CP_2 + (g.w * 6 + wave) * 4 + j], r[j]);
@@ -482,33 +476,33 @@ CYC_NI void c_head_post(CK hpost * e, int pos, float tau, int v, int tid) {
     asm volatile ("" : "+v"(tid));
     hpost h = *e;
     const int row = e->dk ? pos : pos % PF_RING;          // dk: full layers only
-    h.qr = gp(h.qr); h.rr = gp(h.rr); h.sk = gp(h.sk); h.kr = gp(h.kr); h.vr = gp(h.vr);
-    h.dk = h.dk ? gp(h.dk) : nullptr; h.dv = h.dv ? gp(h.dv) : nullptr;
-    h.qclip = gp(h.qclip); h.rclip = gp(h.rclip); h.relb = gp(h.relb); h.kconv = gp(h.kconv); h.vconv = gp(h.vconv);
-    h.hist = gp(h.hist); h.q = gp(h.q); h.tb = gp(h.tb);
-    h.kc = gp(h.kc + (size_t) row * KVL); h.vc = gp(h.vc + (size_t) row * KVL);
+    h.qr = qz_gp(h.qr); h.rr = qz_gp(h.rr); h.sk = qz_gp(h.sk); h.kr = qz_gp(h.kr); h.vr = qz_gp(h.vr);
+    h.dk = h.dk ? qz_gp(h.dk) : nullptr; h.dv = h.dv ? qz_gp(h.dv) : nullptr;
+    h.qclip = qz_gp(h.qclip); h.rclip = qz_gp(h.rclip); h.relb = qz_gp(h.relb); h.kconv = qz_gp(h.kconv); h.vconv = qz_gp(h.vconv);
+    h.hist = qz_gp(h.hist); h.q = qz_gp(h.q); h.tb = qz_gp(h.tb);
+    h.kc = qz_gp(h.kc + (size_t) row * KVL); h.vc = qz_gp(h.vc + (size_t) row * KVL);
     h.tau = e->dk ? tau : 1.f;
     d_head_post(h, v, tid, tid < 128, min(TBW, pos + 1));     // attention at pos reads d <= pos only
 }
 CYC_NI void c_attn(CK attn_args * e, int pos, int v, int tid) {
     asm volatile ("" : "+v"(tid));
     attn_args t = *e;
-    t.q = gp(t.q); t.tb = gp(t.tb); t.gate = gp(t.gate); t.kc = gp(t.kc); t.vc = gp(t.vc); t.oq = gp(t.oq); t.os = gp(t.os);
-    t.part = gp(t.part); t.cnt = gp(t.cnt);
+    t.q = qz_gp(t.q); t.tb = qz_gp(t.tb); t.gate = qz_gp(t.gate); t.kc = qz_gp(t.kc); t.vc = qz_gp(t.vc); t.oq = qz_gp(t.oq); t.os = qz_gp(t.os);
+    t.part = qz_gp(t.part); t.cnt = qz_gp(t.cnt);
     t.pos = pos;
     d_attn(t, v / ATT_SPL, v % ATT_SPL, tid, cyc_lds);   // the mix states are dead here
 }
 CYC_NI void c_xconv_b0(const float * own, const float * peer, const float * w, float * hs, float * x, float * blk, int tid) {
-    d_xconv_blk<512>(gp(own), gp(peer), gp(w), gp(hs), gp(x), blk ? gp(blk) : nullptr, tid);
+    d_xconv_blk<512>(qz_gp(own), qz_gp(peer), qz_gp(w), qz_gp(hs), qz_gp(x), blk ? qz_gp(blk) : nullptr, tid);
 }
-CYC_NI void c_router(const float * f, const float * wr, const float * bias, float * ps, int e, int lane) { d_router(gp(f), gp(wr), gp(bias), gp(ps), e, lane); }
+CYC_NI void c_router(const float * f, const float * wr, const float * bias, float * ps, int e, int lane) { d_router(qz_gp(f), qz_gp(wr), qz_gp(bias), qz_gp(ps), e, lane); }
 // the router's top NE_USED by rank: candidate i's place = #{j : s_j > s_i or (s_j == s_i and j < i)}
 // (selection order: max first, ties to the lower id); the weights p / sum(p) * scale
 // with the sum in that order. The whole block calls it.
 CYC_NI void c_pick_rank(const float * ps, float scale, int * sids, float * swts, int tid) {
     __shared__ float lv[NE], lp[NE_USED];
     asm volatile ("" : "+v"(tid));
-    ps = gp(ps);
+    ps = qz_gp(ps);
     float p = 0.f;
     if (tid < NE) { lv[tid] = ps[NE + tid]; p = ps[tid]; }
     __syncthreads();
@@ -539,7 +533,7 @@ CYC_NI void c_up_situ_w(const char * wv, const __half * ws, const int * sids, co
                         float beta, float lb, float * sv, int * gcnt, unsigned char * hq, float * hs, int tid) {
     asm volatile ("" : "+v"(tid));
     constexpr int NT = NE_USED * FFL / UP_A;
-    av = gp(av); as = gp(as); sv = gp(sv); gcnt = gp(gcnt); hq = gp(hq); hs = gp(hs);
+    av = qz_gp(av); as = qz_gp(as); sv = qz_gp(sv); gcnt = qz_gp(gcnt); hq = qz_gp(hq); hs = qz_gp(hs);
     const int wave = tid >> 6, lane = tid & 63, nw = gridDim.x * 8;
     #pragma unroll 1
     for (int task = blockIdx.x * 8 + wave; task < NT; task += nw) {
@@ -579,7 +573,7 @@ CYC_NI void c_moe_down_q(const char * wv, const __half * ws, const int * sids, c
     static_assert(FFL / 32 <= 32, "one unit per lane");
     asm volatile ("" : "+v"(tid));
     constexpr int NU = FFL / 32, NQ = D / 4;
-    y = gp(y); yp = yp ? gp(yp) : nullptr;          // aq / as: LDS
+    y = qz_gp(y); yp = yp ? qz_gp(yp) : nullptr;          // aq / as: LDS
     const int wave = tid >> 6, lane = tid & 63, h = lane >> 5, l = lane & 31;
     const int q0 = blockIdx.x * NQ / gridDim.x, q1 = (blockIdx.x + 1) * NQ / gridDim.x;
     for (int c0 = q0; c0 < q1; c0 += MD_Q) {
@@ -728,11 +722,11 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
         for (int x = blockIdx.x + nb * wave; x < NE; x += 8 * nb) c_router(A.FN, e->gin, e->pb, A.H, x, lane);   // spread: few waves per block
         BAR();
         c_pick_rank(A.H, A.route_scale, sids, swts, tid);
-        if (b0 && tid < NE_USED) { gp(A.IDS)[tid] = sids[tid]; gp(A.WTS)[tid] = swts[tid]; }
+        if (b0 && tid < NE_USED) { qz_gp(A.IDS)[tid] = sids[tid]; qz_gp(A.WTS)[tid] = swts[tid]; }
         c_up_situ_w(e->guv, e->gus, sids, A.aq3, A.as3, A.beta, A.lb, A.GU, A.gcnt, A.hq, A.hs, tid);
         BAR();
         ++xs;
-        c_moe_down_q(e->dnv, e->dns, sids, swts, gp(A.hq), gp(A.hs), A.PART1, A.xin_peer + (size_t) (xs & 1) * D, tid, mdl);
+        c_moe_down_q(e->dnv, e->dns, sids, swts, qz_gp(A.hq), qz_gp(A.hs), A.PART1, A.xin_peer + (size_t) (xs & 1) * D, tid, mdl);
         __threadfence_system();
         BAR();
     }

@@ -258,11 +258,6 @@ __global__ void __launch_bounds__(256) pf_mtp_in(
 
 typedef _Float16 pf_h2 __attribute__((ext_vector_type(2)));
 
-// v from another lane by DPP control C (0xb1 xor 1, 0x4e xor 2, 0x141 half
-// mirror): no LDS round trip, unlike __shfl_xor
-template <int C> __device__ __forceinline__ float pf_dppf(float v) {
-    return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), C, 0xf, 0xf, false));
-}
 
 // pf_flash2: causal attention as two register-tiled GEMMs; block = 64 queries
 // of one head, wave w holds q dims w * 32 .. + 31, key tiles of 16
@@ -399,7 +394,7 @@ __global__ void __launch_bounds__(PF2_NW * 64, 1) pf_flash2(
                 x[u] = kt + sk + u > sqpos ? -INFINITY : a2[u] * (1.4426950408889634f / 16.f);
             float tm = fmaxf(x[0], x[1]);
             // max over the query's 8 lanes on DPP (xor 1, xor 2, then the other quad: any order gives the max)
-            tm = fmaxf(tm, pf_dppf<0xb1>(tm)); tm = fmaxf(tm, pf_dppf<0x4e>(tm)); tm = fmaxf(tm, pf_dppf<0x141>(tm));
+            tm = fmaxf(tm, qz_dpp<0xb1, false>(tm)); tm = fmaxf(tm, qz_dpp<0x4e, false>(tm)); tm = fmaxf(tm, qz_dpp<0x141, false>(tm));
             const float nm = fmaxf(mx, tm);               // finite: key 0 is in tile 0 and visible to every query
             const float corr = mx == -INFINITY ? 0.f : __builtin_amdgcn_exp2f(mx - nm);
             float ps = 0.f, pr[2];
@@ -414,7 +409,7 @@ __global__ void __launch_bounds__(PF2_NW * 64, 1) pf_flash2(
             ((pf_h2 *) &Pt[0][0])[(sk / 2) * (QB + 4) + sq] = pf_h2{ (_Float16) pr[0], (_Float16) pr[1] };
             // the xor 1 / 2 / 4 butterfly on DPP, the same sums: after xor 2 all four lanes of a quad hold the
             // same value, so row_half_mirror (lane 7 - i, the other quad) supplies what lane i ^ 4 held
-            ps += pf_dppf<0xb1>(ps); ps += pf_dppf<0x4e>(ps); ps += pf_dppf<0x141>(ps);
+            ps += qz_dpp<0xb1, false>(ps); ps += qz_dpp<0x4e, false>(ps); ps += qz_dpp<0x141, false>(ps);
             l = l * corr + ps;
             mx = nm;
             if ((t & 7) == 0) cr[sq] = corr;

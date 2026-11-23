@@ -1,5 +1,5 @@
-// Row ops of the persistent cycle: RMS norm + int8 requant split over the
-// grid, and copying the published plane rows into LDS. DM: the row width,
+// Row ops of the qwen35 persistent cycle: RMS norm + int8 requant split over
+// the grid, and copying the published plane rows into LDS. DM: the row width,
 // a multiple of 32; blocks of 512 threads.
 #pragma once
 
@@ -28,11 +28,10 @@ template <int DM> __device__ __forceinline__ void qz_norm_requant_slice(
         const float x = xn[i] * rs * nw[i];
         const float amax = qz_amax32(fabsf(x));
         const float d = amax / 127.f;
-        const float id = d != 0.f ? 1.f / d : 0.f;
-        int q = (int) roundf(x * id);
-        if (q > 127) q = 127; else if (q < -127) q = -127;
+        const float id = qz_q8_inv(d);
+        int q = qz_q8_code(x, id);
         gq[i] = (unsigned char) q;
-        if (l == 0) gs[u] = __half2float(__float2half(d));
+        if (l == 0) gs[u] = qz_q8_scale(d);
     }
     __syncthreads();                 // xn / red are reused by the next row
 }

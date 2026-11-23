@@ -205,8 +205,7 @@ __global__ void __launch_bounds__(256) ds_fgemvK4(const float * x, const float *
 // block-wide sum over 256 threads (4 waves); every thread gets the total
 __device__ __forceinline__ float ds_bsum(float v) {
     __shared__ float r4[4];
-    #pragma unroll
-    for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
+    v = qz_wsum(v);
     __syncthreads();
     if ((threadIdx.x & 63) == 0) r4[threadIdx.x >> 6] = v;
     __syncthreads();
@@ -253,7 +252,6 @@ __global__ void __launch_bounds__(256) ds_code_b(float * proj, const unsigned ch
 
 // ds_gemvR: T-row GEMV for T <= 12, activations in LDS, up to 4 weight
 // segments per launch; nkc K chunks write partials at y + c ystr
-typedef unsigned int ds_v4u __attribute__((ext_vector_type(4)));
 struct ds_seg { const char * w; const __half * ws; int N; float * y; int b0; };
 struct ds_segs { ds_seg s[4]; int n; };
 #ifndef DS_RS
@@ -309,12 +307,12 @@ __global__ void __launch_bounds__(64 * NW) ds_gemvR(const unsigned char * a_vals
             const int r = min(r0 + s, N - 1);
             wr[s] = w_vals + (size_t) r * ldw + u0 * 32; wsr[s] = w_scal + (size_t) r * lsw + u0;
         }
-        struct WB { ds_v4u w0[S], w1[S]; unsigned short sh[S]; };
+        struct WB { qz_v4u w0[S], w1[S]; unsigned short sh[S]; };
         auto ld = [&](int u, WB & b) {
             #pragma unroll
             for (int s = 0; s < S; s++) {
-                b.w0[s] = __builtin_nontemporal_load((const ds_v4u *)(wr[s] + u * 32));
-                b.w1[s] = __builtin_nontemporal_load((const ds_v4u *)(wr[s] + u * 32 + 16));
+                b.w0[s] = __builtin_nontemporal_load((const qz_v4u *)(wr[s] + u * 32));
+                b.w1[s] = __builtin_nontemporal_load((const qz_v4u *)(wr[s] + u * 32 + 16));
                 b.sh[s] = __builtin_nontemporal_load((const unsigned short *) (wsr[s] + u));
             }
         };
@@ -335,8 +333,8 @@ __global__ void __launch_bounds__(64 * NW) ds_gemvR(const unsigned char * a_vals
                 #pragma unroll
                 for (int s = 0; s < S; s++) {
                     int d = 0;
-                    DS_DOT4(d, b.w0[s].x, a0.x); DS_DOT4(d, b.w0[s].y, a0.y); DS_DOT4(d, b.w0[s].z, a0.z); DS_DOT4(d, b.w0[s].w, a0.w);
-                    DS_DOT4(d, b.w1[s].x, a1.x); DS_DOT4(d, b.w1[s].y, a1.y); DS_DOT4(d, b.w1[s].z, a1.z); DS_DOT4(d, b.w1[s].w, a1.w);
+                    DOT4(d, b.w0[s].x, a0.x); DOT4(d, b.w0[s].y, a0.y); DOT4(d, b.w0[s].z, a0.z); DOT4(d, b.w0[s].w, a0.w);
+                    DOT4(d, b.w1[s].x, a1.x); DOT4(d, b.w1[s].y, a1.y); DOT4(d, b.w1[s].z, a1.z); DOT4(d, b.w1[s].w, a1.w);
                     acc[t][s] += (float) d * sw[s] * sa;
                 }
             }

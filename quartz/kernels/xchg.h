@@ -9,11 +9,6 @@
 // push partials to the peer inbox (slot tok & 1), wait for its flag, y = p0 + p1
 #define QZ_XSPIN 2000000000ll     // clock64 ticks before a wait gives up
 
-template <class XA> __device__ __forceinline__ void qz_xflag(const XA & A, unsigned int tok) {
-    __threadfence_system();
-    __hip_atomic_store(A.xflag_peer, tok, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-}
-
 // per-block exchange flags: block b only needs the peer's block b push (slot 0
 // doubles as the head-merge flag)
 template <class XA> __device__ __forceinline__ void qz_xflag_b(const XA & A, unsigned int tok, int b) {
@@ -33,20 +28,11 @@ template <class XA> __device__ __forceinline__ void qz_xwait_b(const XA & A, uns
     }
 }
 
-// one thread: wait for the peer's flag >= tok. Past the spin limit, or once
-// any wait gave up, set the abort word and return so the launch drains.
-template <class XA> __device__ __forceinline__ void qz_xwait(const XA & A, unsigned int tok) {
-    const long long t0 = clock64();
-    for (;;) {
-        const unsigned int v = __hip_atomic_load(A.xflag_mine, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
-        if ((int) (v - tok) >= 0) return;
-        if (__hip_atomic_load(&A.xerr[1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) return;
-        if (clock64() - t0 > QZ_XSPIN) {
-            if (atomicCAS(&A.xerr[1], 0, 1) == 0) { A.xerr[2] = 1; A.xerr[3] = (int) tok; A.xerr[4] = (int) v; }
-            return;
-        }
-    }
-}
+// block 0's flag (the whole-card exchange): set it / wait (one thread) for the
+// peer's >= tok. Past the spin limit, or once any wait gave up, a wait sets the
+// abort word and returns so the launch drains.
+template <class XA> __device__ __forceinline__ void qz_xflag(const XA & A, unsigned int tok) { qz_xflag_b(A, tok, 0); }
+template <class XA> __device__ __forceinline__ void qz_xwait(const XA & A, unsigned int tok) { qz_xwait_b(A, tok, 0); }
 
 // row-parallel GEMV over the card's K slice: the block's slabs stage in LDS and
 // push after the loop (one fence); activations optionally staged in LDS region 0

@@ -6,6 +6,7 @@
 #include "gguf.h"
 #include "mem.h"
 #include "resize.h"
+#include "kernels/dev.h"
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -24,12 +25,10 @@
 #include <cstring>
 #include <vector>
 
-#define VCHK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { \
-    fprintf(stderr, "quartz_vision: HIP error %s at %s:%d\n", hipGetErrorString(e_), __FILE__, __LINE__); return -1; } } while (0)
-#define VBLAS(x) do { rocblas_status s_ = (x); if (s_ != rocblas_status_success) { \
-    fprintf(stderr, "quartz_vision: rocBLAS error %s at %s:%d\n", rocblas_status_to_string(s_), __FILE__, __LINE__); return -1; } } while (0)
 
 namespace qwen3vl {
+
+#include "common.h"
 
 static constexpr int V_D = 1152, V_H = 16, V_HD = 72, V_PATCH = 16, V_GRID = 48, V_K = 3 * V_PATCH * V_PATCH;
 
@@ -140,12 +139,6 @@ typedef _Float16 vf_h2 __attribute__((ext_vector_type(2)));
 #define VF_VS 96                  // V pair row stride, dwords: 8 dim groups of 12 (9 used: no bank conflicts)
 #define VF_PS (VF_QB + 4)         // P pair row stride, dwords
 
-__device__ __forceinline__ float vf_dpp1(float v) {   // lane ^ 1
-    return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0xB1, 0xF, 0xF, false));
-}
-__device__ __forceinline__ float vf_dpp2(float v) {   // lane ^ 2
-    return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x4E, 0xF, 0xF, false));
-}
 __device__ __forceinline__ uint32_t vf_pack(float a, float b) {
     return __builtin_bit_cast(uint32_t, vf_h2{ (_Float16) a, (_Float16) b });
 }
@@ -250,12 +243,12 @@ __global__ void __launch_bounds__(256, 2) v_flash(const __half * __restrict__ Q,
         float x[8], tm = -INFINITY;
 #pragma unroll
         for (int j = 0; j < 8; j++) {
-            const float a0 = s[0][j] + vf_dpp1(s[0][j]), a1 = s[1][j] + vf_dpp1(s[1][j]);
+            const float a0 = s[0][j] + qz_dpp_mov<0xB1>(s[0][j]), a1 = s[1][j] + qz_dpp_mov<0xB1>(s[1][j]);
             const float a = __uint_as_float((__float_as_uint(a0) & ~mh) | (__float_as_uint(a1) & mh));
             x[j] = kt + 2 * j + kg < N ? a * sl2 : -INFINITY;
             tm = fmaxf(tm, x[j]);
         }
-        tm = fmaxf(tm, vf_dpp2(tm));
+        tm = fmaxf(tm, qz_dpp_mov<0x4E>(tm));
         const float nm = fmaxf(mx, tm);
         const float corr = __builtin_amdgcn_exp2f(mx - nm);
         float ps = 0.f, p[8];
@@ -264,7 +257,7 @@ __global__ void __launch_bounds__(256, 2) v_flash(const __half * __restrict__ Q,
             p[j] = (float) (_Float16) __builtin_amdgcn_exp2f(x[j] - nm);
             ps += p[j];
         }
-        ps += vf_dpp2(ps);
+        ps += qz_dpp_mov<0x4E>(ps);
         l = l * corr + ps;
         mx = nm;
         if (kg == 0) cr[w * 32 + qp + 16 * hf] = corr;
@@ -324,12 +317,6 @@ __global__ void __launch_bounds__(256) v_add2(float * __restrict__ x, const floa
     if (i < n) x[i] = x[i] + ((p0[i] + p1[i]) + b[i % V_D]);
 }
 
-// x[n][d] += b[d]
-__global__ void __launch_bounds__(256) v_bias(float * __restrict__ x, const float * __restrict__ b, int d) {
-    const int i = blockIdx.x * 256 + threadIdx.x;
-    if (i < d) x[(size_t) blockIdx.y * d + i] += b[i];
-}
-
 // out = gelu(y + b), tanh form, f16
 __global__ void __launch_bounds__(256) v_bias_gelu(const float * __restrict__ y, const float * __restrict__ b,
                                                    int d, __half * __restrict__ out) {
@@ -381,16 +368,6 @@ struct qz_vision {
     int n_tok = 0;
     double ms = 0;
 };
-
-// Y[n][m] (+)= X[n][k] . W[m][k]^T, W f16 [m][k], X f16, Y f32 or f16
-static int vgemm(rocblas_handle blas, const __half * W, const __half * X, void * Y, bool y16, int m, int n, int k, float beta) {
-    const float alpha = 1.f;
-    const rocblas_datatype yt = y16 ? rocblas_datatype_f16_r : rocblas_datatype_f32_r;
-    VBLAS(rocblas_gemm_ex(blas, rocblas_operation_transpose, rocblas_operation_none, m, n, k, &alpha,
-                          W, rocblas_datatype_f16_r, k, X, rocblas_datatype_f16_r, k, &beta,
-                          Y, yt, m, Y, yt, m, rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0));
-    return 0;
-}
 
 static void grid_of(const qz_vision * v, int w, int h, int * nx, int * ny) {
     // calc_size_preserved_ratio (mtmd-image.cpp): align 32, round half even, min / max pixels
@@ -666,15 +643,6 @@ int qz_vision_encode_rgb(qz_vision * v, const unsigned char * rgb, int w, int h,
     if (nx_out) *nx_out = nx;
     if (ny_out) *ny_out = ny;
     return T;
-}
-
-int qz_vision_encode(qz_vision * v, const void * bytes, size_t n, int * nx, int * ny) {
-    int w = 0, h = 0, c = 0;
-    unsigned char * px = stbi_load_from_memory((const stbi_uc *) bytes, (int) n, &w, &h, &c, 3);
-    if (!px) { fprintf(stderr, "quartz_vision: cannot decode the image (%s)\n", stbi_failure_reason()); return -1; }
-    const int r = qz_vision_encode_rgb(v, px, w, h, nx, ny);
-    stbi_image_free(px);
-    return r;
 }
 
 void qz_vision_free(qz_vision * v) {

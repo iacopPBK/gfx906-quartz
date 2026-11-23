@@ -148,18 +148,17 @@ __global__ void __launch_bounds__(256, 2) pf_gemm(
             ax = fmaxf(ax, __shfl_xor(ax, 1, 64));
             ax = fmaxf(ax, __shfl_xor(ax, 2, 64));
             const float d = ax / 127.f;
-            const float id = d != 0.f ? 1.f / d : 0.f;
+            const float id = qz_q8_inv(d);
             unsigned w2[2] = {0u, 0u};
 #pragma unroll
             for (int j = 0; j < 8; j++) {
-                int q = (int) roundf(h[j] * id);
-                q = q > 127 ? 127 : q < -127 ? -127 : q;
+                int q = qz_q8_code(h[j], id);
                 w2[j / 4] |= ((unsigned) q & 0xffu) << (8 * (j % 4));
             }
             const int ff = bx * 32 + part * 8;
             const unsigned g = (unsigned) (ff / 128), sub = (unsigned) (ff % 128);
             *(uint2 *) (Qo + ((size_t) g * Mp + m) * 128 + sub) = make_uint2(w2[0], w2[1]);
-            if (part == 0) Qs[((size_t) g * Mp + m) * 4 + sub / 32] = __half2float(__float2half(d));
+            if (part == 0) Qs[((size_t) g * Mp + m) * 4 + sub / 32] = qz_q8_scale(d);
         }
         return;
     }
@@ -211,12 +210,11 @@ __device__ __forceinline__ void pf_quant_unit(float v, int k, int m, int Mp, int
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) ax = fmaxf(ax, __shfl_xor(ax, off, 32));
     const float d = ax / 127.f;
-    const float id = d != 0.f ? 1.f / d : 0.f;
-    int q = (int) roundf(v * id);
-    q = q > 127 ? 127 : q < -127 ? -127 : q;
+    const float id = qz_q8_inv(d);
+    int q = qz_q8_code(v, id);
     const unsigned g = (unsigned) (k / 128), sub = (unsigned) (k % 128);
     Ag[((size_t) g * Mp + m) * 128 + sub] = (int8_t) q;
-    if (lane32 == 0) sag[((size_t) g * Mp + m) * 4 + sub / 32] = __half2float(__float2half(d));
+    if (lane32 == 0) sag[((size_t) g * Mp + m) * 4 + sub / 32] = qz_q8_scale(d);
 }
 
 // one block per row: y = x * rsqrt(mean(x^2) + eps) * w, quantized (and

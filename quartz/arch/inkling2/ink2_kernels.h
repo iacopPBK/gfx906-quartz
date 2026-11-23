@@ -24,14 +24,13 @@ constexpr int CHL = 2 * KVL + 2 * D;                   // local conv history cha
 constexpr int H_K = 0, H_V = KVL, H_A = 2 * KVL, H_F = 2 * KVL + D;
 constexpr int TBW = REL_EXT + 1;                       // bias table width (the zero column past the extent)
 
-// wsum_xor (the xor butterfly with DPP in-row levels): ink2_prelude.h
 // sum of N values over the first nw waves of the block (every thread of the
 // block calls it); every thread gets the sums
 template <int N, bool DPP = true> __device__ __forceinline__ void bsum(float (&v)[N], float * red, int nw) {
     #pragma unroll
     for (int k = 0; k < N; k++)
-        if (DPP) v[k] = wsum_xor(v[k]);
-        else
+        if constexpr (DPP) v[k] = qz_wsum_dpp(v[k]);
+        else   // inline, not qz_wsum: dev.h is outside the contract(on) region, so a caller's x * x would fuse into its first add
             #pragma unroll
             for (int off = 32; off > 0; off >>= 1) v[k] += __shfl_xor(v[k], off, 64);
     const int w = threadIdx.x >> 6;
@@ -55,10 +54,8 @@ __device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + expf(-x)); 
 __device__ __forceinline__ void quant32(float x, unsigned char * q, float * qs, int i) {
     const float amax = qz_amax32(fabsf(x));
     const float d = amax / 127.f;
-    int v = amax == 0.f ? 0 : (int) roundf(x / d);
-    v = v > 127 ? 127 : (v < -127 ? -127 : v);
-    q[i] = (unsigned char) v;
-    if ((i & 31) == 0) qs[i >> 5] = __half2float(__float2half(d));
+    q[i] = (unsigned char) qz_q8_code_div(x, amax, d);
+    if ((i & 31) == 0) qs[i >> 5] = qz_q8_scale(d);
 }
 
 // ---- token row of the Q8 embedding -> rmsnorm * w (NT 256)
@@ -130,7 +127,7 @@ __device__ __forceinline__ void d_mix_lds(const sptrs & S, const float * qy, flo
         r[s] = 0.f;
         #pragma unroll
         for (int k = 0; k < NV; k++) { const float v = sh[s * D + 256 * k]; r[s] += v * v; }
-        r[s] = wsum_xor(r[s]);
+        r[s] = qz_wsum_dpp(r[s]);
     }
     if (lane == 0)
         #pragma unroll
@@ -158,7 +155,7 @@ __device__ __forceinline__ void d_mix_lds(const sptrs & S, const float * qy, flo
         }
     }
     #pragma unroll
-    for (int q = 0; q < NQ; q++) r[q] = wsum_xor(r[q]);
+    for (int q = 0; q < NQ; q++) r[q] = qz_wsum_dpp(r[q]);
     if (lane == 0)
         #pragma unroll
         for (int q = 0; q < NQ; q++) red[(h * 4 + w) * NQ + q] = r[q];
@@ -374,10 +371,10 @@ __device__ __forceinline__ void att_join(float & m, float & l, float * o, float 
     m = M;
 }
 __device__ __forceinline__ float att_row16(float x) {   // sum over the 16-lane DPP row
-    x += dppf<0x128>(x);
-    x += dppf<0x124>(x);
-    x += dppf<0x4E>(x);
-    x += dppf<0xB1>(x);
+    x += qz_dpp<0x128>(x);
+    x += qz_dpp<0x124>(x);
+    x += qz_dpp<0x4E>(x);
+    x += qz_dpp<0xB1>(x);
     return x;
 }
 __device__ __forceinline__ void att_h8(const uint4 & u, float * f) {

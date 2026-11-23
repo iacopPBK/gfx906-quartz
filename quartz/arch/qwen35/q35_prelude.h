@@ -31,7 +31,6 @@
 #include "kernels/gemv.h"
 #include "kernels/dev.h"
 #include "kernels/pf_gemm.h"
-#include "kernels/rowops.h"
 #include "kernels/topk.h"
 #include "kernels/xchg.h"
 #include "loader.h"
