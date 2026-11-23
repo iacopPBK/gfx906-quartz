@@ -6,6 +6,8 @@
 // peer's partial over P2P after a cross-stream event wait).
 #pragma once
 
+#include "ink2_verify.h"     // the speculative round's VR-row kernel (after ink2_cycle.h)
+
 #define ICHECK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { \
     fprintf(stderr, "inkling2: HIP error %s at %s:%d\n", hipGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
 
@@ -40,6 +42,15 @@ struct ink2_card {
     __half * kc[NAPP], * vc[NAPP];            // per slot: full [ctx][KVL], SWA ring [WIN][KVL]
     float * hist;                             // [NAPP][3][CHL]
     int nvalid = 0, id0 = 0;                  // head rows that are real vocab ids, the first id
+    // verify (ink2_verify.h): VR row replicas of the activations, at stride rs bytes
+    size_t rs = 0;                            // one activation row's stride (bytes, 256-aligned)
+    size_t apsz = 0;                          // attention partials per row (floats)
+    float * uh = nullptr;                     // [NAPP][VR][CHL]: each row's conv input
+    float * LOGV = nullptr;                   // [VR][nvalid]: the rows' head logits
+    float2 * vtk = nullptr;                   // [VR][QZ_TOPK_NB][QZ_TOPK]
+    unsigned int * vbst = nullptr;            // the verify grid barrier + chain group flags
+    void * vargs_d = nullptr;                 // the verify args
+    float * vws = nullptr;                    // the verify attention's wave states
     // persistent decode (ink2_cycle.h)
     qz_xbufs x;                               // TP2 exchange buffers (core/cards.h)
     unsigned int * bst = nullptr;      // the grid barrier flags (CYC_NBMAX)
@@ -55,6 +66,8 @@ struct ink2_engine {
     int nx = 0;                               // exchanges issued (partial double-buffer parity)
     std::vector<float2> tkh[2];
     float2 * tkp[2] = {nullptr, nullptr};     // pinned: the top-K, then the exchange error words (8 ints)
+    std::vector<float2> vtkh[2];
+    float2 * vtkp[2] = {nullptr, nullptr};    // pinned: the verify rows' top-K, then the error words
 
     // ---- setup
     static qw Qw(const qz_loader & ld, const char * n) {
@@ -151,11 +164,18 @@ struct ink2_engine {
         add(f32(QL / 4)); add(f32(QL / 32));
         add(f32(NE_USED * FFL / 4)); add(f32(NE_USED * FFL / 32));
         add(f32(QZ_TOPK_NB * QZ_TOPK * 2));
+        // the per-token activations above are replicated VR times: row r of any of them
+        // is (char *) p + r * rs, row 0 being the decode's buffers (ink2_verify.h)
+        const size_t aneed = need;
+        K.rs = (aneed + 255) & ~(size_t) 255;
+        size_t cneed = 0;
+        auto addc = [&](size_t bytes) { sz.push_back(bytes); cneed += bytes; };
         for (int s = 0; s < NAPP; s++) {
             const size_t rows = is_full(slot_phys(s)) ? (size_t) ctx : (size_t) PF_RING;
-            add(f32(rows * KVL / 2)); add(f32(rows * KVL / 2));
+            addc(f32(rows * KVL / 2)); addc(f32(rows * KVL / 2));
         }
-        add(f32((size_t) NAPP * 3 * CHL));
+        addc(f32((size_t) NAPP * 3 * CHL));
+        need = K.rs * VR + cneed;
         char * base = nullptr;
         if (qz_dmalloc((void **) &base, need, "state") != hipSuccess) { fprintf(stderr, "inkling2: card %d: no room for %.2f GB of state\n", c, need / 1e9); return false; }
         ICHECK(hipMemset(base, 0, need));
@@ -177,35 +197,47 @@ struct ink2_engine {
         K.oq = (unsigned char *) nx_(); K.os = (float *) nx_();
         K.hq = (unsigned char *) nx_(); K.hs = (float *) nx_();
         K.tk = (float2 *) nx_();
+        o = K.rs * VR;                             // the KV caches / histories are not replicated
         for (int s = 0; s < NAPP; s++) { K.kc[s] = (__half *) nx_(); K.vc[s] = (__half *) nx_(); }
         K.hist = (float *) nx_();
         ICHECK(hipEventCreateWithFlags(&K.ev, hipEventDisableTiming));
-        ICHECK(K.x.alloc(1, D));
-        ICHECK(qz_dmalloc(&K.apart, (size_t) HKVL * ATT_SPL * GQ * ATT_PW * sizeof(float), "state"));
-        ICHECK(qz_dmalloc(&K.acnt, HKVL * sizeof(int), "state"));
-        ICHECK(hipMemset(K.acnt, 0, HKVL * sizeof(int)));
+        ICHECK(K.x.alloc(VR + 1, D));              // the verify rows' inbox past the decode's 2 D
+        K.apsz = (size_t) HKVL * ATT_SPL * GQ * ATT_PW;
+        ICHECK(qz_dmalloc(&K.apart, VR * K.apsz * sizeof(float), "state"));
+        ICHECK(qz_dmalloc(&K.acnt, VR * HKVL * sizeof(int), "state"));
+        ICHECK(hipMemset(K.acnt, 0, VR * HKVL * sizeof(int)));
         ICHECK(qz_dmalloc((void **) &K.bst, CYC_NBX * sizeof(unsigned int), "state"));
+        ICHECK(qz_dmalloc((void **) &K.vbst, (CYC_NBMAX + VR * CG) * sizeof(unsigned int), "state"));
+        ICHECK(hipMemset(K.vbst, 0, (CYC_NBMAX + VR * CG) * sizeof(unsigned int)));
+        ICHECK(qz_dmalloc((void **) &K.uh, (size_t) NAPP * VR * CHL * sizeof(float), "state"));
+        ICHECK(qz_dmalloc((void **) &K.LOGV, (size_t) VR * K.nvalid * sizeof(float), "state"));
+        ICHECK(hipMalloc((void **) &K.vtk, (size_t) VR * QZ_TOPK_NB * QZ_TOPK * sizeof(float2)));
         ICHECK(hipDeviceGetAttribute(&K.ncu, hipDeviceAttributeMultiprocessorCount, qz_dev_of(c)));
         if (K.ncu > CYC_NBMAX) K.ncu = CYC_NBMAX;      // the barrier's flag lanes
         if (K.ncu < 2 * CG) { fprintf(stderr, "inkling2: card %d: %d CUs, the persistent decode needs %d\n", c, K.ncu, 2 * CG); return false; }
         {
             ICHECK(hipFuncSetAttribute((const void *) ink2_cycle, hipFuncAttributeMaxDynamicSharedMemorySize, CYC_LDS));
+            ICHECK(hipFuncSetAttribute((const void *) ink2_verify, hipFuncAttributeMaxDynamicSharedMemorySize, VER_LDS));
             ICHECK(hipFuncSetAttribute((const void *) k_mix<1>, hipFuncAttributeMaxDynamicSharedMemorySize, MIX_LDS));
             ICHECK(hipFuncSetAttribute((const void *) k_mix<3>, hipFuncAttributeMaxDynamicSharedMemorySize, MIX_LDS));
             ICHECK(hipFuncSetAttribute((const void *) k_mix<4>, hipFuncAttributeMaxDynamicSharedMemorySize, MIX_LDS));
-            const qz_resident_kernel ks[] = {{(const void *) ink2_cycle, CYC_LDS, "ink2_cycle"}};
-            if (!qz_resident(qz_dev_of(c), ks, 1, K.ncu, 512)) return false;
+            const qz_resident_kernel ks[] = {{(const void *) ink2_cycle, CYC_LDS, "ink2_cycle"},
+                                             {(const void *) ink2_verify, VER_LDS, "ink2_verify"}};
+            if (!qz_resident(qz_dev_of(c), ks, 2, K.ncu, 512)) return false;
         }
         cyc_args & A = K.ca;
         A.ev = K.embd.v; A.es = K.embd.s; A.embd_norm = K.embd_norm; A.eps = hp.eps;
         A.X = K.X; A.P = K.P; A.PART0 = K.PART[0]; A.PART1 = K.PART[1];
         A.F = K.F; A.FN = K.FN; A.H = K.H; A.IDS = K.IDS; A.WTS = K.WTS; A.aq3 = K.aq[3]; A.as3 = K.as[3]; A.hq = K.hq; A.hs = K.hs; A.GU = K.LOG;
-        ICHECK(qz_dmalloc(&A.gcnt, NE_USED * FFL / 32 * sizeof(int), "state")); ICHECK(hipMemset(A.gcnt, 0, NE_USED * FFL / 32 * sizeof(int)));
-        ICHECK(qz_dmalloc((void **) &A.cpart, 2 * CP_SZ * sizeof(float), "state"));
+        ICHECK(qz_dmalloc(&A.gcnt, VR * NE_USED * FFL / 32 * sizeof(int), "state"));
+        ICHECK(hipMemset(A.gcnt, 0, VR * NE_USED * FFL / 32 * sizeof(int)));
+        ICHECK(qz_dmalloc((void **) &A.cpart, VR * CP_SZ * sizeof(float), "state"));
         A.route_scale = hp.route_scale; A.beta = hp.situ_beta; A.lb = hp.situ_lin_beta;
         A.xin_mine = K.x.xin; A.xflag_mine = K.x.xflag; A.xseq = K.x.xseq; A.xerr = K.x.xerr;
         tkh[c].resize((size_t) QZ_TOPK_NB * QZ_TOPK);
         ICHECK(hipHostMalloc((void **) &tkp[c], ((size_t) QZ_TOPK_NB * QZ_TOPK + 4) * sizeof(float2), 0));
+        vtkh[c].resize((size_t) VR * QZ_TOPK_NB * QZ_TOPK);
+        ICHECK(hipHostMalloc((void **) &vtkp[c], ((size_t) VR * QZ_TOPK_NB * QZ_TOPK + 4) * sizeof(float2), 0));
         return true;
     }
     void reset() {   // a fresh sequence: zero conv history (KV rows are written before they are read)
@@ -360,6 +392,10 @@ struct ink2_engine {
         head_mix[c] = sp(bl, C[c].X);
     }
     bool planned = false;
+    // DSpark (set before the first step, card 0): the residual entering applications
+    // DSPARK_VISIT[k] -> dtap + k D, the head's normed input -> dtap_head
+    static constexpr int DSPARK_VISIT[3] = {5, 23, 41};
+    float * dtap = nullptr, * dtap_head = nullptr;
     void plan_all() {
         if (planned) return;
         for (int c = 0; c < 2; c++) { C[c].ca.xin_peer = C[1 - c].x.xin; C[c].ca.xflag_peer = C[1 - c].x.xflag; }
@@ -369,10 +405,11 @@ struct ink2_engine {
             {
                 cyc_args & A = C[c].ca;
                 A.hmix = head_mix[c]; A.hq_out = C[c].out_q;
-                A.hn = {C[c].F, C[c].out_norm, nullptr, C[c].aq[3], C[c].as[3]};
+                A.hn = {C[c].F, C[c].out_norm, c == 0 ? dtap_head : nullptr, C[c].aq[3], C[c].as[3]};
                 A.hg = job(C[c].head, C[c].aq[3], C[c].as[3], C[c].LOG);
                 A.nvalid = C[c].nvalid; A.softcap = hp.softcap;
             }
+            if (c == 0 && dtap) for (int k = 0; k < 3; k++) tab[0][DSPARK_VISIT[k]].tap = dtap + (size_t) k * D;
             C[c].ca.napp = (int) tab[c].size();
             if (!tab_d[c]) ICHECK(hipMalloc(&tab_d[c], tab[c].size() * sizeof(appk)));
             ICHECK(hipMemcpy(tab_d[c], tab[c].data(), tab[c].size() * sizeof(appk), hipMemcpyHostToDevice));
@@ -394,6 +431,123 @@ struct ink2_engine {
             ICHECK(hipGetLastError());
         }
         n_cyc++;
+    }
+
+    // ---- verify (ink2_verify.h): the speculative round's VR rows in one launch per card.
+    // The per-row tables (every per-token activation pointer + r * rs, the attention
+    // partials / counters on their own strides) are built once from the decode table.
+    std::vector<appk> vtab[2];
+    appk * vtab_d[2] = {nullptr, nullptr};
+    float * vtap = nullptr;                        // card 0: the rows' [4][D] drafter features (the drafter's)
+    bool vplanned = false;
+    template <class T> static T * shp(T * p, size_t o) { return p ? (T *) ((char *) p + o) : nullptr; }
+    static void sh_sptrs(sptrs & S, size_t o) { for (int i = 0; i < 6; i++) S.p[i] = shp(S.p[i], o); }
+    static void sh_cjob(cjob & c, size_t o) {
+        c.cur = shp(c.cur, o); c.msg = shp(c.msg, o); c.g = shp(c.g, o); c.out = shp(c.out, o);
+    }
+    static void sh_njob(njob & j, size_t o) {
+        j.x = shp(j.x, o); j.y = shp(j.y, o); j.q = shp(j.q, o); j.qs = shp(j.qs, o);
+    }
+    static void sh_gjobs(gjobs & J, size_t o) {
+        for (int i = 0; i < J.n; i++) { J.j[i].av = shp(J.j[i].av, o); J.j[i].as = shp(J.j[i].as, o); J.j[i].y = shp(J.j[i].y, o); }
+    }
+    // row r's entry: activations + r * rs; weights, the KV caches and the histories stay
+    void shift_appk(appk & e, int r, size_t o, size_t ao, size_t co) {
+        e.pre_out = shp(e.pre_out, o);
+        sh_sptrs(e.mres, o); e.res_out = shp(e.res_out, o);
+        sh_sptrs(e.mmsg, o); e.msg_out = shp(e.msg_out, o);
+        for (int j = 0; j < 3; j++) sh_cjob(e.ca.j[j], o);
+        for (int j = 0; j < 3; j++) if (e.na.j[j].x) sh_njob(e.na.j[j], o);
+        sh_gjobs(e.ga, o); sh_gjobs(e.go, o);
+        hpost & h = e.hp;
+        h.qr = shp(h.qr, o); h.rr = shp(h.rr, o); h.sk = shp(h.sk, o); h.kr = shp(h.kr, o); h.vr = shp(h.vr, o);
+        h.dk = shp(h.dk, o); h.dv = shp(h.dv, o);
+        h.q = shp(h.q, o); h.tb = shp(h.tb, o);
+        attn_args & t = e.at;
+        t.q = shp(t.q, o); t.tb = shp(t.tb, o); t.gate = shp(t.gate, o); t.oq = shp(t.oq, o); t.os = shp(t.os, o);
+        t.part = shp(t.part, ao); t.cnt = shp(t.cnt, co);
+        e.blk = shp(e.blk, o);
+        sh_sptrs(e.mff, o);
+        sh_cjob(e.cb.j[0], o);
+        sh_njob(e.nb.j[0], o);
+        if (e.tap) e.tap = vtap + (size_t) r * 4 * D + (e.tap - dtap);
+    }
+    void vplan() {
+        if (vplanned) return;
+        plan_all();
+        vplanned = true;
+        for (int c = 0; c < 2; c++) {
+            const int napp = C[c].ca.napp;                 // the table rows follow the (possibly truncated) count
+            const size_t o = C[c].rs, ao = C[c].apsz * sizeof(float), co = HKVL * sizeof(int);
+            vtab[c].resize((size_t) VR * napp);
+            for (int r = 0; r < VR; r++)
+                for (int a = 0; a < napp; a++) {
+                    appk & e = vtab[c][(size_t) r * napp + a];
+                    e = tab[c][a];
+                    shift_appk(e, r, (size_t) r * o, (size_t) r * ao, (size_t) r * co);
+                }
+            ICHECK(hipSetDevice(qz_dev_of(c)));
+            const size_t bytes = vtab[c].size() * sizeof(appk);
+            if (!vtab_d[c]) ICHECK(hipMalloc((void **) &vtab_d[c], bytes));
+            ICHECK(hipMemcpy(vtab_d[c], vtab[c].data(), bytes, hipMemcpyHostToDevice));
+            vargs V;
+            memset(&V, 0, sizeof(V));
+            V.A = C[c].ca;
+            V.A.tab = vtab_d[c];
+            V.rs = (int) C[c].rs; V.rsf = (int) (C[c].rs / 4);
+            V.uh = C[c].uh; V.LOGV = C[c].LOGV; V.gcnt = C[c].ca.gcnt;
+            V.vtap = c == 0 ? vtap : nullptr;
+            V.hist = C[c].hist;
+            if (!C[c].vws) ICHECK(qz_dmalloc((void **) &C[c].vws, VR * VWS * sizeof(float), "state"));
+            V.ws = C[c].vws;
+            if (!C[c].vargs_d) ICHECK(hipMalloc(&C[c].vargs_d, sizeof(vargs)));
+            ICHECK(hipMemcpy(C[c].vargs_d, &V, sizeof(vargs), hipMemcpyHostToDevice));
+        }
+        ICHECK(hipSetDevice(qz_dev_of(0)));
+    }
+    // the round: launch both cards, then each card's top-K of the VR logit rows; synced
+    long long n_ver = 0;
+    void verify(const int * toks, int pos) {
+        vplan();
+        vtok tv;
+        for (int r = 0; r < VR; r++) { tv.t[r] = toks[r]; tv.tau[r] = tau_at(pos + r); }
+        for (int c = 0; c < 2; c++) {
+            ink2_card & K = C[c];
+            ICHECK(hipSetDevice(qz_dev_of(c)));
+            ICHECK(hipMemsetAsync(K.vbst, 0, (CYC_NBMAX + VR * CG) * sizeof(unsigned int), K.st));
+            hipLaunchKernelGGL(ink2_verify, dim3(K.ncu), dim3(512), VER_LDS, K.st, K.vbst, (const vargs *) K.vargs_d, tv, pos, 1);
+            ICHECK(hipGetLastError());
+            qz_topk_rows<<<dim3(QZ_TOPK_NB, VR), 256, 0, K.st>>>(K.LOGV, K.nvalid, K.id0, K.vtk);
+            const size_t n2 = (size_t) VR * QZ_TOPK_NB * QZ_TOPK;
+            ICHECK(hipMemcpyAsync(vtkp[c], K.vtk, n2 * sizeof(float2), hipMemcpyDeviceToHost, K.st));
+            ICHECK(hipMemcpyAsync(vtkp[c] + n2, K.x.xerr, 8 * sizeof(int), hipMemcpyDeviceToHost, K.st));
+        }
+        for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(C[c].st)); }
+        for (int c = 0; c < 2; c++)
+            qz_xerr_check_h(c, (const int *) (vtkp[c] + (size_t) VR * QZ_TOPK_NB * QZ_TOPK), n_ver);
+        n_ver++;
+    }
+    // the row's greedy pick (the same tie rule as greedy(): the lower id on equal logits)
+    int greedy_row(int r) const {
+        float bv = -INFINITY;
+        int bi = -1;
+        for (int c = 0; c < 2; c++) {
+            const float2 * b = vtkp[c] + (size_t) r * QZ_TOPK_NB * QZ_TOPK;
+            for (int i = 0; i < QZ_TOPK_NB * QZ_TOPK; i++) {
+                int id;
+                memcpy(&id, &b[i].y, 4);
+                if (id >= 0 && (b[i].x > bv || (b[i].x == bv && id < bi))) { bv = b[i].x; bi = id; }
+            }
+        }
+        return bi;
+    }
+    // the conv histories of the m committed rows (both cards)
+    void commit(int m) {
+        for (int c = 0; c < 2; c++) {
+            ink2_card & K = C[c];
+            ICHECK(hipSetDevice(qz_dev_of(c)));
+            k_vcommit<<<(NAPP * CHL + 255) / 256, 256, 0, K.st>>>(K.hist, K.uh, m);
+        }
     }
 
     // the whole forward for one token; logits: also run the head and leave the top-K on the host

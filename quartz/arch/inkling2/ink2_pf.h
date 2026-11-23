@@ -854,11 +854,51 @@ struct pf_card {
     int4 * TM; int * NTL;              // expert tiles: {expert, first pair, count}, count
 };
 
+// rows of out (row stride ostride) = RMSNorm(x; w)
+static __global__ __launch_bounds__(256) void k_pf_rmsw(const float * x, const float * w, float * out, int ostride, float eps) {
+    __shared__ float red[16];
+    const float * xr = x + (size_t) blockIdx.x * D;
+    float v[D / 256], ss[1] = {0.f};
+    #pragma unroll
+    for (int k = 0; k < D / 256; k++) { v[k] = xr[threadIdx.x + k * 256]; ss[0] += v[k] * v[k]; }
+    bsum<1, false>(ss, red, 4);
+    const float r = rsqrtf(ss[0] / D + eps);
+    #pragma unroll
+    for (int k = 0; k < D / 256; k++) out[(size_t) blockIdx.x * ostride + threadIdx.x + k * 256] = v[k] * r * w[threadIdx.x + k * 256];
+}
+
 struct ink2_pf {
     ink2_engine * E = nullptr;
     std::atomic<bool> * abort = nullptr;
     pf_card B[2];
     int bnx = 0;                       // exchange parity (double-buffered partials)
+    // the DSpark drafter's target features per prompt row, [row][4][D]: the residual
+    // entering applications 5, 23, 41 and the head input output_norm(mix(blocks, x; out_q)).
+    // dtaps: card 0, the chunk's rows from 0, then on_chunk(p0, m) (the drafter's context fill)
+    float * dtaps = nullptr;
+    std::function<void(int, int)> on_chunk;
+    float * tapd = nullptr;            // card 0: one chunk's head mixes
+    bool tapping() const { return dtaps != nullptr; }
+    void tap(int k, int p0, int m) {
+        if (!tapping()) return;
+        ICHECK(hipSetDevice(qz_dev_of(0)));
+        hipStream_t st = E->C[0].st;
+        ICHECK(hipMemcpy2DAsync(dtaps + (size_t) k * D, 4 * D * 4, B[0].X, D * 4, D * 4, m, hipMemcpyDeviceToDevice, st));
+    }
+    void tap_head(const ink2_engine::seq & S, int p0, int m) {
+        if (!tapping()) return;
+        ink2_engine & E = *this->E;
+        ink2_card & K = E.C[0];
+        ICHECK(hipSetDevice(qz_dev_of(0)));
+        if (!tapd) ICHECK(hipMalloc(&tapd, (size_t) PF_M * D * 4));
+        for (int r = 0; r < m; r++) {
+            std::vector<const float *> bl;
+            for (int ib : S.blocks) bl.push_back(B[0].BLK[ib] + (size_t) r * D);
+            E.mix(0, bl, B[0].X + (size_t) r * D, K.out_q, 1, tapd + (size_t) r * D);
+        }
+        k_pf_rmsw<<<m, 256, 0, K.st>>>(tapd, K.out_norm, dtaps + 3 * D, 4 * D, E.hp.eps);
+        if (on_chunk) on_chunk(p0, m);
+    }
 
     bool alloc(int c) {
         ink2_engine & E = *this->E;
@@ -1180,7 +1220,7 @@ struct ink2_pf {
                 k_pf_embed<<<m, 256, 0, K.st>>>(b.TOK, K.embd.v, K.embd.s, K.embd_norm, E.hp.eps, b.X);
             }
             ink2_engine::seq S;
-            for (int il = 0; il < LOOP0; il++) layer(il, il, p0, m, S);
+            for (int il = 0; il < LOOP0; il++) { if (il == 5) tap(0, p0, m); layer(il, il, p0, m, S); }
             const ink2_engine::seq pre = S;
             for (int c = 0; c < 2; c++) {
                 ICHECK(hipSetDevice(qz_dev_of(c)));
@@ -1203,11 +1243,13 @@ struct ink2_pf {
                 }
                 for (int ip = LOOP0; ip < LOOP1; ip++) {
                     const int slot = pass == 0 ? ip : NL + (pass - 1) * (LOOP1 - LOOP0) + (ip - LOOP0);
+                    if ((pass == 1 && ip == 11) || (pass == 2 && ip == 17)) tap(pass, p0, m);   // visits 23, 41
                     layer(slot, ip, p0, m, S);
                 }
             }
             S.bank = -1;
             for (int il = LOOP1; il < NL; il++) layer(il, il, p0, m, S);
+            tap_head(S, p0, m);
             if (logits && p0 + m == n) head_last(S, m);
         }
         return true;

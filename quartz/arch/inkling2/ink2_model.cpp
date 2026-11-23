@@ -15,6 +15,7 @@ namespace ink2 {
 #include "ink2_cycle.h"
 #include "ink2_engine.h"
 #include "ink2_pf.h"
+#include "ink2_dspark.h"
 
 struct ink2_ctx : qz_ctx {
     std::string name;
@@ -27,6 +28,10 @@ struct ink2_ctx : qz_ctx {
     qz_pcache pc;
     float * shist[2] = {};
     int hi = -1;
+    // DSpark drafter (QZ_DSPINE=<drafter gguf>): speculative greedy rounds (the
+    // anchor and the 7 drafts are the verify kernel's 8 rows, ink2_verify.h)
+    ink2_dspark DS;
+    bool ds_on = false;
     static constexpr int tail = 64;
 
     void info(qz_model_info * out) const override {
@@ -93,19 +98,60 @@ struct ink2_ctx : qz_ctx {
         const auto t1 = clk::now();
         st.prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         int pos = n_prompt;
-        while (st.n_gen < max_new) {
-            const int32_t t = pick();
-            bool hit = false;
-            for (int k = 0; k < n_stop; k++) if (stop[k] == t) hit = true;
-            if (hit) { st.stop = 1; break; }
-            if (cb && !cb(user, &t, 1)) { st.n_gen++; st.stop = 3; break; }
+        const bool dsr = ds_on && !sam.smp;
+        int dr[DS_BS - 1];
+        const long r0 = DS.rounds, a0 = DS.accepted;
+        // one token: 0 = the generation goes on, 1 = it ends here (the token was emitted)
+        auto emit = [&](int32_t t) {
+            for (int k = 0; k < n_stop; k++) if (stop[k] == t) { st.stop = 1; return 1; }
+            if (cb && !cb(user, &t, 1)) { st.n_gen++; st.stop = 3; return 1; }
             st.n_gen++;
-            if (st.n_gen >= max_new) break;
-            if (abort_flag) { st.stop = 2; break; }
-            hi = std::max(hi, pos);
-            E.step(t, pos++, true);
+            if (st.n_gen >= max_new) return 1;
+            if (abort_flag) { st.stop = 2; return 1; }
+            return 0;
+        };
+        // DSpark greedy rounds: the anchor t0 at pos is verify row 0, the drafter's 7
+        // drafts rows 1 .. 7; n leading drafts match the target's own pick, so rows
+        // 0 .. n commit, d[0 .. n-1] are emitted, and the row-n pick g[n] at pos + n + 1
+        // is the next anchor (emitted at the top of the next round). Without the drafter (or when the 8 rows do
+        // not fit) this is one step per token, as before.
+        bool anchor = false;
+        int32_t anc = 0;
+        while (st.n_gen < max_new) {
+            if (!anchor) anc = pick();
+            anchor = false;
+            if (emit(anc)) break;
+            if (!dsr || pos + VR > E.ctx) {
+                hi = std::max(hi, pos);
+                E.step(anc, pos++, true);
+                if (ds_on) DS.fill(DS.tap, 4 * D, pos - 1, 1);
+                st.decode_cycles++;
+                continue;
+            }
+            DS.draft(anc, pos, dr);
+            int toks[VR];
+            toks[0] = anc;
+            for (int r = 0; r < DS_BS - 1; r++) toks[r + 1] = dr[r];
+            E.verify(toks, pos);
+            int g[VR], n = 0;
+            for (int r = 0; r < VR; r++) g[r] = E.greedy_row(r);
+            while (n < DS_BS - 1 && dr[n] == g[n]) n++;
+            DS.rounds++;
+            DS.accepted += n;
+            hi = std::max(hi, pos + VR - 1);          // the SWA ring rows the verify wrote
             st.decode_cycles++;
+            bool end = false;
+            for (int i = 0; i < n && !end; i++) end = emit(dr[i]) != 0;
+            if (end) break;
+            E.commit(n + 1);
+            DS.fill(E.vtap, 4 * D, pos, n + 1);
+            pos += n + 1;
+            anc = g[n];
+            anchor = true;
         }
+        if (dsr && DS.rounds > r0)
+            fprintf(stderr, "dspark: %ld rounds, %.2f tok/rnd (%.2f drafts accepted of %d)\n", DS.rounds - r0,
+                    (double) (DS.accepted - a0 + DS.rounds - r0) / (DS.rounds - r0), (double) (DS.accepted - a0) / (DS.rounds - r0), DS_BS - 1);
         st.decode_tok = st.decode_cycles;
         st.decode_ms = std::chrono::duration<double, std::milli>(clk::now() - t1).count();
         return fin(0);
@@ -148,6 +194,15 @@ static qz_ctx * create(const char * path, const qz_create_opts & o) {
             hb.live[i] = c->E.C[i].hist; hb.stage[i] = c->shist[i];
         }
         c->pc.init({ hb }, 16, c->E.C[0].st, c->E.C[1].st);
+    }
+    if (const char * dp = getenv("QZ_DSPINE")) {   // the server's drafter flag: a DSpark GGUF here
+        c->DS.E = &c->E;
+        if (!c->DS.load(dp, c->E.ctx)) { delete c; return nullptr; }
+        ICHECK(hipSetDevice(qz_dev_of(0)));
+        ICHECK(qz_dmalloc((void **) &c->EPF.dtaps, (size_t) PF_M * 4 * D * 4, "dspark"));
+        c->EPF.on_chunk = [c](int p0, int m) { c->DS.fill(c->EPF.dtaps, 4 * D, p0, m); };
+        c->ds_on = true;
+        printf("inkling2: DSpark drafter %s\n", dp);
     }
     ICHECK(hipSetDevice(qz_dev_of(0)));
     qz_mem_report(stdout, 2);

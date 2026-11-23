@@ -51,6 +51,7 @@ struct appk {
     const float * gin, * pb;
     const char * guv; const __half * gus; const char * dnv; const __half * dns;
     const float * fconv; float * hsf;
+    float * tap;                  // DSpark: X after this application's leading xconv (null: none)
 };
 
 // static per card (device memory); the token's tok / pos / tau are kernel arguments
@@ -286,8 +287,10 @@ CYC_NI void cg_sync(const cgrp & g, unsigned int e) {
 }
 __device__ __forceinline__ void cg_put(float * p, float v) { *p = v; __threadfence(); }
 // d_xconv_blk's values on the owned columns (thread q = tid, tid + 512)
-CYC_NI void c_cxconv(const float * own, const float * peer, const float * w, float * hs, float * x, float * blk, int cw, int tid) {
-    own = gp(own); peer = gp(peer); w = gp(w); hs = gp(hs); x = gp(x); blk = blk ? gp(blk) : nullptr;
+// tap: also the new x (the DSpark drafter's feature: the residual entering the next application)
+CYC_NI void c_cxconv(const float * own, const float * peer, const float * w, float * hs, float * x, float * blk, int cw, int tid,
+                     float * tap = nullptr) {
+    own = gp(own); peer = gp(peer); w = gp(w); hs = gp(hs); x = gp(x); blk = blk ? gp(blk) : nullptr; tap = tap ? gp(tap) : nullptr;
     #pragma unroll
     for (int m = 0; m < 2; m++) {
         const int q = tid + 512 * m;
@@ -302,6 +305,7 @@ CYC_NI void c_cxconv(const float * own, const float * peer, const float * w, flo
             const float y = (u + o) * (1.f / sqrtf((float) NCONV + 1.f));
             if (blk) { blk[i] = xv; x[i] = y; }
             else x[i] = xv + y;
+            if (tap) tap[i] = blk ? y : xv + y;
         }
     }
 }
@@ -674,7 +678,7 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
             if (ai > 0) {
                 CK appk * ep = e - 1;
                 cyc_xwait(A, xs);
-                c_cxconv(A.PART1, A.xin_mine + (size_t) (xs & 1) * D, ep->fconv, ep->hsf, A.X, nullptr, g1.w, tid);
+                c_cxconv(A.PART1, A.xin_mine + (size_t) (xs & 1) * D, ep->fconv, ep->hsf, A.X, nullptr, g1.w, tid, e->tap);
             }
             if (pre) c_cpre(pre, A.P, A.X, e->pre_out, g1.w, tid);
             if (e->has_res && !msg) {           // the norms' inputs are the mix outputs (nna = mres_m)
