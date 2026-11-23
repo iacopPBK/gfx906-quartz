@@ -1,8 +1,8 @@
 # Inkling-2-Mini (`inkling2_loop`): the forward pass
 
 The spec quartz's `inkling2` engine is built from. Source: mainline llama.cpp
-`src/models/inkling2.cpp` and `src/models/inkling2-loop.cpp` at e300919cc
-(2026-11-22), the reference quartz is checked against. Names in `code` are GGUF
+`src/models/inkling2.cpp` and `src/models/inkling2-loop.cpp` at e300919cc,
+the reference quartz is checked against. Names in `code` are GGUF
 tensor names without the `blk.N.` prefix or the `.weight` suffix. Shapes are
 in ggml order (`[ne0, ne1]`; a matrix `[in, out]` maps `in` to `out`).
 
@@ -152,8 +152,10 @@ logits = 30 * tanh((h · output) / 30), first 200058 ids
 | SWA K/V: the other 40 slots | 40 × 1024 × 2 × 8 × 128 | window ring |
 | conv history: 48 slots | 48 × 3 × 6656 f32 | fixed |
 
-Restoring a prefix-cache snapshot therefore needs the 40 SWA rings and the conv
-history in the blob list, or a re-prefill of the last 1024 rows.
+A prefix-cache snapshot therefore needs the conv history and the SWA rows of
+the last 1024 positions. quartz snapshots the conv history only and keeps each
+SWA ring 8192 rows long; a snapshot is used while its last 1024 rows are still
+in the ring.
 
 ## quartz's TP2 layout (`quartz/arch/inkling2/ink2_tp2.h`)
 

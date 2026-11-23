@@ -34,59 +34,22 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 
 | Role | Model |
 |:---|:---|
-| **Target** | [Qwen3.8-27B Q8_0](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF?show_file_info=Qwen3.8-27B-Q8_0.gguf), or any fine-tune (e.g. Swift) quantised to Q8_0. It must keep the MTP block |
+| **Target** | [Qwen3.8-27B Q8_0](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF?show_file_info=Qwen3.8-27B-Q8_0.gguf), or any fine-tune quantised to Q8_0 that keeps the MTP block |
 | **DSpine drafter** *(optional)* | [Qwen3.8-27B DSpine draft](https://huggingface.co/aj9o9/Qwen3.8-27B-DSpine-b16-GGUF?show_file_info=Qwen3.8-27B-DSpine-b16-Q8_0.gguf) |
 | **Vision projector** *(optional)* | [Qwen3.8-27B mmproj](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/mmproj-F16.gguf) |
 
 | Feature | Details |
 |:---|:---|
-| **Speculative decode** | A drafter proposes several tokens and the target verifies them in one pass. **MTP** uses the target's own built-in draft block; **DSpine** uses a separate small draft model (usually faster on code, slower on prose). With DSpine loaded, decode switches between the two by acceptance rate (`QZ_NO_SWITCH=1` turns that off) |
-| **Megakernel execution** | Persistent decode loop tuned for MI50 / gfx906 |
+| **Speculative decode** | Drafted tokens are verified by the target in one pass. **MTP** drafts with the target's own MTP block, **DSpine** with a separate draft model. With DSpine loaded, decode switches between the two on acceptance rate |
+| **Persistent decode** | One kernel per card runs the whole model for each round |
 | **Batched prefill** | 2048-token chunks |
-| **Vision** | Image input through the vision projector |
+| **Prefix cache** | Recurrent state snapshots in host memory |
+| **Vision** | Image input through the projector |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench/qwen3.8-27b-dark.svg">
-  <img src="docs/images/bench/qwen3.8-27b-light.svg" alt="Qwen3.8-27B Q8_0 on 2x MI50: prefill, decode by text type and perplexity against llama.cpp" width="880">
+  <img src="docs/images/bench/qwen3.8-27b-light.svg" alt="Qwen3.8-27B Q8_0 on 2x MI50: prefill and decode against llama.cpp, VRAM per card, perplexity" width="880">
 </picture>
-
-<details>
-<summary>Numbers</summary>
-
-<br>
-
-| Prefill | 0 ctx | 16384 ctx |
-|:---|---:|---:|
-| **quartz** pp2048 | 777 tok/s | 631 tok/s |
-| llama.cpp pp2048 | 654 tok/s | 499 tok/s |
-
-| Decode, 400 tokens | MTP | DSpine | SWITCH |
-|:---|---:|---:|---:|
-| C code | 95.0 tok/s | 109.0 tok/s | 109.7 tok/s |
-| Python code | 92.9 tok/s | 113.6 tok/s | 113.7 tok/s |
-| JSON | 103.1 tok/s | 138.2 tok/s | 138.7 tok/s |
-| Explanation | 74.9 tok/s | 76.1 tok/s | 77.6 tok/s |
-| Prose | 61.9 tok/s | 45.7 tok/s | 55.8 tok/s |
-
-| Mixed answers, 800 tokens | MTP | DSpine | SWITCH |
-|:---|---:|---:|---:|
-| Code → prose | 68.7 tok/s | 63.7 tok/s | 71.9 tok/s |
-| JSON → prose | 88.0 tok/s | 92.6 tok/s | 104.3 tok/s |
-| Prose → code | 65.9 tok/s | 49.0 tok/s | 57.5 tok/s |
-| Code → prose → code | 68.2 tok/s | 59.9 tok/s | 91.4 tok/s |
-
-| Perplexity | quartz | llama.cpp |
-|:---|---:|---:|
-| wikitext-2, 8 × 2048 | 5.16 | 5.18 ± 0.14 |
-
-| VRAM per card, `--max-ctx 262144` | card 0 | card 1 |
-|:---|---:|---:|
-| MTP | 25.6 GB | 25.6 GB |
-| DSpine | 29.7 GB | 29.5 GB |
-
-<sub>llama.cpp: build 557a6068f, tensor split, flash attention, f16 KV, ubatch 2048, run on the same day. Prefill is the median of three runs. Decode is sampled (T 1.0, top-k 20, top-p 0.95, seed 7), thinking off, prompts of about 30 tokens, one run each. Perplexity scores the second half of each 2048-token window, as llama-perplexity does.</sub>
-
-</details>
 
 </details>
 
@@ -101,53 +64,20 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 |:---|:---|
 | **Target** | [Inkling-2-Mini Q8_0](https://huggingface.co/bartowski/thinkingmachines_Inkling-2-Mini-GGUF) (`inkling2_loop`) |
 | **DSpark drafter** *(optional)* | An Inkling-2-Mini DSpark draft as Q8_0 GGUF, passed with `--dspine` |
-| **Vision projector** *(optional)* | The Inkling-2-Mini `inkling2v` mmproj (f16, ~0.6 GB), passed with `--mmproj` |
+| **Vision projector** *(optional)* | The Inkling-2-Mini `inkling2v` mmproj (F16), passed with `--mmproj` |
 
 | Feature | Details |
 |:---|:---|
-| **Speculative decode** | With the DSpark drafter, each round drafts 7 tokens and verifies them with the anchor as 8 rows in one persistent kernel. A draft is kept only if it equals the target's own pick for its row (greedy or sampled), so the output is the same as plain decoding. Decode drops to one token per step while the rounds are slower than that and probes them again later (`QZ_NO_SWITCH=1` turns that off) |
-| **Megakernel execution** | Persistent decode loop over the 48 layer applications (24 layers, 12 of them looped 3 times) |
+| **Speculative decode** | Each DSpark round drafts 7 tokens and verifies them with the anchor as 8 rows. A draft is kept only if it equals the target's own pick, so the output equals plain decoding. Decode runs one token per step while that is faster than the rounds |
+| **Persistent decode** | One kernel per card runs the 48 layer applications (24 layers, 12 of them looped 3 times) |
 | **Batched prefill** | 2048-token chunks, grouped expert GEMMs |
-| **Prefix cache** | Conv histories and sliding-window rings in the snapshots |
+| **Prefix cache** | Conv history snapshots in host memory; a snapshot is used while its sliding-window rows are still on the cards |
 | **Vision** | Image input at the image's own resolution, up to 4096 tokens |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench/inkling-2-mini-dark.svg">
-  <img src="docs/images/bench/inkling-2-mini-light.svg" alt="Inkling-2-Mini Q8_0 on 2x MI50: prefill, decode by text type in the three modes, and VRAM per card at full context" width="880">
+  <img src="docs/images/bench/inkling-2-mini-light.svg" alt="Inkling-2-Mini Q8_0 on 2x MI50: prefill, decode in the three modes, VRAM per card" width="880">
 </picture>
-
-<details>
-<summary>Numbers</summary>
-
-<br>
-
-| Prefill | 0 ctx | 16384 ctx |
-|:---|---:|---:|
-| **quartz** pp2048 | 2034 tok/s | 1427 tok/s |
-
-| Decode, 400 tokens | Plain | DSpark | SWITCH |
-|:---|---:|---:|---:|
-| C code | 104.9 tok/s | 78.8 tok/s | 101.4 tok/s |
-| Python code | 104.7 tok/s | 160.6 tok/s | 146.6 tok/s |
-| JSON | 105.0 tok/s | 154.0 tok/s | 139.5 tok/s |
-| Explanation | 105.0 tok/s | 74.0 tok/s | 99.6 tok/s |
-| Prose | 104.9 tok/s | 53.3 tok/s | 91.5 tok/s |
-
-| Mixed answers, 800 tokens | Plain | DSpark | SWITCH |
-|:---|---:|---:|---:|
-| Code → prose | 104.0 tok/s | 81.5 tok/s | 114.8 tok/s |
-| JSON → prose | 103.1 tok/s | 93.5 tok/s | 130.3 tok/s |
-| Prose → code | 103.9 tok/s | 72.3 tok/s | 110.4 tok/s |
-| Code → prose → code | 103.9 tok/s | 99.7 tok/s | 110.9 tok/s |
-
-| VRAM per card, `--max-ctx 262144` | card 0 | card 1 |
-|:---|---:|---:|
-| Plain | 20.6 GB | 20.6 GB |
-| DSpark | 22.4 GB | 22.2 GB |
-
-<sub>Prefill is the median of three runs. Decode is sampled (T 1.0, top-k 20, top-p 0.95, seed 7), thinking off, the same prompts as Qwen3.8-27B's, one run each; the three modes give the same tokens. Measured 2026-11-23 at a 178 W power limit.</sub>
-
-</details>
 
 The forward pass quartz implements is in [docs/inkling2.md](docs/inkling2.md).
 
@@ -157,12 +87,12 @@ The forward pass quartz implements is in [docs/inkling2.md](docs/inkling2.md).
 
 ### Requirements
 
-- Two AMD MI50/60 32 GB cards with PCIe peer access, and ROCm
-- About 59 GB of VRAM across the two cards at the default context for Qwen3.8-27B with DSpine (Inkling-2-Mini needs less)
+- Two AMD MI50/MI60 32 GB cards with PCIe peer access, and ROCm
 - A C++17 compiler, Python 3 with `jinja2`
-- The target model GGUF (optional: the DSpine or DSpark draft and the vision projector)
+- The target model GGUF; optionally the draft and the vision projector
 
-The [requirements guide](docs/requirements.md) has the details.
+Memory per model and context is in the [requirements guide](docs/requirements.md).
+
 ### 1. Build
 
 ```bash
@@ -174,30 +104,30 @@ This produces `build/bin/libquartz.so`.
 ### 2. Run
 
 ```bash
-# MTP decode
+# target only
 python3 quartz/server/quartz_server.py --model <target.gguf>
 ```
 
 ```bash
-# DSpine drafter + vision
+# with drafter and vision
 python3 quartz/server/quartz_server.py \
   --model  <target.gguf> \
   --dspine <draft.gguf> \
   --mmproj <projector.gguf>
 ```
 
-The server listens on `127.0.0.1:8090`. Pass `--host 0.0.0.0` to expose it on the network.
-It has **no authentication** and handles **one request at a time**, so keep it behind a
+The server listens on `127.0.0.1:8090` (`--host 0.0.0.0` exposes it). It has
+**no authentication** and runs **one request at a time**: keep it behind a
 firewall or a reverse proxy.
 
-See [Troubleshooting](docs/troubleshooting.md) if it does not come up.
+If it does not start, see [Troubleshooting](docs/troubleshooting.md).
 
 <details>
-<summary><b>Logs and per-request JSON traces</b></summary>
+<summary><b>Logs and per-request traces</b></summary>
 
 <br>
 
-The server logs to stderr. `QZ_TRACE` adds one JSON file per request:
+The server logs to stderr. `QZ_TRACE` writes one JSON file per request:
 
 ```bash
 mkdir -p logs && QZ_TRACE=logs/trace python3 quartz/server/quartz_server.py \
@@ -211,25 +141,23 @@ pass one file to see its prompt, raw output and tool calls.
 
 ## API
 
-The server exposes OpenAI-compatible chat completions:
+OpenAI-compatible chat completions:
 
 ```bash
 curl http://127.0.0.1:8090/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "quartz",
     "messages": [{"role": "user", "content": "Write a haiku about GPUs"}],
     "stream": true
   }'
 ```
 
-Images (needs `--mmproj`) use the standard OpenAI content parts:
+Images (needs `--mmproj`) use OpenAI content parts:
 
 ```bash
 curl http://127.0.0.1:8090/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "quartz",
     "messages": [{"role": "user", "content": [
       {"type": "text", "text": "What is in this image?"},
       {"type": "image_url", "image_url": {"url": "data:image/png;base64,<BASE64>"}}
@@ -237,19 +165,16 @@ curl http://127.0.0.1:8090/v1/chat/completions \
   }'
 ```
 
-`tools` in the request are rendered through the model's chat template and tool
-calls are parsed back into OpenAI `tool_calls`. `GET /v1/models` and `GET /health`
-are also available.
-
-Run `python3 quartz/server/quartz_server.py --help` for every option; the
-[configuration reference](docs/configuration.md) lists them with their defaults.
+`tools` are rendered through the model's chat template and tool calls come back
+as OpenAI `tool_calls`. The [server reference](docs/server.md) lists the
+endpoints and request fields.
 
 ## Documentation
 
-- [Requirements](docs/requirements.md): hardware, model files, toolchain
-- [Configuration](docs/configuration.md): every flag and variable, with defaults
-- [Troubleshooting](docs/troubleshooting.md): start-up failures and what to do about them
+- [Requirements](docs/requirements.md): hardware, model files, memory, toolchain
+- [Configuration](docs/configuration.md): flags and environment variables
+- [Troubleshooting](docs/troubleshooting.md): start-up failures
 - [Architecture](docs/architecture.md): how a request becomes tokens on two cards
 - [Server](docs/server.md): endpoints, request fields, responses, traces
-- [Testing](docs/testing.md): checking a change, how the benchmarks were measured
-- [Adding a model](docs/adding-a-model.md): the per-architecture layout and the steps for a new one
+- [Testing](docs/testing.md): checking a change
+- [Adding a model](docs/adding-a-model.md): the per-architecture layout
