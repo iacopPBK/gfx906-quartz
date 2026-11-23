@@ -17,6 +17,7 @@ namespace ink2 {
 #include "ink2_engine.h"
 #include "ink2_pf.h"
 #include "ink2_dspark.h"
+#include "ink2_preflight.h"
 
 struct ink2_ctx : qz_ctx {
     std::string name;
@@ -215,12 +216,14 @@ static qz_ctx * create(const char * path, const qz_create_opts & o) {
     if (!g.open(path)) { fprintf(stderr, "inkling2: cannot open %s\n", path); return nullptr; }
     hparams hp;
     if (!parse(g, hp) || !check_tensors(g)) { fprintf(stderr, "inkling2: %s is not a supported Inkling-2-Mini GGUF\n", path); return nullptr; }
-    if (qz_p2p_check()) return nullptr;   // the peer link both ways, before the weights
+    const int ctx = std::min(o.max_ctx > 0 ? o.max_ctx : 32768, 262144);
+    // the memory and the peer link both ways, before the weights
+    if (ink2_vram_check(g, ctx, getenv("QZ_DSPINE")) || qz_p2p_check()) return nullptr;
     ink2_ctx * c = new ink2_ctx();
     c->name = g.str("general.name");
     c->E.hp = hp;
     c->EPF.E = &c->E;
-    c->E.ctx = std::min(o.max_ctx > 0 ? o.max_ctx : 32768, 262144);
+    c->E.ctx = ctx;
     qz_mem_baseline(2);
     if (!qz_peer_enable()) { delete c; return nullptr; }
     for (int i = 0; i < 2; i++) {

@@ -1,7 +1,7 @@
 # Configuration
 
-Every switch and its default. Measured on 2× MI50 with the pi model and DSpine,
-`--max-ctx 32768`, a 2.7k-token prompt; speeds vary ±3%.
+Every switch and its default. Speeds are for Qwen3.8-27B, measured on 2× MI50 with the
+pi model and DSpine, `--max-ctx 32768`, a 2.7k-token prompt; they vary ±3%.
 
 ## Build
 
@@ -16,12 +16,12 @@ Every switch and its default. Measured on 2× MI50 with the pi model and DSpine,
 | Flag | Default | Effect |
 |---|---|---|
 | `--model` | required | Target GGUF |
-| `--dspine` | unset | DSpine draft GGUF; decode uses it, images stay on MTP |
-| `--mmproj` | unset | `qwen3vl_merger` projector; enables image input |
+| `--dspine` | unset | Draft GGUF: DSpine for Qwen (images stay on MTP), DSpark for Inkling (greedy requests) |
+| `--mmproj` | unset | `qwen3vl_merger` projector; enables image input (Qwen only) |
 | `--lib` | `build/bin/libquartz.so` | Engine library |
 | `--host`, `--port` | `127.0.0.1`, `8090` | Bind address, no authentication |
-| `--max-ctx` | `262144` | Context length, at least 1024; 262144 takes about 59 GB in total with DSpine |
-| `--slot-t` | `0` | Rows per cycle: 3, 4, or 0 adaptive |
+| `--max-ctx` | `262144` | Context length, at least 1024; 262144 takes about 59 GB in total for Qwen with DSpine (see [requirements](requirements.md) for Inkling) |
+| `--slot-t` | `0` | Qwen MTP rows per cycle: 3, 4, or 0 adaptive |
 | `--slack` | `1` | Adaptive depth slack |
 | `--temp` | `1.0` | Default temperature, 0 is greedy |
 | `--top-k`, `--top-p`, `--min-p` | `20`, `0.95`, `0` | Default sampling; top-k 1..64 |
@@ -39,8 +39,9 @@ The server sets
 | `QZ_DEVICES` | `0,1` | Which two visible gfx906 cards to use, as HIP ordinals |
 | `QZ_TRACE` | unset | Directory for one JSON per request, read with `quartz/server/quartz_trace.py` |
 | `QZ_DSPINE` | unset | Draft GGUF path; the server sets it from `--dspine` |
-| `QZ_NO_SWITCH` | unset | Set to `1` to keep DSpine for the whole answer. By default, with `--dspine`, decode switches drafters mid-answer on acceptance |
-| `QZ_SW_LO`, `QZ_SW_HI`, `QZ_SW_WIN` | `3.8`, `3.4`, `128` | Leave DSpine below, leave MTP at or above this many tokens per round; window averaged. Each on its drafter's own scale, so `lo > hi` is intended |
+| `QZ_NO_SWITCH` | unset | Set to `1` to keep the draft model for the whole answer. By default, with `--dspine`, Qwen switches between DSpine and MTP mid-answer on acceptance, and Inkling between DSpark rounds and one token per step on measured speed |
+| `QZ_SW_LO`, `QZ_SW_HI`, `QZ_SW_WIN` | Qwen: `3.8`, `3.4`, `128` | Leave DSpine below, leave MTP at or above this many tokens per round; window averaged. Each on its drafter's own scale, so `lo > hi` is intended |
+| `QZ_SW_LO`, `QZ_SW_WIN` | Inkling: `2.7`, `32` | The window (tokens) over which DSpark rounds are timed against the plain step; `lo` is the tokens per round to leave below while the plain step has not been timed yet |
 | `QZ_IMG_MIN_TOKENS`, `QZ_IMG_MAX_TOKENS` | `8`, `4096` | Fewest and most tokens an image resizes to; each token takes a context row |
 
 ## Log

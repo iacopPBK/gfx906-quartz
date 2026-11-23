@@ -154,3 +154,27 @@ logits = 30 * tanh((h · output) / 30), first 200058 ids
 
 Restoring a prefix-cache snapshot therefore needs the 40 SWA rings and the conv
 history in the blob list, or a re-prefill of the last 1024 rows.
+
+## quartz's TP2 layout (`quartz/arch/inkling2/ink2_tp2.h`)
+
+Card c ∈ {0, 1} holds:
+
+| Tensor | Card c's part |
+|---|---|
+| `attn_q`, `attn_gate` | q heads 12c .. 12c + 11 (rows 1536c, 1536 rows) |
+| `attn_k`, `attn_v`, `attn_k_conv`, `attn_v_conv` | kv heads 4c .. 4c + 3 (whole GQA groups of 3 q heads) |
+| `attn_k_conv_proj`, `attn_v_conv_proj` | the dynamic taps of those 4 kv heads |
+| `attn_rel`, `attn_sink_proj`, `attn_q_clip`, `attn_rel_clip` | the rows of its 12 q heads |
+| `attn_output` | half of the contraction (Q8 blocks 48c .. 48c + 47) |
+| `ffn_gate_up_exps` | per expert, gate rows 576c .. and up rows 1152 + 576c .. (576 each) |
+| `ffn_down_exps` | half of the contraction (Q8 blocks 18c .. 18c + 17) |
+| `output` | vocabulary rows [V/2 · c, V/2 · (c + 1)) |
+
+Everything else (embeddings, norms, controllers, routers, mix queries, conv
+taps of the post convs) is on both cards. The attention output and the
+expert down projection produce partial sums, which the cards exchange and
+add twice per layer application: after the attention and after the experts.
+The post convs and the residual then run on both cards on the full row. Each
+card keeps the K/V, and the K/V conv history, of its own 4 kv heads. The logits are split by vocabulary, and the pick merges
+the two cards' top-K.
+

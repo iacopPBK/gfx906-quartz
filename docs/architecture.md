@@ -1,6 +1,7 @@
 # Architecture
 
-How quartz turns a request into tokens, for Qwen3.8-27B. The code is in
+How quartz turns a request into tokens, for Qwen3.8-27B (Inkling-2-Mini at the
+end). The code is in
 `quartz/`: the model's own engine in `arch/qwen35/`, the parts every model
 shares in `core/`, `kernels/` and the top level (see
 [Adding a model](adding-a-model.md)). File names below are relative to
@@ -60,3 +61,20 @@ link works before loading anything (`arch/qwen35/qwen35_preflight.h`,
 `preflight.h`), then prints a per-card
 ledger of what it allocated (`mem.h`). The default context (262144 tokens)
 takes about 59 GB in total with DSpine (half on each card).
+
+## Inkling-2-Mini
+
+The second model, `arch/inkling2/`, follows the same request path with its
+own engine; its forward pass is written down in [inkling2.md](inkling2.md).
+
+- **Two cards.** Each card holds half the query and KV heads, half of every
+  expert's FFN rows and half of the vocabulary head
+  (`arch/inkling2/ink2_tp2.h`); the partial sums cross over PCIe as for Qwen.
+- **Prefill** runs in 2048-token chunks with a grouped GEMM over the
+  selected experts (`ink2_pf.h`). The prefix cache saves the conv histories
+  and checks that the sliding-window rings still cover the resumed position.
+- **Decode** is one persistent kernel per card per token (`ink2_cycle.h`).
+  With a DSpark draft, greedy requests run rounds of 7 drafts checked as 8
+  rows by a second persistent kernel (`ink2_dspark.h`, `ink2_verify.h`).
+  The switch falls back to one token per step while that is faster.
+- **Memory** is checked at start by `ink2_preflight.h`.

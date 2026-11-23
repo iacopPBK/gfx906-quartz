@@ -88,11 +88,24 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 <br>
 
 <details>
-<summary><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/inkling-2-mini-dark.svg"><img src="docs/images/inkling-2-mini-light.svg" alt="Inkling 2 Mini" height="25" align="middle"></picture> <i>(roadmap)</i></summary>
+<summary><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/inkling-2-mini-dark.svg"><img src="docs/images/inkling-2-mini-light.svg" alt="Inkling 2 Mini" height="25" align="middle"></picture></summary>
 
 <br>
 
-[Inkling-2-Mini GGUF](https://huggingface.co/bartowski/thinkingmachines_Inkling-2-Mini-GGUF): not supported yet.
+| Role | Model |
+|:---|:---|
+| **Target** | [Inkling-2-Mini Q8_0](https://huggingface.co/bartowski/thinkingmachines_Inkling-2-Mini-GGUF) (`inkling2_loop`) |
+| **DSpark drafter** *(optional)* | An Inkling-2-Mini DSpark draft as Q8_0 GGUF, passed with `--dspine` |
+
+| Feature | Details |
+|:---|:---|
+| **Speculative decode** | With the DSpark drafter, each round drafts 7 tokens and verifies them with the anchor as 8 rows in one persistent kernel (greedy requests). Decode drops to one token per step while the rounds are slower than that and probes them again later (`QZ_NO_SWITCH=1` turns that off). Sampled requests decode one token per step |
+| **Megakernel execution** | Persistent decode loop over the 48 layer applications (24 layers, 12 of them looped 3 times) |
+| **Batched prefill** | 2048-token chunks, grouped expert GEMMs |
+| **Prefix cache** | Conv histories and sliding-window rings in the snapshots |
+
+Image input is not supported for Inkling yet. The forward pass quartz implements is in
+[docs/inkling2.md](docs/inkling2.md).
 
 </details>
 
@@ -101,9 +114,9 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 ### Requirements
 
 - Two AMD MI50/60 32 GB cards with PCIe peer access, and ROCm
-- About 59 GB of VRAM across the two cards at the default context with DSpine
+- About 59 GB of VRAM across the two cards at the default context for Qwen3.8-27B with DSpine (Inkling-2-Mini needs less)
 - A C++17 compiler, Python 3 with `jinja2`
-- The target model GGUF (optional: the DSpine draft and the vision projector)
+- The target model GGUF (optional: the DSpine or DSpark draft and the vision projector)
 
 The [requirements guide](docs/requirements.md) has the details.
 ### 1. Build
