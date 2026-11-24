@@ -19,7 +19,7 @@
 <a href="https://discord.gg/sKjBBtNmJ"><img src="https://img.shields.io/badge/discord-gfx906%20server-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="gfx906"></a>
 </p>
 
-quartz is a small inference engine for **two-card** gfx906 (MI50/MI60 32 GB) systems.<br>
+quartz is a small inference engine for **two-cards** gfx906 (MI50/MI60 32 GB) systems.<br>
 It runs a short list of models as **Q8_0** GGUF files only (other quantisations are refused).<br>
 It needs **exactly two cards with P2P** between them: no single-card or 4-card mode.
 
