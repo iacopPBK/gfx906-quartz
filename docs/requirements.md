@@ -22,9 +22,8 @@ commands are in the [README](../README.md), flags and environment variables in
   mode for more cards. With more than two cards visible, quartz uses one pair
   (`QZ_DEVICES`).
 - **P2P is recommended, not required.** With peer access the cards write into
-  each other's VRAM. Without it they exchange through pinned host memory, at the
-  same addresses, with the same arithmetic and the same greedy output, only
-  slower: prefill about 10-25 % and decode 5-10 %. `QZ_LINK=auto` (the default)
+  each other's VRAM. Without it they exchange through pinned host memory, with the
+  same arithmetic and the same greedy output, only slower: roughly 5-20 %. `QZ_LINK=auto` (the default)
   takes a peer pair when there is one and host memory otherwise; `p2p` and
   `host` force a mode ([configuration](configuration.md)).
 - **gfx906 only.** The kernels use gfx906 instructions and need every block of
@@ -54,8 +53,9 @@ card 1. The vision encoder adds up to 1.8 GB on card 0. The prefix cache takes
 about 0.1 GB of pinned host RAM.
 
 Without P2P none of the above changes, but the exchange takes a stretch of
-pinned host RAM: a few tens of MB in decode, and up to about 0.25 GB while
-prefill runs (the bulk copies are staged through it).
+pinned host RAM: a few MB for the exchange itself, a few hundred MB once
+prefill has run (the bulk copies are staged through it), and about 0.3 GB more
+with `--mmproj` on Qwen.
 
 ## Build
 

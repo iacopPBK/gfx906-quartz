@@ -89,8 +89,7 @@ The forward pass quartz implements is in [docs/inkling2.md](docs/inkling2.md).
 ### Requirements
 
 - Two AMD MI50/MI60 32 GB cards, and ROCm. PCIe peer access (P2P) between them is
-  recommended: without it quartz runs through pinned host memory, about 10-25 % slower
-  on prefill and 5-10 % on decode
+  recommended: without it quartz runs through pinned host memory, roughly 5-20 % slower
 - A C++17 compiler, Python 3 with `jinja2`
 - The target model GGUF; optionally the draft and the vision projector
 
