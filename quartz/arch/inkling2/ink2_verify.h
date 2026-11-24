@@ -1,5 +1,5 @@
-// inkling2 verify kernel. Runs the VR = 8 rows of a speculative round (the anchor
-// and 7 drafts, positions pos .. pos + 7) through the 48 layer applications and the
+// inkling2 verify kernel. Runs the VR = 8 rows a speculative round may use (the anchor
+// and up to 7 drafts, positions pos .. pos + 7) through the 48 layer applications and the
 // head, in one launch per card. Each row runs the decode bodies on its own copy of
 // the activations (byte stride RS from row 0), so it is bit-identical to a single
 // ink2_cycle step at its position. Row r sees KV rows up to pos + r; its own K and V
@@ -129,7 +129,7 @@ VR_NI void d_head_post_v(const hpost & a, int b, int t, bool act, int dmax, int 
         float n2[1] = {v_gsum2(x * x, red, grp)};
         const float nr = sqrtf(n2[0]) + 1e-6f;
         x *= fminf(fmaxf(a.qk_clip / nr, 0.f), 1.f);
-        if (act) { a.q[i] = x * a.tau; a.qh[i] = __float2half(x * a.tau * FL_QSC); }
+        if (act) a.qh[i] = __float2half(x * a.tau * FL_QSC);
         float r_ = t < DREL ? a.rr[h * DREL + t] * a.rclip[h * DREL + t] : 0.f;
         float r2[1] = {v_gsum2(r_ * r_, red, grp)};
         const float rn = sqrtf(r2[0]) + 1e-6f;
@@ -192,7 +192,7 @@ VR_NI void v_head_post(CK hpost * e, int pos, float tau, int v, int tid, int r, 
     h.qr = qz_gp(h.qr); h.rr = qz_gp(h.rr); h.sk = qz_gp(h.sk); h.kr = qz_gp(h.kr); h.vr = qz_gp(h.vr);
     h.dk = h.dk ? qz_gp(h.dk) : nullptr; h.dv = h.dv ? qz_gp(h.dv) : nullptr;
     h.qclip = qz_gp(h.qclip); h.rclip = qz_gp(h.rclip); h.relb = qz_gp(h.relb); h.kconv = qz_gp(h.kconv); h.vconv = qz_gp(h.vconv);
-    h.hist = qz_gp(h.hist); h.q = qz_gp(h.q); h.qh = qz_gp(h.qh); h.tb = qz_gp(h.tb);
+    h.hist = qz_gp(h.hist); h.qh = qz_gp(h.qh); h.tb = qz_gp(h.tb);
     h.kc = qz_gp(h.kc + (size_t) row * KVL); h.vc = qz_gp(h.vc + (size_t) row * KVL);
     h.tau = e->dk ? tau : 1.f;
     d_head_post_v(h, v, tid & 127, true, min(TBW, pos + 1), r, uh, rsf, hb, tid >> 7);
@@ -798,7 +798,7 @@ VR_NI void v_attn_a(CK appk * tab, int napp, int ai, int pos, int v, float * ws,
     const attn_args * at0 = &((CK appk *) tab + ai)->at;
     fl_attn_rows(at0, (size_t) napp * sizeof(appk), qz_gp(ws), VWS, pos, kvh, sp, tid, nr, cyc_lds);
 }
-VR_NI void v_attn_b(CK appk * tab, int napp, int ai, int pos, int u, const float * ws, int tid, int nr) {
+VR_NI void v_attn_b(CK appk * tab, int napp, int ai, int u, const float * ws, int tid, int nr) {
     asm volatile ("" : "+v"(tid));
     const int row = u / HKVL, kvh = u % HKVL;
     if (row >= nr) return;                                       // block-uniform: an inactive row
@@ -917,7 +917,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         cyc_barrier(vbst, ++kb);
         for (int v = blockIdx.x; v < HKVL * FL_NS; v += nb) v_attn_a((CK appk *) Av.tab, napp, ai, pos, v, Vq->ws, tid, nr);
         cyc_barrier(vbst, ++kb);
-        for (int u = blockIdx.x; u < nr * HKVL; u += nb) v_attn_b((CK appk *) Av.tab, napp, ai, pos, u, Vq->ws, tid, nr);
+        for (int u = blockIdx.x; u < nr * HKVL; u += nb) v_attn_b((CK appk *) Av.tab, napp, ai, u, Vq->ws, tid, nr);
         cyc_barrier(vbst, ++kb);
         ++xs;
         for (int v = blockIdx.x; v < 4 / VG_S * e0->ngo; v += nb) v_gemv<VG_S>(&e0->go, v, rs, rsf, Av.xin_peer + 2 * D + (size_t) (xs & 1) * VR * D);
@@ -938,7 +938,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
             cyc_barrier(vbst, ++kb);
             v_ctrl_up<1>(e0->cb.j, rsf, tid);
             cyc_barrier(vbst, ++kb);
-            if (blockIdx.x < nr) c_norm(&VROW(Av.tab, blockIdx.x, ai)->nb.j[0], Av.eps, tid);
+            if (blockIdx.x < (unsigned) nr) c_norm(&VROW(Av.tab, blockIdx.x, ai)->nb.j[0], Av.eps, tid);
             cyc_barrier(vbst, ++kb);
         }
         // ---- the experts: the router, the pick, gate | up + SITU, the down sum
@@ -961,7 +961,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
     }
     const int wave = tid_k >> 6, lane = tid_k & 63;
     // the last ffn sum and conv, with the window, one block per active row
-    if (blockIdx.x < nr) {
+    if (blockIdx.x < (unsigned) nr) {
         const int r = blockIdx.x;
         CK appk * ep = (CK appk *) Vp->A.tab + (size_t) r * napp + (napp - 1);
         cyc_xwait(Vp->A, xs);
@@ -972,7 +972,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         if (blockIdx.x == 0 && tid_k == 0) *Vp->A.xseq = xs;
     }
     if (head) {
-        if (blockIdx.x < nr) {          // the head mix and norm of row r, its normed input to the drafter
+        if (blockIdx.x < (unsigned) nr) {    // the head mix and norm of row r, its normed input to the drafter
             const int r = blockIdx.x;
             __syncthreads();
             sptrs S;

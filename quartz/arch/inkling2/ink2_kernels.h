@@ -22,9 +22,9 @@ static_assert(PF_RING >= WIN + PF_M, "the SWA ring holds a window plus a chunk")
 constexpr int CHL = 2 * KVL + 2 * D;                   // local conv history channels: K | V | attn post | ffn post
 constexpr int H_K = 0, H_V = KVL, H_A = 2 * KVL, H_F = 2 * KVL + D;
 constexpr int TBW = REL_EXT + 1;                       // bias table width (the zero column past the extent)
-// the attention's score scale: it works in log2 units (ink2_flash.h), so the table bias
-// is multiplied by log2(e) and the f16 copy of q head post writes is pre-scaled by
-// log2(e) / sqrt(HD), which then costs one v_dot2 per (lane = key, head, 2 dims)
+// The attention works in log2 units (ink2_flash.h): head post scales the bias table by
+// log2(e) and writes an f16 copy of q pre-scaled by log2(e) / sqrt(HD), so a score is one
+// v_dot2 per (lane = key, head, 2 dims).
 constexpr float FL_L2E = 1.4426950408889634f;
 constexpr float FL_QSC = 0.12751743082459868f;
 
@@ -279,7 +279,7 @@ struct hpost {
     const float * qr, * rr, * sk, * kr, * vr, * dk, * dv;     // raw projections (dk / dv null on SWA layers)
     const float * qclip, * rclip, * relb, * kconv, * vconv;
     float * hist;                                            // this slot's [3][CHL]
-    float * q, * tb;                                         // out: q [QL], table [HQL][TBW]
+    float * tb;                                              // out: table [HQL][TBW]
     __half * qh;                                             // out: q as f16 * log2(e)/sqrt(HD), [QL]
     __half * kc, * vc;                                       // the cache rows to write
     float tau, qk_clip, rel_clip, eps;
@@ -295,7 +295,7 @@ __device__ __forceinline__ void d_head_post(const hpost & a, int b, int t, bool 
         bsum<1>(n2, red, 2);
         const float nr = sqrtf(n2[0]) + 1e-6f;
         x *= fminf(fmaxf(a.qk_clip / nr, 0.f), 1.f);
-        if (act) { a.q[i] = x * a.tau; a.qh[i] = __float2half(x * a.tau * FL_QSC); }
+        if (act) a.qh[i] = __float2half(x * a.tau * FL_QSC);
         float r = t < DREL ? a.rr[h * DREL + t] * a.rclip[h * DREL + t] : 0.f;
         float r2[1] = {r * r};
         bsum<1>(r2, red, 2);
@@ -347,20 +347,21 @@ __device__ __forceinline__ void d_head_post(const hpost & a, int b, int t, bool 
     }
 }
 
-// ---- attention: the flash body of ink2_flash.h (lane = key position, q in wave-uniform
-// registers, K/V tiles in LDS, one wave per query row), shared by the plain step and the
-// DSpark verify so that a verify row is bit-identical to a plain step at the same rp.
-// ATT_SPL splits of the KV cache per KV head serve the plain step; the verify uses FL_NS.
+// ---- attention: the flash body of ink2_flash.h (lane = key position, q in LDS, K/V tiles
+// in LDS, one wave per query row), shared by the plain step and the DSpark verify so that a
+// verify row is bit-identical to a plain step at the same rp. The plain step splits the KV
+// cache ATT_SPL ways per KV head; the verify stages the same split count (FL_NS).
 constexpr int GQ = HQ / HKV, ATT_SPL = 15, ATT_PW = HD + 2;
 struct attn_args {
-    const float * q, * tb, * gate;
-    const __half * qh;            // q as f16 * log2(e)/sqrt(HD) (the attention's copy)
+    const float * tb, * gate;
+    const __half * qh;            // q as f16 * log2(e)/sqrt(HD), pre-scaled by head post
     const __half * kc, * vc;      // cache base: row r at r * KVL
     int pos, full;
     unsigned char * oq; float * os;
     float * part;                 // [HKVL][ATT_SPL][GQ][ATT_PW]
     int * cnt;                    // [HKVL], zero between uses (the merger resets it)
 };
+// one 16 B read of the f16 cache as 8 floats (the drafter's attention staging)
 __device__ __forceinline__ void att_h8(const uint4 & u, float * f) {
     const __half2 * h = (const __half2 *) &u;
     #pragma unroll

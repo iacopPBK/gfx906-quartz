@@ -477,7 +477,7 @@ CYC_NI void c_head_post(CK hpost * e, int pos, float tau, int v, int tid) {
     h.qr = qz_gp(h.qr); h.rr = qz_gp(h.rr); h.sk = qz_gp(h.sk); h.kr = qz_gp(h.kr); h.vr = qz_gp(h.vr);
     h.dk = h.dk ? qz_gp(h.dk) : nullptr; h.dv = h.dv ? qz_gp(h.dv) : nullptr;
     h.qclip = qz_gp(h.qclip); h.rclip = qz_gp(h.rclip); h.relb = qz_gp(h.relb); h.kconv = qz_gp(h.kconv); h.vconv = qz_gp(h.vconv);
-    h.hist = qz_gp(h.hist); h.q = qz_gp(h.q); h.tb = qz_gp(h.tb);
+    h.hist = qz_gp(h.hist); h.qh = qz_gp(h.qh); h.tb = qz_gp(h.tb);
     h.kc = qz_gp(h.kc + (size_t) row * KVL); h.vc = qz_gp(h.vc + (size_t) row * KVL);
     h.tau = e->dk ? tau : 1.f;
     d_head_post(h, v, tid, tid < 128, min(TBW, pos + 1));     // attention at pos reads d <= pos only
@@ -485,7 +485,7 @@ CYC_NI void c_head_post(CK hpost * e, int pos, float tau, int v, int tid) {
 CYC_NI void c_attn(CK attn_args * e, int pos, int v, int tid) {
     asm volatile ("" : "+v"(tid));
     attn_args t = *e;
-    t.q = qz_gp(t.q); t.qh = qz_gp(t.qh); t.tb = qz_gp(t.tb); t.gate = qz_gp(t.gate); t.kc = qz_gp(t.kc); t.vc = qz_gp(t.vc);
+    t.qh = qz_gp(t.qh); t.tb = qz_gp(t.tb); t.gate = qz_gp(t.gate); t.kc = qz_gp(t.kc); t.vc = qz_gp(t.vc);
     t.oq = qz_gp(t.oq); t.os = qz_gp(t.os); t.part = qz_gp(t.part); t.cnt = qz_gp(t.cnt);
     t.pos = pos;
     fl_attn_plain(t, v / ATT_SPL, v % ATT_SPL, tid, cyc_lds);   // the mix states are dead here

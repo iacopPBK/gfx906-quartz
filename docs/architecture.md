@@ -69,11 +69,17 @@ forward pass is in [inkling2.md](inkling2.md).
   rings are 8192 rows, longer than the 1024-row window, and a snapshot is used
   only while its window rows are still in the ring.
 - **Decode** is one persistent kernel per card per token (`ink2_cycle.h`).
-  With a DSpark draft, each round drafts 7 tokens and a second persistent
-  kernel verifies them with the anchor as 8 rows (`ink2_verify.h`). Each row's
-  token is picked (greedy or sampled) as a single step would pick it. The
-  drafter (`ink2_dspark.h`) is split over both cards like the target. The
-  switch runs single steps while they are faster than the rounds.
+  With a DSpark draft, each round drafts up to 7 tokens and a second persistent
+  kernel verifies them with the anchor as up to 8 rows (`ink2_verify.h`). The
+  round's width follows the recent acceptance and the measured round times.
+  A row's token is picked as a single step would pick it. Greedy keeps a draft
+  only when it equals the row's pick. Under a sampler with a temperature the
+  drafter draws its drafts from its own distribution and a row accepts with
+  probability `min(1, p / q)` or takes a draw from the residual `max(0, p - q)`,
+  so the output keeps the sampler's distribution. The plain step and the verify
+  share the attention body (`ink2_flash.h`). The drafter (`ink2_dspark.h`) is
+  split over both cards like the target. The switch runs single steps while
+  they are faster than the rounds.
 - **Images** are encoded on card 0 (`vision/inkling2v.cpp`). Their rows
   replace the image placeholder in the prefill, without the embedding norm.
   Image prompts decode like text, DSpark included.

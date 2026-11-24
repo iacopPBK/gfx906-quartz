@@ -23,8 +23,10 @@ python3 quartz/server/quartz_server.py --model <target.gguf>
 
 Use a few prompts (one short, one of 1-2k tokens, and the same one again to hit
 the prefix cache), about 32 generated tokens each. Run each model the change
-touches, without and with `--dspine`; for Inkling, the DSpark rounds give the
-same tokens as single steps, so both runs must match each other too.
+touches, without and with `--dspine`; for Inkling, a greedy run gives the same
+tokens with the DSpark rounds and as single steps, so both runs must match each
+other too. A sampled run keeps the sampler's distribution rather than the token
+sequence, so the two runs of it are not comparable token for token.
 
 Qwen DSpine's 12-row rounds can differ from the 8-row ones at near-ties, where
 two tokens have almost the same score. A difference that starts at such a

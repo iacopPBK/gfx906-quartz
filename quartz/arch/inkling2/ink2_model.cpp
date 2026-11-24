@@ -181,17 +181,13 @@ struct ink2_ctx : qz_ctx {
             sam.tk[1] = E.tkh[1];
             return sam.sample_row(0);
         };
-        // Speculative sampling of the drafts (core/spec_accept.h), read per call so one
-        // process can A/B it: with a sampler and a temperature the drafter draws its 7
-        // drafts from q = softmax(logit / (T * QT)) and each verify row accepts its draft
-        // with probability min(1, p/q) or takes the residual. QZ_DS_SPEC=0 keeps the old
-        // exact-match acceptance, QZ_DS_QT (default 1) calibrates the drafter's sharpness.
-        const bool qmode = sam.smp && sam.smp->temp > 0.f;
-        const char * e_spec = getenv("QZ_DS_SPEC"), * e_qt = getenv("QZ_DS_QT");
-        const float ds_qt = e_qt && *e_qt ? (float) atof(e_qt) : 1.0f;
-        const bool dspec = ds_on && qmode && ds_qt > 0.f && !(e_spec && *e_spec && strcmp(e_spec, "0") == 0);
-        // q's logits go through the target's final softcap, as p's do (a better calibrated q)
-        dsamp dsa = { 1.f / (ms.temp * ds_qt), ms.seed, 0, nullptr, E.hp.softcap };
+        // Speculative sampling of the drafts (core/spec_accept.h): with a sampler above
+        // temperature 0 the drafter draws its drafts from q = softmax(logit / T) and each
+        // verify row accepts its draft with probability min(1, p/q) or takes the residual.
+        // At temperature 0 the row's pick is an argmax, so an exact match is the test.
+        const bool dspec = ds_on && sam.smp && sam.smp->temp > 0.f;
+        // q's logits go through the target's final softcap, as p's do
+        dsamp dsa = { 1.f / ms.temp, ms.seed, 0, nullptr, E.hp.softcap };
         if (dspec) DS.rnd = 0;
         const auto t0 = clk::now();
         EPF.abort = &abort_flag;
@@ -366,60 +362,53 @@ struct ink2_ctx : qz_ctx {
             for (int r = 0; r < nd; r++) toks[r + 1] = dr[r];
             E.verify(toks, pos, nr);
             int g[VR], n = 0;
-            if (!sam.smp) {
+            // Without a sampler, or at temperature 0, the row's pick is an argmax, so the
+            // drafts match it exactly or not at all.
+            if (!sam.smp || ms.temp <= 0.f) {
                 for (int r = 0; r < nr; r++) g[r] = E.greedy_row(r);
                 while (n < nd && dr[n] == g[n]) n++;
-            } else {                                  // sampled: exact match, or speculative sampling
+            } else {                                  // sampled: speculative sampling
                 const size_t rb = (size_t) QZ_TOPK_NB * QZ_TOPK;
                 for (int c = 0; c < 2; c++) sam.tk[c].assign(E.vtkp[c], E.vtkp[c] + VR * rb);
-                if (!dspec) {
-                    for (;;) {
-                        g[n] = sam.sample_row(n);
-                        if (n == nd || g[n] != dr[n]) break;
-                        n++;
+                // Each row's p is the sampler's own chain, q comes from the drafter: the
+                // round's rows' candidate ids (plus each row's draft, when p does not list
+                // it) go to the cards in one launch, then row r accepts dr[r] or the
+                // residual ends the round. A residual in g[n] anchors the next round like
+                // any other row pick, so the round still emits n + 1 tokens.
+                std::vector<float> w;
+                int rid[DS_BS][DS_QID], rn[DS_BS], dslot[DS_BS];
+                float rw[DS_BS][DS_QID];
+                double qall[DS_BS][DS_QID];
+                for (int r = 0; r < DS_BS; r++)
+                    for (int j = 0; j < DS_QID; j++) { rid[r][j] = -1; rw[r][j] = 0.f; }
+                for (int r = 0; r < nd; r++) {
+                    const int nc = sam.row_chain(r, w);
+                    int m = 0;
+                    dslot[r] = -1;
+                    for (int i = 0; i < nc; i++) {
+                        const int id = sam.cand[i].second;
+                        rid[r][m] = id;
+                        rw[r][m] = nc == 1 ? 1.f : w[i];
+                        if (id == dr[r]) dslot[r] = m;
+                        m++;
                     }
-                } else {
-                    // Each row's p is the sampler's own chain, q comes from the drafter: the
-                    // 7 rows' candidate ids (plus each row's draft, when p does not list it)
-                    // go to the cards in one launch, then row r accepts dr[r] or the residual
-                    // ends the round. A residual in g[n] anchors the next round like any
-                    // other row pick, so the round still emits n + 1 tokens.
-                    std::vector<float> w;
-                    int rid[DS_BS][DS_QID], rn[DS_BS], dslot[DS_BS];
-                    float rw[DS_BS][DS_QID];
-                    double qall[DS_BS][DS_QID];
-                    for (int r = 0; r < DS_BS; r++)
-                        for (int j = 0; j < DS_QID; j++) { rid[r][j] = -1; rw[r][j] = 0.f; }
-                    for (int r = 0; r < nd; r++) {
-                        const int nc = sam.row_chain(r, w);
-                        int m = 0;
-                        dslot[r] = -1;
-                        for (int i = 0; i < nc; i++) {
-                            const int id = sam.cand[i].second;
-                            rid[r][m] = id;
-                            rw[r][m] = nc == 1 ? 1.f : w[i];
-                            if (id == dr[r]) dslot[r] = m;
-                            m++;
-                        }
-                        if (dslot[r] < 0) { rid[r][m] = dr[r]; dslot[r] = m; m++; }   // p(d) = 0
-                        rn[r] = m;
+                    if (dslot[r] < 0) { rid[r][m] = dr[r]; dslot[r] = m; m++; }   // p(d) = 0
+                    rn[r] = m;
+                }
+                DS.qlog(&rid[0][0], &lgt[0], lse);
+                for (int r = 0; r < nd; r++)                     // q of every candidate of every row
+                    for (int i = 0; i < rn[r]; i++) {
+                        double x = lgt[r * DS_QID + i];
+                        if (dsa.cap > 0.f) x = (double) dsa.cap * tanh(x / dsa.cap);
+                        qall[r][i] = exp(x * dsa.invTq - lse[r]);
                     }
-                    DS.qlog(&rid[0][0], &lgt[0], lse);
-                    for (int r = 0; r < nd; r++)                     // q of every candidate of every row
-                        for (int i = 0; i < rn[r]; i++)
-                            {
-                                double x = lgt[r * DS_QID + i];
-                                if (dsa.cap > 0.f) x = (double) dsa.cap * tanh(x / dsa.cap);
-                                qall[r][i] = exp(x * dsa.invTq - lse[r]);
-                            }
-                    std::uniform_real_distribution<double> u01(0.0, 1.0);
-                    for (int r = 0; r < nd; r++) {
-                        const qz_spec_out o = qz_spec_row(rid[r], rw[r], rn[r], dr[r], qall[r][dslot[r]], qall[r],
-                                                          u01(sam.rng), u01(sam.rng));
-                        if (!o.accepted) { g[n] = o.id; break; }          // residual: the round ends
-                        g[n] = dr[r];
-                        if (++n == nd) { g[nd] = sam.sample_row(nd); break; }
-                    }
+                std::uniform_real_distribution<double> u01(0.0, 1.0);
+                for (int r = 0; r < nd; r++) {
+                    const qz_spec_out o = qz_spec_row(rid[r], rw[r], rn[r], dr[r], qall[r][dslot[r]], qall[r],
+                                                      u01(sam.rng), u01(sam.rng));
+                    if (!o.accepted) { g[n] = o.id; break; }          // residual: the round ends
+                    g[n] = dr[r];
+                    if (++n == nd) { g[nd] = sam.sample_row(nd); break; }
                 }
             }
             note_round(nr, n, n + (n < nd ? 1 : 0), std::chrono::duration<double, std::milli>(clk::now() - tr0).count());
@@ -438,14 +427,13 @@ struct ink2_ctx : qz_ctx {
             anchor = true;
             last_kind = 2; last_n = n + 1;
         }
-        if (dsr && DS.rounds > r0)
-            fprintf(stderr, "dspark: %ld rounds, %.2f tok/rnd (%.2f drafts accepted of %d)\n", DS.rounds - r0,
-                    (double) (DS.accepted - a0 + DS.rounds - r0) / (DS.rounds - r0), (double) (DS.accepted - a0) / (DS.rounds - r0), DS_BS - 1);
-        if (dsr && rows_fixed < 2 && nround > 0) {   // the adaptive rounds' width histogram
-            char b[128];
+        if (dsr && DS.rounds > r0) {
+            char b[160];                              // the rounds per width, as n<width>=<rounds>
             int o = 0;
-            for (int n = 2; n <= VR; n++) o += snprintf(b + o, sizeof(b) - (size_t) o, " nr%d=%d", n, nr_hist[n]);
-            fprintf(stderr, "dspark rows: adaptive, %ld rounds:%s (a=%.2f)\n", nround, b, a_est());
+            for (int n = 2; n <= VR; n++)
+                if (nr_hist[n]) o += snprintf(b + o, sizeof(b) - (size_t) o, " n%d=%d", n, nr_hist[n]);
+            fprintf(stderr, "dspark: %ld rounds, %.2f tok/rnd (%.2f drafts accepted of %d) rows%s\n", DS.rounds - r0,
+                    (double) (DS.accepted - a0 + DS.rounds - r0) / (DS.rounds - r0), (double) (DS.accepted - a0) / (DS.rounds - r0), DS_BS - 1, b);
         }
         if (dsr && sw_on && ntok_plain)
             fprintf(stderr, "switch: %d, %d tokens plain (%.2f ms/step)\n", nsw, ntok_plain, step_ms);

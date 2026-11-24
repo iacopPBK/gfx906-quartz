@@ -1,4 +1,4 @@
-// inkling2 flash attention, Qwen's fl9 structure (quartz/arch/qwen35/flash9.h): a tile of
+// inkling2 flash attention, the structure of quartz/arch/qwen35/flash9.h: a tile of
 // FL_TP = 64 keys by absolute index, lane = key position for the QK (one dot per lane, no
 // cross-lane reduction per key), the K tile in LDS with an XOR swizzle of its 16 B chunks,
 // q in LDS read as wave-uniform 16 B broadcasts, the online softmax per tile in log2 units,
@@ -29,7 +29,7 @@ constexpr int FL_CH = HD / 8;                // 16 B chunks in a key row
 constexpr int FL_VP = FL_TP / 2;             // key pairs per tile
 constexpr int FL_KH = FL_TP * HD;            // halves in the K tile (and in the V tile)
 constexpr int FL_NW = 8;                     // waves per block, and the verify's rows
-constexpr float FL_FBIG = -3.4028235e38f;    // empty-partial max (flash9.h QZ_FBIG)
+constexpr float FL_FBIG = -3.4028235e38f;    // empty-partial max
 
 typedef unsigned int fl_v4 __attribute__((ext_vector_type(4)));
 
@@ -102,9 +102,7 @@ __device__ __forceinline__ void fl_st_v(__half * vb, int tile, int lo, int rp, i
     fl_pair8(a & m0, b & m1, vb + ((size_t) pk * HD + c * 8) * 2);
 }
 // q, f16 and pre-scaled by log2(e)/sqrt(HD), is staged once per row into LDS: the dots then
-// read it as wave-uniform 16 B broadcasts, so it costs no VGPRs and no HBM latency (a
-// s_load_dwordx16 of a global address is not L1-resident, and the 12 per tile cost more
-// than the dots they feed; per-dot global loads were worse still).
+// read it as wave-uniform 16 B broadcasts, so it costs no VGPRs and no HBM latency.
 __device__ __forceinline__ void fl_st_q(__half * qb, const __half * qrow, int lane) {
     if (lane < GQ * HD / 8) *(fl_v4 *) (qb + lane * 8) = *(const fl_v4 *) (qrow + lane * 8);
 }
@@ -144,7 +142,7 @@ __device__ __forceinline__ void fl_qk(const __half * krow, int sw, const __half 
     #pragma unroll
     for (int h = 0; h < NH; h++) s[h] = a0[h] + a1[h];
 }
-// The online softmax of one tile in log2 units (flash9.h:158): one wave max per (tile,
+// The online softmax of one tile in log2 units: one wave max per (tile,
 // head), p = exp2(s - m) as f16 into this wave's slot, l kept per lane, the accumulators
 // rescaled once per tile. A tile whose keys are all masked leaves the state untouched.
 template <int NH>
@@ -167,7 +165,7 @@ __device__ __forceinline__ void fl_softmax(fl_st & st, float (&s)[NH], __half * 
 }
 // PV: lane = 2 output dims, key pairs ascending. V is [pair][dim][2], so the lane's 8 B are
 // dims 2 * lane and 2 * lane + 1 of both keys, and one v_dot2 per (head, dim) takes
-// (p_2k, p_2k+1) as src0 (flash9.h:196). All lanes read the same P word: a broadcast.
+// (p_2k, p_2k+1) as src0. All lanes read the same P word: a broadcast.
 template <int NH>
 __device__ __forceinline__ void fl_pv(fl_st & st, const __half * vb, const __half * prow, int lane) {
     const int d0 = lane * 2;
@@ -223,8 +221,8 @@ __device__ __forceinline__ void fl_store_part(float * part, fl_st & st, int lane
         if (lane == 0) { B[0] = st.m[h]; B[1] = l; }
     }
 }
-// A partial absorbs another (att_join in log2 units): both rescaled by their exponents
-// against the joint max. m = m2 = FBIG leaves the state unchanged.
+// A partial absorbs another: both rescaled by their exponents against the joint max.
+// m = m2 = FBIG leaves the state unchanged.
 __device__ __forceinline__ void fl_join(float & m, float & l, float & o, float m2, float l2, float o2) {
     const float M = fmaxf(m, m2);
     const float a = m == FL_FBIG ? 0.f : __builtin_amdgcn_exp2f(m - M);
@@ -308,8 +306,8 @@ __device__ __forceinline__ void fl_plain_run(const attn_args & a, const fl_lds &
     if (live) fl_store_part<1>(qz_gp(a.part) + (size_t) (kvh * FL_NS + sp) * GQ * ATT_PW, st, lane, hp);
 }
 
-// The plain step: one unit (kv head, split) per block. The kv head's last block, counted as
-// d_attn counted it, merges the FL_NS splits.
+// The plain step: one unit (kv head, split) per block. Whichever block finds the kv head's
+// counter at FL_NS - 1 merges the splits.
 __device__ __forceinline__ void fl_attn_plain(const attn_args & a, int kvh, int sp, int tid, float * lds) {
     __shared__ int last;
     fl_plain_run(a, fl_layout1(lds), kvh, sp, tid);

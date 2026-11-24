@@ -68,7 +68,7 @@ It needs **exactly two cards with P2P** between them: no single-card or 4-card m
 
 | Feature | Details |
 |:---|:---|
-| **Speculative decode** | Each DSpark round drafts 7 tokens and verifies them with the anchor as 8 rows. A draft is kept only if it equals the target's own pick, so the output equals plain decoding. Decode runs one token per step while that is faster than the rounds |
+| **Speculative decode** | Each DSpark round drafts up to 7 tokens and verifies them with the anchor in one pass, its width set by the recent acceptance. Greedy output equals plain decoding; sampled output keeps the sampler's distribution (speculative sampling). Decode runs one token per step while that is faster than the rounds |
 | **Persistent decode** | One kernel per card runs the 48 layer applications (24 layers, 12 of them looped 3 times) |
 | **Batched prefill** | 2048-token chunks, grouped expert GEMMs |
 | **Prefix cache** | Conv history snapshots in host memory; a snapshot is used while its sliding-window rows are still on the cards |

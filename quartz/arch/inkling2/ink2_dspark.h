@@ -4,17 +4,18 @@
 // cache. A position enters that cache through 4 target features: the residual entering
 // applications 5, 23 and 41 and the head's normed input. A layer mixes them by
 // softmax(dspark_fuse) then RMSNorm (dflare_norm; dspark_norm for the Markov context g).
-// The Markov head chains the 7 drafts. joint_proj maps [state | markov_w1[prev] | hidden_i
-// | g of the anchor - 1] to gate, cand and latent. A draft's logits are the target head on
-// hidden_i + hidden_out(latent), one 7-row head GEMV plus fold . [latent; 1], where
-// fold = head . [hidden_out | bias] is built at load, per card, over its vocab half.
+// The Markov head chains the round's drafts. joint_proj maps
+// [state | markov_w1[prev] | hidden_i | g of the anchor - 1] to gate, cand and latent. A
+// draft's logits are the target head on hidden_i + hidden_out(latent), one 7-row head
+// GEMV plus fold . [latent; 1]. fold = head . [hidden_out | bias] is built at load, per
+// card, over its vocab half.
 // The layers split over the two cards as the target's do (ink2_ds_tp2_spec). Card c owns
 // 12 q heads, 4 kv heads with their context K / V cache, and half the FFN. The attn_output
 // and ffn_down partials are exchanged and summed on both cards, card 0's first, so the
 // residual stays replicated.
-// The 7 Markov steps run as one device-side chain with no host round trip. Card 0's joint
+// The Markov steps run as one device-side chain with no host round trip. Card 0's joint
 // kernel waits for the peer's argmax through peer memory flags, and card 1's fold waits for
-// card 0's lat1 the same way. Only the 7 tokens come back.
+// card 0's lat1 the same way. Only the round's tokens come back.
 // Included after ink2_engine.h / ink2_pf.h (same TU).
 
 constexpr int DS_BS = 8, DS_NL = 3, DS_R = 256, DS_FF = 9216, DS_Q = 3072, DS_KV = 1024, DS_NQ = 24, DS_NKV = 8;
@@ -272,8 +273,8 @@ __device__ __forceinline__ void ds_attn_key(const float * qq, const float * kf, 
 }
 // one tile of DS_TILE cache keys for one query vector: the scores of the whole tile first,
 // then a single rescale against the tile's max, then an expf and a value accumulate per
-// key. The keys of a tile are independent, unlike the one-key-at-a-time update, so the
-// softmax latency no longer serializes the tile. Keys past n are masked to -infinity.
+// key. The keys of a tile are independent, unlike a one-key-at-a-time update, so the
+// softmax latency does not serialize the tile. Keys past n are masked to -infinity.
 __device__ __forceinline__ void ds_attn_tile(const float * qq, const float * sk, const float * sv, int li,
                                              float * o, float & m, float & l, int n) {
     float s[DS_TILE];
@@ -448,7 +449,7 @@ static __global__ __launch_bounds__(256) void k_ds_markov(const float * joint, f
 // for their own ids, so no exchange is needed and a fixed seed repeats a run exactly.
 // u takes 23 hash bits + 0.5 over 2^23, i.e. u in [2^-24, 1 - 2^-24]: 24 bits cannot be
 // mapped this way in f32, where (2^24 - 1) + 0.5 rounds to 2^24 and u = 1 would make G
-// +inf, pinning the draft to whatever id hit that value (~1.2% of the rows here). The
+// +inf, pinning the draft to whichever id hit that value. The
 // grid truncates the Gumbel tails at [-2.81, 16.66], which costs q at most ~exp(-17) of
 // its mass per entry.
 __device__ __forceinline__ unsigned int ds_fmix(unsigned int x) {           // murmur3's finalizer
@@ -465,7 +466,7 @@ __device__ __forceinline__ float ds_gumbel(unsigned int seed, unsigned int rnd, 
 // partials of that row's logsumexp go to part (null: no logsumexp)
 struct dsamp { float invTq; unsigned int seed, rnd; float * part; float cap; };   // cap > 0: the target's logit softcap on q's logits
 constexpr int DS_LSEB = 128;                   // logsumexp partials per card per row (>= grid)
-constexpr int DS_QID = QZ_TOPK + 1;            // a row's candidate ids: the draft, then the top-K
+constexpr int DS_QID = QZ_TOPK + 1;            // a row's candidate ids: p's chain, plus the draft if absent
 // draft row logits over this card's head rows: base + fold . lat1, then the argmax into
 // best as a packed (orderable value, ~id) max, so ties keep the lower id. WT waits for lat1
 // first, on card 1. fold rows are nhp halves apart and 128-byte aligned, walked in j order,
@@ -869,10 +870,9 @@ struct ink2_dspark {
         ICHECK(hipSetDevice(qz_dev_of(0)));
     }
     // The nd drafts (1 .. 7) after anchor tok at position a, context rows 0 .. a - 1 filled.
-    // The 3 DFlash layers always run DS_BS rows; only the Markov chain stops early. With
-    // sa each draft is drawn from q = softmax(logit * invTq) by Gumbel-max, keyed on the
-    // request's seed and this round's counter; without it the chain is the greedy argmax,
-    // bit for bit as before.
+    // The 3 DFlash layers always run DS_BS rows; only the Markov chain stops early. With sa
+    // each draft is drawn from q = softmax(logit * invTq) by Gumbel-max, keyed on the
+    // request's seed and this round's counter; without it the chain is the greedy argmax.
     void draft(int tok, int a, int * out, const dsamp * sa, int nd) {
         each([&](int c, card & k, hipStream_t st) {
             const ink2_card & T = E->C[c];
@@ -971,8 +971,9 @@ struct ink2_dspark {
     }
     // ---- sampled rounds, after the verify
     // The drafter's logit of the target's candidate ids: ids is the host's [DS_BS][DS_QID]
-    // list (-1 padded, row r slot 0 = draft r), lg the host's logits in the same layout and
-    // lse the per-row logsumexp of the whole vocab. Each card evaluates the ids it owns.
+    // list (-1 padded, row r's own candidates in its slots), lg the host's logits in the
+    // same layout and lse the per-row logsumexp of the whole vocab. Each card evaluates
+    // the ids it owns.
     void qlog(const int * ids, float * lg, float * lse) {
         memcpy(qid_h, ids, DS_BS * DS_QID * sizeof(int));
         for (int c = 0; c < 2; c++) {
