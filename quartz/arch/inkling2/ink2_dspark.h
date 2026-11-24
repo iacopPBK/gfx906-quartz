@@ -583,14 +583,14 @@ static __global__ __launch_bounds__(64) void k_ds_best_push(unsigned long long *
     ds_flag(fl_peer, seq);
     *best = 0;
 }
-// the chain's last token, the argmax of step DS_BS - 1, once the peer's push has landed
+// the chain's last token, the argmax of its last step, once the peer's push has landed
 static __global__ __launch_bounds__(64) void k_ds_last(const unsigned long long * best, const unsigned long long * xbest,
-                                                       unsigned int * fl, unsigned int seq, int * err, int * out) {
+                                                       unsigned int * fl, unsigned int seq, int * err, int * out, int slot) {
     if (threadIdx.x != 0) return;
     ds_wait(fl, seq, err);
     const unsigned long long b0 = ((volatile const unsigned long long *) best)[0];
     const unsigned long long b1 = ((volatile const unsigned long long *) xbest)[0];
-    out[DS_BS - 2] = (int) ~(unsigned int) ((b0 > b1 ? b0 : b1) & 0xffffffffu);
+    out[slot] = (int) ~(unsigned int) ((b0 > b1 ? b0 : b1) & 0xffffffffu);
 }
 static __global__ void k_ds_tohalf(const float * y, __half * o, int n, int stride) {
     const int r = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -868,11 +868,12 @@ struct ink2_dspark {
         });
         ICHECK(hipSetDevice(qz_dev_of(0)));
     }
-    // The 7 drafts after anchor tok at position a, context rows 0 .. a - 1 filled. With sa
-    // each draft is drawn from q = softmax(logit * invTq) by Gumbel-max, keyed on the
+    // The nd drafts (1 .. 7) after anchor tok at position a, context rows 0 .. a - 1 filled.
+    // The 3 DFlash layers always run DS_BS rows; only the Markov chain stops early. With
+    // sa each draft is drawn from q = softmax(logit * invTq) by Gumbel-max, keyed on the
     // request's seed and this round's counter; without it the chain is the greedy argmax,
     // bit for bit as before.
-    void draft(int tok, int a, int * out, const dsamp * sa) {
+    void draft(int tok, int a, int * out, const dsamp * sa, int nd) {
         each([&](int c, card & k, hipStream_t st) {
             const ink2_card & T = E->C[c];
             k_ds_embed<<<DS_BS, 256, 0, st>>>(T.embd.v, T.embd.s, tok, T.embd_norm, E->hp.eps, k.X, k.mask);
@@ -918,11 +919,13 @@ struct ink2_dspark {
         hipStream_t st = E->C[0].st;
         const float * hid = K[0].hid;
         ICHECK(hipMemsetAsync(state, 0, DS_R * 4, st));
-        // the 7 Markov steps, each chained to the peer through lat1 and the argmax push.
+        // the nd Markov steps, each chained to the peer through lat1 and the argmax push.
         // With sa the packed value is the Gumbel-max's z, so the drafts are drawn from q.
+        // The handshake's sequence number only ever counts up, so a shorter round leaves
+        // both cards' flags consistent.
         const int nb[2] = { (E->C[0].nvalid + 256 * DS_FE - 1) / (256 * DS_FE),
                             (E->C[1].nvalid + 256 * DS_FE - 1) / (256 * DS_FE) };
-        for (int i = 1; i < DS_BS; i++) {
+        for (int i = 1; i <= nd; i++) {
             const unsigned int sq = ++seq;
             const int r = i - 1;
             dsamp s0 = { 0.f, 0, 0, nullptr, 0.f }, s1 = { 0.f, 0, 0, nullptr, 0.f };
@@ -960,10 +963,10 @@ struct ink2_dspark {
             }
             ICHECK(hipSetDevice(qz_dev_of(0)));
         }
-        k_ds_last<<<1, 64, 0, st>>>(best[0], xbest[0], fl[0], seq, out_d + 7, out_d);
+        k_ds_last<<<1, 64, 0, st>>>(best[0], xbest[0], fl[0], seq, out_d + 7, out_d, nd - 1);
         ICHECK(hipMemcpyAsync(out_h, out_d, 8 * sizeof(int), hipMemcpyDeviceToHost, st));
         ICHECK(hipStreamSynchronize(st));
-        for (int i = 0; i < DS_BS - 1; i++) out[i] = out_h[i];
+        for (int i = 0; i < nd; i++) out[i] = out_h[i];
         if (out_h[7]) { fprintf(stderr, "dspark: the Markov chain's cross-card wait timed out (step %u)\n", seq), exit(1); }
     }
     // ---- sampled rounds, after the verify

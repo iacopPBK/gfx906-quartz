@@ -503,19 +503,21 @@ struct ink2_engine {
         }
         ICHECK(hipSetDevice(qz_dev_of(0)));
     }
-    // the round: launch both cards, then each card's top-K of the VR logit rows, then sync
+    // the round: launch both cards, then each card's top-K of the VR logit rows, then sync.
+    // nr (2 .. VR) is the round's active rows: toks[0 .. nr-1], the rest of the table is idle.
     long long n_ver = 0;
-    void verify(const int * toks, int pos) {
+    void verify(const int * toks, int pos, int nr) {
         vplan();
+        nr = nr < 2 ? 2 : nr > VR ? VR : nr;
         vtok tv;
-        for (int r = 0; r < VR; r++) { tv.t[r] = toks[r]; tv.tau[r] = tau_at(pos + r); }
+        for (int r = 0; r < VR; r++) { tv.t[r] = r < nr ? toks[r] : 0; tv.tau[r] = tau_at(pos + r); }
         for (int c = 0; c < 2; c++) {
             ink2_card & K = C[c];
             ICHECK(hipSetDevice(qz_dev_of(c)));
             ICHECK(hipMemsetAsync(K.vbst, 0, (CYC_NBMAX + VR * CG) * sizeof(unsigned int), K.st));
-            hipLaunchKernelGGL(ink2_verify, dim3(K.ncu), dim3(512), VER_LDS, K.st, K.vbst, (const vargs *) K.vargs_d, tv, pos, 1);
+            hipLaunchKernelGGL(ink2_verify, dim3(K.ncu), dim3(512), VER_LDS, K.st, K.vbst, (const vargs *) K.vargs_d, tv, pos, 1, nr);
             ICHECK(hipGetLastError());
-            qz_topk_rows<<<dim3(QZ_TOPK_NB, VR), 256, 0, K.st>>>(K.LOGV, K.nvalid, K.id0, K.vtk);
+            qz_topk_rows<<<dim3(QZ_TOPK_NB, nr), 256, 0, K.st>>>(K.LOGV, K.nvalid, K.id0, K.vtk);
             const size_t n2 = (size_t) VR * QZ_TOPK_NB * QZ_TOPK;
             ICHECK(hipMemcpyAsync(vtkp[c], K.vtk, n2 * sizeof(float2), hipMemcpyDeviceToHost, K.st));
             ICHECK(hipMemcpyAsync(vtkp[c] + n2, K.x.xerr, 8 * sizeof(int), hipMemcpyDeviceToHost, K.st));

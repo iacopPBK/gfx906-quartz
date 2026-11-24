@@ -265,6 +265,55 @@ struct ink2_ctx : qz_ctx {
         constexpr double SW_MARGIN = 0.85;                      // plain mode below 85% of the plain step's rate
         bool spec = true, meas = false;
         int plain_left = 0, probe = SW_PROBE, seg = 0, nsw = 0, ntok_plain = 0;
+        // Adaptive verify width. A round of n rows (the anchor and n - 1 drafts) emits
+        // E(n) = (1 - a^n) / (1 - a) tokens for a per-draft acceptance a, in the round time
+        // t(n), so the policy takes the n with the best E(n) / t(n). a is the accepted share
+        // of the last 32 rounds' tested drafts (a rejection is one more test, the drafts
+        // after it are untested), clamped to [0.05, 0.98]. t(n) is a per-n EMA of the round's
+        // wall time, seeded from t(8) * (0.45 + 0.55 n / 8) until n has samples; the table is
+        // kept across requests like the plain step's timing. Every 64th round takes the best
+        // n + 1 instead, to refresh its estimate. QZ_DS_ROWS=2..8 fixes n (read per call).
+        const char * e_rows = getenv("QZ_DS_ROWS");
+        const int rows_fixed = e_rows && *e_rows ? atoi(e_rows) : 0;
+        static double rt_ms[VR + 1] = {0};               // per n round time (ms), across requests
+        static int rt_n[VR + 1] = {0};                   // its samples
+        int rq_a[32], rq_t[32];                          // the last rounds' accepted / tested drafts
+        int rq_len = 0, rq_h = 0, rq_sa = 0, rq_st = 0;
+        int last_nr = VR, nr_hist[VR + 1] = {0};
+        double last_ms = 0.0;
+        long nround = 0, probe_at = 64;
+        auto a_est = [&]() -> double {
+            if (rq_st <= 0) return 0.6;                  // nothing tested yet
+            const double a = (double) rq_sa / (double) rq_st;
+            return a < 0.05 ? 0.05 : a > 0.98 ? 0.98 : a;
+        };
+        auto t_est = [&](int n) -> double {
+            if (rt_n[n]) return rt_ms[n];
+            const double t8 = rt_n[VR] ? rt_ms[VR] : last_ms / (0.45 + 0.55 * last_nr / (double) VR);
+            return t8 * (0.45 + 0.55 * n / (double) VR);
+        };
+        auto pick_rows = [&]() -> int {
+            if (rows_fixed >= 2) return rows_fixed > VR ? VR : rows_fixed;
+            if (!rt_n[VR] && last_ms <= 0.0) return VR;  // the first round: measure t(8)
+            const double a = a_est(), d = 1.0 - a;
+            int bn = 2;
+            double bv = -1.0;
+            for (int n = 2; n <= VR; n++) {
+                const double v = (1.0 - std::pow(a, n)) / d / t_est(n);
+                if (v > bv) { bv = v; bn = n; }
+            }
+            return nround >= probe_at && bn < VR ? bn + 1 : bn;
+        };
+        auto note_round = [&](int nr, int acc, int tst, double ms) {
+            rt_ms[nr] = rt_n[nr] ? 0.75 * rt_ms[nr] + 0.25 * ms : ms;
+            rt_n[nr]++;
+            last_ms = ms; last_nr = nr;
+            nr_hist[nr]++;
+            if (rq_len == 32) { rq_sa -= rq_a[rq_h]; rq_st -= rq_t[rq_h]; } else rq_len++;
+            rq_a[rq_h] = acc; rq_t[rq_h] = tst; rq_sa += acc; rq_st += tst;
+            rq_h = (rq_h + 1) & 31;
+            if (++nround >= probe_at) probe_at = nround + 64;
+        };
         std::deque<std::pair<int, double>> wq;                  // (tokens, ms) per round in the window
         int wtok = 0; double wms = 0.0;
         int last_kind = 0, last_n = 0;                          // the previous iteration: 1 plain, 2 a round of last_n tokens
@@ -294,7 +343,8 @@ struct ink2_ctx : qz_ctx {
             if (!anchor) anc = pick();
             anchor = false;
             if (emit(anc)) break;
-            if (!dsr || pos + VR > E.ctx || !spec) {
+            const int nr = pick_rows(), nd = nr - 1;
+            if (!dsr || pos + nr > E.ctx || !spec) {
                 hi = std::max(hi, pos);
                 E.step(anc, pos++, true);
                 if (ds_on) DS.fill(DS.tap, 4 * D, pos - 1, 1);
@@ -308,23 +358,24 @@ struct ink2_ctx : qz_ctx {
                 }
                 continue;
             }
+            const auto tr0 = clk::now();
             dsa.rnd = DS.rnd++;
-            DS.draft(anc, pos, dr, dspec ? &dsa : nullptr);
+            DS.draft(anc, pos, dr, dspec ? &dsa : nullptr, nd);
             int toks[VR];
             toks[0] = anc;
-            for (int r = 0; r < DS_BS - 1; r++) toks[r + 1] = dr[r];
-            E.verify(toks, pos);
+            for (int r = 0; r < nd; r++) toks[r + 1] = dr[r];
+            E.verify(toks, pos, nr);
             int g[VR], n = 0;
             if (!sam.smp) {
-                for (int r = 0; r < VR; r++) g[r] = E.greedy_row(r);
-                while (n < DS_BS - 1 && dr[n] == g[n]) n++;
+                for (int r = 0; r < nr; r++) g[r] = E.greedy_row(r);
+                while (n < nd && dr[n] == g[n]) n++;
             } else {                                  // sampled: exact match, or speculative sampling
                 const size_t rb = (size_t) QZ_TOPK_NB * QZ_TOPK;
                 for (int c = 0; c < 2; c++) sam.tk[c].assign(E.vtkp[c], E.vtkp[c] + VR * rb);
                 if (!dspec) {
                     for (;;) {
                         g[n] = sam.sample_row(n);
-                        if (n == DS_BS - 1 || g[n] != dr[n]) break;
+                        if (n == nd || g[n] != dr[n]) break;
                         n++;
                     }
                 } else {
@@ -339,7 +390,7 @@ struct ink2_ctx : qz_ctx {
                     double qall[DS_BS][DS_QID];
                     for (int r = 0; r < DS_BS; r++)
                         for (int j = 0; j < DS_QID; j++) { rid[r][j] = -1; rw[r][j] = 0.f; }
-                    for (int r = 0; r < DS_BS - 1; r++) {
+                    for (int r = 0; r < nd; r++) {
                         const int nc = sam.row_chain(r, w);
                         int m = 0;
                         dslot[r] = -1;
@@ -354,7 +405,7 @@ struct ink2_ctx : qz_ctx {
                         rn[r] = m;
                     }
                     DS.qlog(&rid[0][0], &lgt[0], lse);
-                    for (int r = 0; r < DS_BS - 1; r++)              // q of every candidate of every row
+                    for (int r = 0; r < nd; r++)                     // q of every candidate of every row
                         for (int i = 0; i < rn[r]; i++)
                             {
                                 double x = lgt[r * DS_QID + i];
@@ -362,18 +413,19 @@ struct ink2_ctx : qz_ctx {
                                 qall[r][i] = exp(x * dsa.invTq - lse[r]);
                             }
                     std::uniform_real_distribution<double> u01(0.0, 1.0);
-                    for (int r = 0; r < DS_BS - 1; r++) {
+                    for (int r = 0; r < nd; r++) {
                         const qz_spec_out o = qz_spec_row(rid[r], rw[r], rn[r], dr[r], qall[r][dslot[r]], qall[r],
                                                           u01(sam.rng), u01(sam.rng));
                         if (!o.accepted) { g[n] = o.id; break; }          // residual: the round ends
                         g[n] = dr[r];
-                        if (++n == DS_BS - 1) { g[DS_BS - 1] = sam.sample_row(DS_BS - 1); break; }
+                        if (++n == nd) { g[nd] = sam.sample_row(nd); break; }
                     }
                 }
             }
+            note_round(nr, n, n + (n < nd ? 1 : 0), std::chrono::duration<double, std::milli>(clk::now() - tr0).count());
             DS.rounds++;
             DS.accepted += n;
-            hi = std::max(hi, pos + VR - 1);          // the SWA ring rows the verify wrote
+            hi = std::max(hi, pos + nr - 1);          // the SWA ring rows the verify wrote
             st.decode_cycles++; st.decode_tok += n + 1;
             st.dspine = 1;
             bool end = false;
@@ -389,6 +441,12 @@ struct ink2_ctx : qz_ctx {
         if (dsr && DS.rounds > r0)
             fprintf(stderr, "dspark: %ld rounds, %.2f tok/rnd (%.2f drafts accepted of %d)\n", DS.rounds - r0,
                     (double) (DS.accepted - a0 + DS.rounds - r0) / (DS.rounds - r0), (double) (DS.accepted - a0) / (DS.rounds - r0), DS_BS - 1);
+        if (dsr && rows_fixed < 2 && nround > 0) {   // the adaptive rounds' width histogram
+            char b[128];
+            int o = 0;
+            for (int n = 2; n <= VR; n++) o += snprintf(b + o, sizeof(b) - (size_t) o, " nr%d=%d", n, nr_hist[n]);
+            fprintf(stderr, "dspark rows: adaptive, %ld rounds:%s (a=%.2f)\n", nround, b, a_est());
+        }
         if (dsr && sw_on && ntok_plain)
             fprintf(stderr, "switch: %d, %d tokens plain (%.2f ms/step)\n", nsw, ntok_plain, step_ms);
         st.decode_ms = std::chrono::duration<double, std::milli>(clk::now() - t1).count();

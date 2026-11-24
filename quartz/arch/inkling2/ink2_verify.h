@@ -8,6 +8,13 @@
 // The host builds the row replicas in ink2_engine::vplan: one table entry per (row,
 // application), every activation pointer shifted by the row's stride, so the chain and
 // grid bodies run unchanged. Included from ink2_engine.h after ink2_cycle.h.
+//
+// A round is often shorter than VR rows: nr (2 .. VR, a kernel argument) is the number
+// of rows this round runs, and rows nr .. VR - 1 are idle. They get no chain group, no
+// head post, no attention unit, no router pick, and since they pick no experts they are
+// in no up / down row list. Rows < nr are untouched by this, so their bits do not depend
+// on nr. The phases that stream a weight once for all rows keep all VR rows: the qkv /
+// out GEMVs, the router, the controller sums and the head GEMV.
 #pragma once
 
 // fp contract(on) so the bodies round like ink2_cycle.h; contract(fast) again at the end
@@ -408,43 +415,45 @@ VR_NI unsigned long long v_pkey(float x, int id) {
     u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
     return ((unsigned long long) u << 32) | (unsigned) (NE - 1 - id);
 }
-VR_NI void v_pick_w(const float * H0, int rsf, float scale, int * sids, float * swts, int tid) {
+VR_NI void v_pick_w(const float * H0, int rsf, float scale, int * sids, float * swts, int tid, int nr) {
     static_assert(VR == 8 && NE == 128, "a wave per row, 2 candidates per lane");
     asm volatile ("" : "+v"(tid));
     const int r = tid >> 6, lane = tid & 63;
-    const float * h = qz_gp(H0) + (size_t) r * rsf;
-    const float pa = h[lane], pb = h[lane + 64];
-    unsigned long long ka = v_pkey(h[NE + lane], lane), kb = v_pkey(h[NE + lane + 64], lane + 64);
-    float lp[NE_USED];
-    int ids[NE_USED];
-    #pragma unroll
-    for (int k = 0; k < NE_USED; k++) {
-        unsigned long long m = ka > kb ? ka : kb;
+    if (r < nr) {
+        const float * h = qz_gp(H0) + (size_t) r * rsf;
+        const float pa = h[lane], pb = h[lane + 64];
+        unsigned long long ka = v_pkey(h[NE + lane], lane), kb = v_pkey(h[NE + lane + 64], lane + 64);
+        float lp[NE_USED];
+        int ids[NE_USED];
         #pragma unroll
-        for (int o = 32; o > 0; o >>= 1) {
-            const unsigned lo = __shfl_xor((unsigned) m, o, 64), hi = __shfl_xor((unsigned) (m >> 32), o, 64);
-            const unsigned long long q = ((unsigned long long) hi << 32) | lo;
-            m = q > m ? q : m;
+        for (int k = 0; k < NE_USED; k++) {
+            unsigned long long m = ka > kb ? ka : kb;
+            #pragma unroll
+            for (int o = 32; o > 0; o >>= 1) {
+                const unsigned lo = __shfl_xor((unsigned) m, o, 64), hi = __shfl_xor((unsigned) (m >> 32), o, 64);
+                const unsigned long long q = ((unsigned long long) hi << 32) | lo;
+                m = q > m ? q : m;
+            }
+            const int w = NE - 1 - (int) (unsigned) m;
+            if (w == lane) ka = 0; else if (w == lane + 64) kb = 0;
+            lp[k] = __shfl(w < 64 ? pa : pb, w & 63, 64);
+            ids[k] = w;
         }
-        const int w = NE - 1 - (int) (unsigned) m;
-        if (w == lane) ka = 0; else if (w == lane + 64) kb = 0;
-        lp[k] = __shfl(w < 64 ? pa : pb, w & 63, 64);
-        ids[k] = w;
+        float sum = 0.f;
+        #pragma unroll
+        for (int k = 0; k < NE_USED; k++) sum += lp[k];
+        sum += 1e-20f;
+        #pragma unroll
+        for (int k = 0; k < NE_USED; k++)
+            if (lane == k) { sids[r * NE_USED + k] = ids[k]; swts[r * NE_USED + k] = lp[k] / sum * scale; }
     }
-    float sum = 0.f;
-    #pragma unroll
-    for (int k = 0; k < NE_USED; k++) sum += lp[k];
-    sum += 1e-20f;
-    #pragma unroll
-    for (int k = 0; k < NE_USED; k++)
-        if (lane == k) { sids[r * NE_USED + k] = ids[k]; swts[r * NE_USED + k] = lp[k] / sum * scale; }
     __syncthreads();
 }
 
-// The experts the VR rows picked, each once: dex[0 .. nd-1] ascending, dmk[u] the rows
+// The experts the active rows picked, each once: dex[0 .. nd-1] ascending, dmk[u] the rows
 // that picked dex[u] as bit r. Every block builds it identically, after v_pick_all.
 struct vdist { int nd; int dex[VR * NE_USED]; unsigned dmk[VR * NE_USED]; };
-VR_NI void v_distinct(const int * sids, vdist & dd, int tid) {
+VR_NI void v_distinct(const int * sids, vdist & dd, int tid, int nr) {
     __shared__ int wc[2];
     unsigned m = 0;
     const int lane = tid & 63, wave = tid >> 6;
@@ -452,7 +461,7 @@ VR_NI void v_distinct(const int * sids, vdist & dd, int tid) {
         #pragma unroll
         for (int r = 0; r < VR; r++)
             #pragma unroll
-            for (int k = 0; k < NE_USED; k++) m |= (sids[r * NE_USED + k] == tid ? 1u : 0u) << r;
+            for (int k = 0; k < NE_USED; k++) m |= (r < nr && sids[r * NE_USED + k] == tid ? 1u : 0u) << r;
     }
     const unsigned long long b = __ballot(m != 0);
     if (tid < NE && lane == 0) wc[wave] = __popcll(b);
@@ -477,19 +486,19 @@ VR_NI int v_slot(const int * sids, int r, int e) {
 // values in its LDS tile, then quantizes each picking row's group into its slot.
 VR_NI void v_up_dd(const char * wv, const __half * ws, const int * sids, const vdist & dd,
                    const unsigned char * av0, const float * as0, float beta, float lb,
-                   unsigned char * hq0, float * hs0, int tid, int rs, int rsf) {
+                   unsigned char * hq0, float * hs0, int tid, int rs, int rsf, int nr) {
     asm volatile ("" : "+v"(tid));
     av0 = qz_gp(av0); as0 = qz_gp(as0); hq0 = qz_gp(hq0); hs0 = qz_gp(hs0);
     const int wave = tid >> 6, lane = tid & 63, nw = gridDim.x * 8;
-    // the VR activation rows (int8 and scales) in dynamic LDS, read by every task
+    // the active activation rows (int8 and scales) in dynamic LDS, read by every task
     unsigned char * la = (unsigned char *) cyc_lds;                       // [VR][D]
     float * ls = cyc_lds + VR * D / 4;                                     // [VR][D / 32]
     __syncthreads();
-    for (int i = tid; i < VR * D / 16; i += 512) {
+    for (int i = tid; i < nr * D / 16; i += 512) {
         const int r = i / (D / 16), c = i % (D / 16);
         ((uint4 *) la)[i] = *(const uint4 *) (av0 + (size_t) r * rs + c * 16);
     }
-    for (int i = tid; i < VR * D / 32; i += 512) {
+    for (int i = tid; i < nr * D / 32; i += 512) {
         const int r = i / (D / 32), c = i % (D / 32);
         ls[i] = as0[(size_t) r * rsf + c];
     }
@@ -544,7 +553,8 @@ VR_NI void v_up_dd(const char * wv, const __half * ws, const int * sids, const v
 constexpr int VER_LDS = (VR * MD_Q * NE_USED * 4) * 4 + VR * NE_USED * FFL + VR * NE_USED * (FFL / 32) * 4;
 static_assert(VER_LDS >= CYC_LDS, "verify's dynamic LDS covers the decode's");
 VR_NI void v_down_dd(const char * wv, const __half * ws, const int * sids, const float * swts, const vdist & dd,
-                     const unsigned char * aq0, const float * as0, float * y0, float * yp0, int tid, int rs, int rsf, float * lacc) {
+                     const unsigned char * aq0, const float * as0, float * y0, float * yp0, int tid, int rs, int rsf, float * lacc,
+                     int nr) {
     static_assert(FFL / 32 <= 32, "one unit per lane");
     asm volatile ("" : "+v"(tid));
     constexpr int NU = FFL / 32, NQ = D / 4, LR = MD_Q * NE_USED * 4;
@@ -552,14 +562,14 @@ VR_NI void v_down_dd(const char * wv, const __half * ws, const int * sids, const
     const int wave = tid >> 6, lane = tid & 63, gq = lane >> 4, l = lane & 15;
     const int q0 = blockIdx.x * NQ / gridDim.x, q1 = (blockIdx.x + 1) * NQ / gridDim.x;
     const int np = (dd.nd + 3) / 4;
-    // the VR rows' SITU activations, all NE_USED slots, staged in LDS after the partials
+    // the active rows' SITU activations, all NE_USED slots, staged in LDS after the partials
     unsigned char * la = (unsigned char *) (lacc + VR * LR);
     float * ls = (float *) (la + VR * NE_USED * FFL);
-    for (int i = tid; i < VR * NE_USED * FFL / 16; i += 512) {
+    for (int i = tid; i < nr * NE_USED * FFL / 16; i += 512) {
         const int r = i / (NE_USED * FFL / 16), o = i % (NE_USED * FFL / 16);
         ((uint4 *) la)[i] = ((const uint4 *) (aq0 + (size_t) r * rs))[o];
     }
-    for (int i = tid; i < VR * NE_USED * NU; i += 512) {
+    for (int i = tid; i < nr * NE_USED * NU; i += 512) {
         const int r = i / (NE_USED * NU), o = i % (NE_USED * NU);
         ls[i] = as0[(size_t) r * rsf + o];
     }
@@ -630,7 +640,7 @@ VR_NI void v_down_dd(const char * wv, const __half * ws, const int * sids, const
             }
         }
         __syncthreads();
-        for (int i = tid; i < VR * nq * 4; i += 512) {
+        for (int i = tid; i < nr * nq * 4; i += 512) {
             const int r = i / (nq * 4), qd = (i >> 2) % nq, s = i & 3, row = (c0 + qd) * 4 + s;
             float tot = 0.f;
             #pragma unroll
@@ -784,10 +794,11 @@ template <int NJ> VR_NI void v_ctrl_up(CK cjob * cj, int rsf, int tid) {
 // barrier: unit (row, KV head), thread (head, dim), d_attn's folds in their order, per
 // split from its first non-empty wave, then the sink and the splits, the gate and the quant.
 constexpr size_t VWS = (size_t) HKVL * ATT_SPL * 8 * GQ * ATT_PW; // ws: [VR][HKVL][ATT_SPL][8][GQ][ATT_PW]
-VR_NI void v_attn_a(CK appk * tab, int napp, int ai, int pos, int v, float * ws, int tid) {
+VR_NI void v_attn_a(CK appk * tab, int napp, int ai, int pos, int v, float * ws, int tid, int nr) {
     asm volatile ("" : "+v"(tid));
     const int kvh = v % HKVL, sp = v / (HKVL * 8), w2 = (v / HKVL) % 8;   // KV head minor, so the units with keys spread over the grid
     const int wave = tid >> 6, lane = tid & 63, li = lane & 15, row = wave;
+    if (row >= nr) return;                                       // wave-uniform: an inactive row
     CK attn_args * ea = &((CK appk *) tab + (size_t) row * napp + ai)->at;
     const int full = ea->full, rp = pos + row;
     const int lo = full ? 0 : max(0, rp - (WIN - 1));
@@ -876,9 +887,10 @@ VR_NI void v_attn_a(CK appk * tab, int napp, int ai, int pos, int v, float * ws,
         }
     }
 }
-VR_NI void v_attn_b(CK appk * tab, int napp, int ai, int pos, int u, const float * ws, int tid) {
+VR_NI void v_attn_b(CK appk * tab, int napp, int ai, int pos, int u, const float * ws, int tid, int nr) {
     asm volatile ("" : "+v"(tid));
     const int row = u / HKVL, kvh = u % HKVL;
+    if (row >= nr) return;                                       // block-uniform: an inactive row
     if (tid >= GQ * HD) return;
     CK attn_args * ea = &((CK appk *) tab + (size_t) row * napp + ai)->at;
     const int full = ea->full, rp = pos + row;
@@ -929,7 +941,7 @@ static __global__ void k_vcommit(float * hist, const float * uh, int m) {
 // ink2_cycle's blocks 0 .. CG - 1 in the same order. Then the grid's phases for all VR
 // rows: the qkv and out GEMVs, the head posts, the attention, the router, the experts. One
 // TP2 flag per exchange, rows at the disjoint inbox region 2 D + (parity * VR + r) D.
-__global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const vargs * Vg, vtok tv, int pos, int head) {
+__global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const vargs * Vg, vtok tv, int pos, int head, int nr_) {
     __shared__ int sids[VR * NE_USED];
     __shared__ float swts[VR * NE_USED];
     __shared__ vdist dd;
@@ -940,7 +952,8 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
     asm volatile ("" : "+s"(Vp));
     const int rs = Vp->rs, rsf = Vp->rsf;
     const int cr = blockIdx.x >> 2, cw = blockIdx.x & 3;   // the chain group's row, this block's columns
-    const bool chain = cr < VR;
+    const int nr = min(max(nr_, 1), VR);                   // the active rows: 2 .. VR, the rest idle
+    const bool chain = cr < nr;
     const int tr = chain ? cr : 0;
     unsigned int xs = *Vp->A.xseq;
     // pick, distinct and up run in one phase, with no grid barrier between them
@@ -999,7 +1012,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
             cyc_barrier(vbst, ++kb);
             v_ctrl_up<3>(e0->ca.j, rsf, tid);
             cyc_barrier(vbst, ++kb);
-            for (int v = blockIdx.x; v < VR * nna; v += nb) {
+            for (int v = blockIdx.x; v < nr * nna; v += nb) {
                 const int r = v / nna, j = v % nna;
                 c_norm(&VROW(Av.tab, r, ai)->na.j[j], Av.eps, tid);
             }
@@ -1009,14 +1022,14 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         for (int v = blockIdx.x; v < 4 / VG_S * e0->nga; v += nb) v_gemv<VG_S>(&e0->ga, v, rs, rsf, nullptr);
         cyc_barrier(vbst, ++kb);
         static_assert(HQL % 4 == 0 && HKVL % 4 == 0, "a block's 4 units of one kind (q / k / v)");
-        for (int v = blockIdx.x; v < VR * (HQL + 2 * HKVL) / 4; v += nb) {
+        for (int v = blockIdx.x; v < nr * (HQL + 2 * HKVL) / 4; v += nb) {
             const int nu = (HQL + 2 * HKVL) / 4, r = v / nu, u = (v % nu) * 4 + (tid >> 7);   // 4 units, 128 threads each
             v_head_post(&VROW(Av.tab, r, ai)->hp, pos + r, tv.tau[r], u, tid, r, Vq->uh, rsf, Vq->hist);
         }
         cyc_barrier(vbst, ++kb);
-        for (int v = blockIdx.x; v < HKVL * ATT_SPL * 8; v += nb) v_attn_a((CK appk *) Av.tab, napp, ai, pos, v, Vq->ws, tid);
+        for (int v = blockIdx.x; v < HKVL * ATT_SPL * 8; v += nb) v_attn_a((CK appk *) Av.tab, napp, ai, pos, v, Vq->ws, tid, nr);
         cyc_barrier(vbst, ++kb);
-        for (int u = blockIdx.x; u < VR * HKVL; u += nb) v_attn_b((CK appk *) Av.tab, napp, ai, pos, u, Vq->ws, tid);
+        for (int u = blockIdx.x; u < nr * HKVL; u += nb) v_attn_b((CK appk *) Av.tab, napp, ai, pos, u, Vq->ws, tid, nr);
         cyc_barrier(vbst, ++kb);
         ++xs;
         for (int v = blockIdx.x; v < 4 / VG_S * e0->ngo; v += nb) v_gemv<VG_S>(&e0->go, v, rs, rsf, Av.xin_peer + 2 * D + (size_t) (xs & 1) * VR * D);
@@ -1037,30 +1050,30 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
             cyc_barrier(vbst, ++kb);
             v_ctrl_up<1>(e0->cb.j, rsf, tid);
             cyc_barrier(vbst, ++kb);
-            if (blockIdx.x < VR) c_norm(&VROW(Av.tab, blockIdx.x, ai)->nb.j[0], Av.eps, tid);
+            if (blockIdx.x < nr) c_norm(&VROW(Av.tab, blockIdx.x, ai)->nb.j[0], Av.eps, tid);
             cyc_barrier(vbst, ++kb);
         }
         // ---- the experts: the router, the pick, gate | up + SITU, the down sum
         for (int ex = blockIdx.x * 8 + wave; ex < NE; ex += 8 * nb) v_router(Av.FN, e0->gin, e0->pb, Av.H, rs, ex, lane);
         cyc_barrier(vbst, ++kb);
-        v_pick_w(Av.H, rsf, Av.route_scale, sids, swts, tid);
-        if (b0 && tid < VR * NE_USED) {
+        v_pick_w(Av.H, rsf, Av.route_scale, sids, swts, tid, nr);
+        if (b0 && tid < VR * NE_USED && tid / NE_USED < nr) {
             const int r = tid / NE_USED, k = tid % NE_USED;
             ((int *) ((char *) Av.IDS + (size_t) r * rs))[k] = sids[tid];
             ((float *) ((char *) Av.WTS + (size_t) r * rs))[k] = swts[tid];
         }
-        v_distinct(sids, dd, tid);
-        v_up_dd(e0->guv, e0->gus, sids, dd, Av.aq3, Av.as3, Av.beta, Av.lb, Av.hq, Av.hs, tid, rs, rsf);
+        v_distinct(sids, dd, tid, nr);
+        v_up_dd(e0->guv, e0->gus, sids, dd, Av.aq3, Av.as3, Av.beta, Av.lb, Av.hq, Av.hs, tid, rs, rsf, nr);
         cyc_barrier(vbst, ++kb);
         ++xs;
         v_down_dd(e0->dnv, e0->dns, sids, swts, dd, Av.hq, Av.hs, Av.PART1, Av.xin_peer + 2 * D + (size_t) (xs & 1) * VR * D,
-                  tid, rs, rsf, cyc_lds);
+                  tid, rs, rsf, cyc_lds, nr);
         __threadfence_system();
         cyc_barrier(vbst, ++kb);
     }
     const int wave = tid_k >> 6, lane = tid_k & 63;
-    // the last ffn sum and conv, with the window, one block per row
-    if (blockIdx.x < VR) {
+    // the last ffn sum and conv, with the window, one block per active row
+    if (blockIdx.x < nr) {
         const int r = blockIdx.x;
         CK appk * ep = (CK appk *) Vp->A.tab + (size_t) r * napp + (napp - 1);
         cyc_xwait(Vp->A, xs);
@@ -1071,7 +1084,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         if (blockIdx.x == 0 && tid_k == 0) *Vp->A.xseq = xs;
     }
     if (head) {
-        if (blockIdx.x < VR) {          // the head mix and norm of row r, its normed input to the drafter
+        if (blockIdx.x < nr) {          // the head mix and norm of row r, its normed input to the drafter
             const int r = blockIdx.x;
             __syncthreads();
             sptrs S;
