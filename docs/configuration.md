@@ -32,6 +32,7 @@ Every flag and environment variable, with its default.
 | Variable | Default | Effect |
 |---|---|---|
 | `QZ_DEVICES` | `0,1` | The two cards to use, as HIP ordinals. On a machine with other GPUs the server first hides the non-gfx906 cards, so ordinals count gfx906 cards only |
+| `QZ_LINK` | `auto` | How the two cards reach each other: `auto` takes a peer pair when there is one and pinned host memory otherwise; `p2p` refuses unless the pair has peer access; `host` forces host memory and never enables peer access. Same kernels and same greedy output either way, slower over host memory |
 | `QZ_NO_PREFLIGHT` | unset | Load even when the memory check says the context does not fit |
 | `QZ_TRACE` | unset | Directory for one JSON file per request, read with `quartz/server/quartz_trace.py` |
 | `QZ_NO_SWITCH` | unset | `1` keeps the drafter for the whole answer. By default, with `--dspine`, Qwen switches between DSpine and MTP on acceptance, and Inkling between DSpark rounds and single steps on measured speed |
@@ -39,11 +40,13 @@ Every flag and environment variable, with its default.
 | `QZ_SW_LO`, `QZ_SW_WIN` | Inkling: `2.7`, `16` | DSpark rounds are timed over `win` tokens against the single step. Before the single step has been timed, decode leaves the rounds below `lo` tokens per round |
 | `QZ_DS_ROWS` | unset | Inkling: `2`..`8` fixes the DSpark round's rows, the anchor and its drafts. Unset, each round picks its width from the recent acceptance and the measured round times |
 | `QZ_IMG_MIN_TOKENS`, `QZ_IMG_MAX_TOKENS` | `8`, `4096` | Fewest and most tokens an image resizes to; each token takes a context row. Inkling reads only the maximum |
-| `QZ_START_RETRIES` | `3` | Start attempts when the server crashes or hangs before it is ready; `0` runs without the supervisor |
+| `QZ_START_RETRIES` | `3` | Start attempts when the server crashes or hangs before it is ready; `0` runs without the supervisor. A peer check that hangs is its own case: one restart with `QZ_LINK=host`, in the default mode only |
 | `QZ_START_TIMEOUT` | `180` | Seconds to wait for each start attempt |
 
 The server sets `QZ_DSPINE` and `QZ_MMPROJ` from `--dspine` and `--mmproj`, and
-`HSA_FORCE_FINE_GRAIN_PCIE=1` and `GPU_MAX_HW_QUEUES=8` unless they are set.
+`HSA_FORCE_FINE_GRAIN_PCIE=1` and `GPU_MAX_HW_QUEUES=8` unless they are set. The
+host link does not depend on them (its mailboxes ask for coherent pinned memory
+themselves); they are kept for the peer link.
 
 ## Log
 

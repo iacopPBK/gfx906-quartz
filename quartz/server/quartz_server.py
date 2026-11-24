@@ -334,6 +334,82 @@ def log(msg):
     sys.stderr.flush()
 
 
+# The engine names the link it runs on in one line as it starts: peer access, or pinned
+# host memory when the cards have no peer pair. The start-up summary repeats it.
+LINK_LINES = (("quartz: peer link ok:", "p2p"),
+              ("quartz: link host (no P2P):", "host (no P2P)"))
+PEER_HANG = ("quartz: peer check:", "did not finish")   # the engine giving up on the peer link
+READY_HANG = b"h"        # what the child says when its peer check hung: a second start may work
+
+
+class StartUp:
+    """What the engine says about the link while it starts.
+
+    libquartz writes those lines from C, so this process only reads them as bytes:
+    watch_start() puts a pipe in front of stderr for the start. A peer check that hangs is
+    kept apart from the rest because it is the one start-up failure a second process can
+    survive: the stuck kernel dies with this one."""
+
+    def __init__(self):
+        self.link = None        # "p2p" or "host (no P2P)", as the engine reported it
+        self.hang = False       # the peer check gave up: its kernel may still be stuck
+
+    def feed(self, line):
+        for head, mode in LINK_LINES:
+            if line.startswith(head):
+                self.link = mode
+        if all(s in line for s in PEER_HANG):
+            self.hang = True
+
+
+def watch_start(seen):
+    """Read this process's stderr from here on and give every line to `seen`.
+
+    Nothing is held back: each line is written through as it arrives, so the log looks
+    the same as without this. Returns the function that puts the real stderr back."""
+    real = os.dup(2)
+    rd, wr = os.pipe()
+    os.dup2(wr, 2)
+    os.close(wr)
+
+    def pump():
+        buf = b""
+        while True:
+            chunk = os.read(rd, 65536)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                os.write(real, line + b"\n")
+                seen.feed(line.decode("utf-8", "replace"))
+        if buf:                                  # a last line that ends without a newline
+            os.write(real, buf)
+            seen.feed(buf.decode("utf-8", "replace"))
+    th = threading.Thread(target=pump, daemon=True)
+    th.start()
+
+    def stop():
+        sys.stderr.flush()                       # Python's own buffer, then no writer is left
+        os.dup2(real, 2)
+        th.join()                                # reads what is left in the pipe, then EOF
+        os.close(real)
+    return stop
+
+
+def tell_supervisor(byte):
+    """One byte on the pipe the supervisor waits with: `1` ready, `h` the peer check hung.
+    Nothing at all when the supervisor did not start this process (QZ_START_RETRIES=0)."""
+    fd = os.environ.get("QZ_CHILD_READY_FD")
+    if not fd:
+        return
+    try:
+        os.write(int(fd), byte)
+        os.close(int(fd))
+    except OSError:
+        pass
+
+
 _ESC = "\ue000"
 _SPECIAL_RE = re.compile(r"(<\|[^<>|\s]+\|>)")
 
@@ -727,30 +803,46 @@ def preflight(args):
         probe.close()
 
 
+def link_fallback(link, hung, tried_host):
+    """Whether a start that hit a hanging peer check is redone with QZ_LINK=host.
+
+    Only in the default mode: QZ_LINK=p2p asked for the peer link, so its hang stays an
+    error. `tried_host` caps the fallback at one start, and the host check reports a hang
+    of its own (`link check: ... did not finish`), so a host start never asks for another."""
+    return bool(hung) and not tried_host and link in (None, "", "auto")
+
+
 def supervise(args):
     """Run the server as a child and restart it when its start crashes or hangs, as
     HIP initialisation occasionally does. Errors the child reports itself, such as
-    a refused model, are not retried. QZ_START_RETRIES (default 3) caps the
-    attempts, QZ_START_TIMEOUT (default 180 s) the wait for ready."""
+    a refused model, are not retried, with one exception: a peer check that hangs leaves
+    its kernel stuck on the cards, so in the default link mode the start is redone once
+    with QZ_LINK=host. QZ_START_RETRIES (default 3) caps the attempts, QZ_START_TIMEOUT
+    (default 180 s) the wait for ready."""
     tries = max(1, int(os.environ.get("QZ_START_RETRIES", "3")))
     wait = float(os.environ.get("QZ_START_TIMEOUT", "180"))
     stop = []
+    host = False                           # a start has been asked for the host link
+    crashes = 0
 
     def on_signal(n, _frame):
         stop.append(n)                    # asked to quit: no restart
         if child.poll() is None:
             child.send_signal(n)
-    for attempt in range(1, tries + 1):
+    while True:
         rd, wr = os.pipe()
         env = dict(os.environ, QZ_CHILD_READY_FD=str(wr))
+        if host:
+            env["QZ_LINK"] = "host"
         child = subprocess.Popen([sys.executable, os.path.abspath(__file__)] + sys.argv[1:], env=env, pass_fds=(wr,))
         os.close(wr)
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, on_signal)
-        ready = timed_out = False
+        ready = timed_out = hang = False
         try:
             if select.select([rd], [], [], wait)[0]:
-                ready = os.read(rd, 1) == b"1"    # EOF instead: the child died
+                said = os.read(rd, 1)               # EOF instead: the child died
+                ready, hang = said == b"1", said == READY_HANG
             else:
                 timed_out = True
         except InterruptedError:
@@ -762,13 +854,21 @@ def supervise(args):
             log("start: no ready after %.0f s, killing it" % wait)
             child.kill()
         rc = child.wait()
-        if stop or rc >= 0:               # asked to quit, or the child reported its own error: no retry
-            sys.exit(rc)
-        if attempt < tries:
-            log("start: the server died on signal %d before ready (HIP init fault?), retrying (%d/%d)" % (-rc, attempt + 1, tries))
+        if stop:
+            sys.exit(rc)                            # asked to quit: no restart
+        if rc >= 0 and link_fallback(os.environ.get("QZ_LINK"), hang, host):
+            log("start: the peer check hung, so the peer link cannot be used: restarting once "
+                "with QZ_LINK=host, the exchange over pinned host memory")
+            host = True
+            continue                                # a fresh process: the stuck kernel went with the old one
+        if rc >= 0:
+            sys.exit(rc)                            # the child reported its own error: no retry
+        crashes += 1
+        if crashes < tries:
+            log("start: the server died on signal %d before ready (HIP init fault?), retrying (%d/%d)" % (-rc, crashes + 1, tries))
         else:
             log("start: failed %d times, giving up" % tries)
-    sys.exit(1)
+            sys.exit(1)
 
 
 def main():
@@ -799,8 +899,10 @@ def main():
         os.environ["QZ_DSPINE"] = args.dspine
     if args.mmproj:                          # read by qz_create's memory check
         os.environ["QZ_MMPROJ"] = args.mmproj
-    # read by the HIP runtime at libquartz's first device touch: P2P over PCIe needs
-    # fine-grained PCIe memory
+    # read by the HIP runtime at libquartz's first device touch: with P2P the uncached
+    # mailboxes need fine-grained PCIe memory. Host mode asks for that per allocation
+    # (hipHostMallocCoherent, core/link.h) and does not need this set, so it stays for the
+    # P2P path.
     os.environ.setdefault("HSA_FORCE_FINE_GRAIN_PCIE", "1")
     os.environ.setdefault("GPU_MAX_HW_QUEUES", "8")
     preflight(args)
@@ -808,24 +910,28 @@ def main():
         supervise(args)
     select_devices()
     t0 = time.time()
+    start = StartUp()
+    stop_watch = watch_start(start)          # the engine's own start-up lines, read here
     try:
         Handler.eng = Engine(args.lib, args.model, args.max_ctx, args.slot_t, args.slack)
     except RuntimeError as e:
         log("error: %s (the lines above say why; usual causes: the target has no MTP block, "
             "the cards are not two gfx906 with 32 GB free, or --max-ctx is too large)" % e)
+        if start.hang:
+            tell_supervisor(READY_HANG)      # the supervisor may start again over host memory
         sys.exit(1)
+    finally:
+        stop_watch()
     if args.mmproj:
         Handler.eng.attach_vision(args.mmproj)
     Handler.args = args
     Handler.model_id = model_id(Handler.eng)
-    log("ready in %.1f s | ctx %d | %s%s | %s:%d%s" % (
+    log("ready in %.1f s | ctx %d | %s%s%s | %s:%d%s" % (
         time.time() - t0, Handler.eng.max_ctx, Handler.eng.drafter_name(bool(args.dspine)), " + vision" if args.mmproj else "",
+        " | link " + start.link if start.link else "",
         args.host, args.port, " | trace " + TRACE if TRACE else ""))
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
-    fd = os.environ.get("QZ_CHILD_READY_FD")
-    if fd:
-        os.write(int(fd), b"1")           # the supervisor stops waiting
-        os.close(int(fd))
+    tell_supervisor(b"1")                    # the supervisor stops waiting
     httpd.serve_forever()
 
 

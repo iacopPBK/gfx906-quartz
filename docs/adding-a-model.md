@@ -20,10 +20,10 @@ directory and a few table entries and leaves the others alone.
 | `quartz/capi.h`, `quartz/capi.cpp` | The C API. `qz_create` reads `general.architecture` and calls the arch's create function from `qz_archs[]` | one table entry |
 | `quartz/arch.h` | `qz_ctx`, the interface an arch implements, and `qz_create_opts` | one create declaration |
 | `quartz/arch/<arch>/` | The arch: engine, kernels, prefill, TP split, drafter, memory check, `qz_ctx` subclass | the arch only |
-| `quartz/core/` | Host code with no arch knowledge: `devices.h` (pair selection), `cards.h` (peer access, P2P inboxes, residency check), `sampler.h` (host sampling), `prefix_cache.h` (snapshot slots, chunked prefill driver) | — |
+| `quartz/core/` | Host code with no arch knowledge: `devices.h` (pair selection), `cards.h` (peer access, exchange buffers, residency check), `link.h` (the two link modes), `sampler.h` (host sampling), `prefix_cache.h` (snapshot slots, chunked prefill driver) | — |
 | `quartz/kernels/` | Device building blocks templated on the arch's widths: `dev.h` (address hints, int8 dot, DPP, wave sums, Q8 rounding), `gemv.h`, `xchg.h` (inbox exchange), `pf_gemm.h` (prefill GEMM and quant), `topk.h` | — |
 | `quartz/loader.{h,cpp}`, `quartz/gguf.h`, `quartz/gguf_lite.h`, `quartz/repack.h` | GGUF reading and the Q8_0 repack; the arch supplies the TP slice callback | — |
-| `quartz/mem.h`, `quartz/preflight.h` | Per-card memory ledger; the peer-link check before the load | — |
+| `quartz/mem.h`, `quartz/preflight.h` | Per-card memory ledger; the link check before the load | — |
 | `quartz/tokapi.cpp` | Byte-level BPE. `TOK_PRES[]` maps `tokenizer.ggml.pre` to its regexes | one row per new pre-tokenizer |
 | `quartz/vision/` | Image encoders, one namespace per `clip.projector_type`; `common.h` and `resize.h` are shared | one encoder per projector |
 | `quartz/server/quartz_server.py` | The OpenAI server, arch-neutral | — |

@@ -16,6 +16,13 @@ each card holds half the attention heads, half the FFN rows and half the
 vocabulary head. After each layer the cards write their partial results
 straight into each other's memory over PCIe. `core/devices.h` picks the pair.
 
+Without peer access (`QZ_LINK=host`, or `auto` on a pair that has none) the
+mailboxes the cards hand each other — the exchange buffers, DSpine's verify
+slots, DSpark's handshake — live in pinned host memory instead, and bulk copies
+are staged through it (`core/link.h`). Both cards reach a mailbox through the
+same pointer, so the exchange kernels run unchanged: same arithmetic, same
+greedy output, and the extra cost is the PCIe trip.
+
 ### A request
 
 1. **Template.** The server renders the chat with the template from the GGUF
@@ -51,9 +58,9 @@ mid-answer (`arch/qwen35/qwen35_model.cpp`). Image prompts decode on MTP.
 ### Memory
 
 Before the load, quartz checks that the context fits on both cards and that the
-peer link works (`arch/qwen35/qwen35_preflight.h`, `preflight.h`). After it, it
-prints a per-card ledger of what it allocated (`mem.h`). Numbers are in
-[requirements](requirements.md#memory).
+link between them carries the exchange (`arch/qwen35/qwen35_preflight.h`,
+`preflight.h`). After it, it prints a per-card ledger of what it allocated
+(`mem.h`). Numbers are in [requirements](requirements.md#memory).
 
 ## Inkling-2-Mini
 

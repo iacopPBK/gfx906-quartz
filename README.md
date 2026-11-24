@@ -21,7 +21,8 @@
 
 quartz is a small inference engine for **two-cards** gfx906 (MI50/MI60 32 GB) systems.<br>
 It runs a short list of models as **Q8_0** GGUF files only (other quantisations are refused).<br>
-It needs **exactly two cards with P2P** between them: no single-card or 4-card mode.
+It needs **exactly two cards**: no single-card or 4-card mode. PCIe peer access (P2P)
+between them is recommended; without it they exchange through host memory and it is slower.
 
 </div>
 
@@ -87,7 +88,9 @@ The forward pass quartz implements is in [docs/inkling2.md](docs/inkling2.md).
 
 ### Requirements
 
-- Two AMD MI50/MI60 32 GB cards with PCIe peer access, and ROCm
+- Two AMD MI50/MI60 32 GB cards, and ROCm. PCIe peer access (P2P) between them is
+  recommended: without it quartz runs through pinned host memory, about 10-25 % slower
+  on prefill and 5-10 % on decode
 - A C++17 compiler, Python 3 with `jinja2`
 - The target model GGUF; optionally the draft and the vision projector
 

@@ -8,7 +8,7 @@ commands are in the [README](../README.md), flags and environment variables in
 
 | | Item | Needed for |
 |---|---|---|
-| GPU | exactly 2× AMD MI50/MI60 (gfx906) 32 GB with PCIe peer access | all |
+| GPU | exactly 2× AMD MI50/MI60 (gfx906) 32 GB; PCIe peer access recommended | all |
 | Toolchain | ROCm (`hipcc`, HIP runtime, rocBLAS), a C++17 compiler | build, run |
 | Model (`--model`) | Qwen3.8-27B or a fine-tune as Q8_0 GGUF with the nextn (MTP) block, ~28 GB; or Inkling-2-Mini as Q8_0 GGUF, ~28 GB | all |
 | Drafter (`--dspine`) | Qwen: DSpine draft GGUF, ~2.1 GB. Inkling: DSpark draft GGUF, ~0.4 GB | speculative decode |
@@ -17,14 +17,21 @@ commands are in the [README](../README.md), flags and environment variables in
 
 ## Hardware
 
-- **Two gfx906 cards, 32 GB each, with peer access between them.** Every layer
-  is split across the pair and the cards write into each other's memory, so
-  there is no single-card mode, no mode for more cards and no fallback without
-  P2P. With more than two cards visible, quartz uses one pair (`QZ_DEVICES`).
+- **Two gfx906 cards, 32 GB each.** Every layer is split across the pair and the
+  cards write into each other's memory, so there is no single-card mode and no
+  mode for more cards. With more than two cards visible, quartz uses one pair
+  (`QZ_DEVICES`).
+- **P2P is recommended, not required.** With peer access the cards write into
+  each other's VRAM. Without it they exchange through pinned host memory, at the
+  same addresses, with the same arithmetic and the same greedy output, only
+  slower: prefill about 10-25 % and decode 5-10 %. `QZ_LINK=auto` (the default)
+  takes a peer pair when there is one and host memory otherwise; `p2p` and
+  `host` force a mode ([configuration](configuration.md)).
 - **gfx906 only.** The kernels use gfx906 instructions and need every block of
   a 60-block grid resident at once; the load fails on a card where they do not fit.
 - **P2P setup.** The server sets `HSA_FORCE_FINE_GRAIN_PCIE=1` and
-  `GPU_MAX_HW_QUEUES=8` unless already set. Without peer access, see
+  `GPU_MAX_HW_QUEUES=8` unless already set; the host link does not need either.
+  If you expect peer access and the start says `link host (no P2P)`, see
   [Troubleshooting](troubleshooting.md#cards).
 
 ## Memory
@@ -45,6 +52,10 @@ cards; its context cache adds 6 KB per token (1.6 GB at 262144). At the
 default context: 20.6 GB per card, with DSpark 22.4 GB on card 0 and 22.2 GB on
 card 1. The vision encoder adds up to 1.8 GB on card 0. The prefix cache takes
 about 0.1 GB of pinned host RAM.
+
+Without P2P none of the above changes, but the exchange takes a stretch of
+pinned host RAM: a few tens of MB in decode, and up to about 0.25 GB while
+prefill runs (the bulk copies are staged through it).
 
 ## Build
 
