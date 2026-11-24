@@ -442,15 +442,42 @@ static __global__ __launch_bounds__(256) void k_ds_markov(const float * joint, f
         if (k == 0) ds_flag(fl, seq);
     }
 }
+// ---- sampled drafts: an exact draw from q = softmax(s * invTq) by Gumbel-max. z = s * invTq
+// + G with G = -log(-log(u)), u in (0, 1) from a counter-based hash of the request's seed,
+// the round counter, the draft row and the global vocab id. Both cards hash the same key
+// for their own ids, so no exchange is needed and a fixed seed repeats a run exactly.
+// u takes 23 hash bits + 0.5 over 2^23, i.e. u in [2^-24, 1 - 2^-24]: 24 bits cannot be
+// mapped this way in f32, where (2^24 - 1) + 0.5 rounds to 2^24 and u = 1 would make G
+// +inf, pinning the draft to whatever id hit that value (~1.2% of the rows here). The
+// grid truncates the Gumbel tails at [-2.81, 16.66], which costs q at most ~exp(-17) of
+// its mass per entry.
+__device__ __forceinline__ unsigned int ds_fmix(unsigned int x) {           // murmur3's finalizer
+    x ^= x >> 16; x *= 0x85ebca6bu; x ^= x >> 13; x *= 0xc2b2ae35u; x ^= x >> 16;
+    return x;
+}
+__device__ __forceinline__ float ds_gumbel(unsigned int seed, unsigned int rnd, unsigned int row, unsigned int id) {
+    unsigned int h = ds_fmix(seed ^ 0x9e3779b9u);
+    h = ds_fmix(h ^ rnd); h = ds_fmix(h ^ row); h = ds_fmix(h ^ id);
+    const float u = ((float) (h >> 9) + 0.5f) * (1.f / 8388608.f);          // exact in f32, in (0, 1)
+    return -logf(-logf(u));
+}
+// one draft row's sampler state: q = softmax(logit * invTq) and the (max, sumexp) block
+// partials of that row's logsumexp go to part (null: no logsumexp)
+struct dsamp { float invTq; unsigned int seed, rnd; float * part; float cap; };   // cap > 0: the target's logit softcap on q's logits
+constexpr int DS_LSEB = 128;                   // logsumexp partials per card per row (>= grid)
+constexpr int DS_QID = QZ_TOPK + 1;            // a row's candidate ids: the draft, then the top-K
 // draft row logits over this card's head rows: base + fold . lat1, then the argmax into
 // best as a packed (orderable value, ~id) max, so ties keep the lower id. WT waits for lat1
 // first, on card 1. fold rows are nhp halves apart and 128-byte aligned, walked in j order,
-// DS_FE consecutive entries per thread with 8-byte loads.
+// DS_FE consecutive entries per thread with 8-byte loads. With SMP the packed value is the
+// Gumbel-max's z instead of the logit, so the same argmax draws the draft from q, and each
+// block also leaves its (max, sumexp) of logit * invTq for the row's logsumexp.
 constexpr int DS_FE = 4;
-template <bool WT>
+template <bool WT, bool SMP>
 static __global__ __launch_bounds__(256) void k_ds_fold_argmax(const float * base, const __half * fold, int nhp, int nvalid,
                                                                const float * lat1, int id0, unsigned long long * best,
-                                                               unsigned int * fl, unsigned int seq, int * err) {
+                                                               unsigned int * fl, unsigned int seq, int * err,
+                                                               dsamp sa, unsigned int grow) {
     __shared__ float sl[DS_R + 1];
     if (WT) {
         if (threadIdx.x == 0) ds_wait(fl, seq, err);
@@ -460,9 +487,11 @@ static __global__ __launch_bounds__(256) void k_ds_fold_argmax(const float * bas
     __syncthreads();
     const int v0 = (blockIdx.x * 256 + threadIdx.x) * DS_FE;
     unsigned long long key = 0;
+    float s[DS_FE];
+    #pragma unroll
+    for (int e = 0; e < DS_FE; e++) s[e] = 0.f;
     if (v0 < nvalid) {
         const __half * p = fold + v0;
-        float s[DS_FE];
         #pragma unroll
         for (int e = 0; e < DS_FE; e++) s[e] = v0 + e < nvalid ? base[v0 + e] : 0.f;
         #pragma unroll 8
@@ -476,10 +505,15 @@ static __global__ __launch_bounds__(256) void k_ds_fold_argmax(const float * bas
             s[3] += lj * __high2float(h23);
             p += nhp;
         }
+        if (SMP && sa.cap > 0.f)                   // q's logits through the target's softcap, as p's are
+            #pragma unroll
+            for (int e = 0; e < DS_FE; e++) s[e] = sa.cap * tanhf(s[e] / sa.cap);
         #pragma unroll
         for (int e = 0; e < DS_FE; e++)
             if (v0 + e < nvalid) {
-                unsigned int u = __float_as_uint(s[e]);
+                float v = s[e];
+                if (SMP) v = v * sa.invTq + ds_gumbel(sa.seed, sa.rnd, grow, (unsigned int) (id0 + v0 + e));
+                unsigned int u = __float_as_uint(v);
                 u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
                 const unsigned long long k = ((unsigned long long) u << 32) | (unsigned int) ~(unsigned int) (id0 + v0 + e);
                 key = k > key ? k : key;
@@ -489,12 +523,57 @@ static __global__ __launch_bounds__(256) void k_ds_fold_argmax(const float * bas
     for (int off = 32; off > 0; off >>= 1) { const unsigned long long o = __shfl_xor(key, off, 64); key = o > key ? o : key; }
     __shared__ unsigned long long sb[4];
     if ((threadIdx.x & 63) == 0) sb[threadIdx.x >> 6] = key;
+    if (SMP) {                                     // this block's (max, sumexp) of logit * invTq
+        __shared__ float sm[4], ss[4];
+        float m = -INFINITY;
+        for (int e = 0; e < DS_FE; e++) if (v0 + e < nvalid) m = fmaxf(m, s[e] * sa.invTq);
+        for (int off = 32; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor(m, off, 64));
+        float l = 0.f;
+        for (int e = 0; e < DS_FE; e++) if (v0 + e < nvalid) l += expf(s[e] * sa.invTq - m);
+        for (int off = 32; off > 0; off >>= 1) l += __shfl_xor(l, off, 64);
+        if ((threadIdx.x & 63) == 0) { sm[threadIdx.x >> 6] = m; ss[threadIdx.x >> 6] = l; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float bm = sm[0], bl = 0.f;
+            for (int i = 1; i < 4; i++) bm = fmaxf(bm, sm[i]);
+            for (int i = 0; i < 4; i++) bl += ss[i] * expf(sm[i] - bm);
+            sa.part[2 * blockIdx.x] = bm;
+            sa.part[2 * blockIdx.x + 1] = bl;
+        }
+    }
     __syncthreads();
     if (threadIdx.x == 0) {
         unsigned long long b = sb[0];
         for (int i = 1; i < 4; i++) b = sb[i] > b ? sb[i] : b;
         atomicMax(best, b);
     }
+}
+// one draft row's logsumexp from its fold blocks' (max, sum) partials: out[2 r] = max,
+// out[2 r + 1] = sum of exp(logit * invTq - max). The host adds the two cards' rows.
+static __global__ __launch_bounds__(64) void k_ds_lse_merge(const float * part, int nblk, float * out) {
+    if (threadIdx.x) return;
+    const float * p = part + (size_t) blockIdx.x * DS_LSEB * 2;
+    float m = -INFINITY;
+    for (int b = 0; b < nblk; b++) m = fmaxf(m, p[2 * b]);
+    float s = 0.f;
+    for (int b = 0; b < nblk; b++) s += p[2 * b + 1] * expf(p[2 * b] - m);
+    out[2 * blockIdx.x] = m;
+    out[2 * blockIdx.x + 1] = s;
+}
+// The drafter's logit of one candidate id per block: row r of the draft logits is
+// base[r] + fold . lat1[r], so this walks the id's fold column. Ids this card does not own
+// (id - id0 out of range, -1 for padding) are skipped; the host reads the owner's buffer.
+static __global__ __launch_bounds__(64) void k_ds_qids(const float * base, int N, const __half * fold, int nhp, int nvalid,
+                                                      int id0, const int * ids, const float * lat1, float * out) {
+    const int r = blockIdx.y, v = ids[(size_t) r * gridDim.x + blockIdx.x] - id0;
+    if (v < 0 || v >= nvalid) return;
+    const __half * p = fold + v;
+    const float * lr = lat1 + (size_t) r * (DS_R + 1);
+    float acc = 0.f;
+    for (int j = threadIdx.x; j <= DS_R; j += 64) acc += lr[j] * __half2float(p[(size_t) j * nhp]);
+    #pragma unroll
+    for (int off = 32; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 64);
+    if (threadIdx.x == 0) out[(size_t) r * gridDim.x + blockIdx.x] = base[(size_t) r * N + v] + acc;
 }
 // card 1: hand this step's argmax to card 0 by a peer store and a flag, then free the slot
 static __global__ __launch_bounds__(64) void k_ds_best_push(unsigned long long * best, unsigned long long * xbest_peer,
@@ -583,6 +662,16 @@ struct ink2_dspark {
     unsigned int * fl[2] = {};                 // the peer's handshake flag (uncached)
     int * out_d = nullptr, * out_h = nullptr;  // the 7 tokens + the chain's error word
     unsigned int seq = 0;                      // the chain's step counter (monotone)
+    // Sampled rounds: each draft row's (max, sumexp) partials and merged logsumexp, the
+    // target's candidate ids to evaluate, and their drafter logits.
+    float * lses[2] = {};                      // device: [DS_BS][DS_LSEB][2] fold block partials
+    float * lsem[2] = {};                      // device: [DS_BS][2] merged per row, per card
+    float * lseh[2] = {};                      // pinned: [DS_BS][2]
+    int * qid_d[2] = {};                       // device: [DS_BS][DS_QID] candidate ids
+    int * qid_h = nullptr;                     // pinned: the same
+    float * qs_d[2] = {};                      // device: [DS_BS][DS_QID] drafter logits
+    float * qs_h[2] = {};                      // pinned: the same
+    unsigned int rnd = 0;                      // the request's round counter (Gumbel key)
 
     long rounds = 0, accepted = 0;
     static qw Q8(const qz_loader & l, const char * n, int K, int N) {
@@ -675,8 +764,9 @@ struct ink2_dspark {
             const qw & H = E->C[c].head;
             nhp[c] = (H.N + 63) & ~63;             // 128-byte aligned fold rows
             al(&hq[c], DS_BS * D); al(&hs[c], DS_BS * D / 32); al(&base[c], (size_t) DS_BS * H.N);
-            // lat1 comes over P2P from the peer's Markov step, so it is allocated uncached
-            ICHECK(qz_dmalloc_uncached((void **) &lat1[c], (DS_R + 1) * sizeof(float), "dspark"));
+            // lat1 comes over P2P from the peer's Markov step, so it is allocated uncached.
+            // One slot per draft row: the candidate logits are evaluated after the chain.
+            ICHECK(qz_dmalloc_uncached((void **) &lat1[c], (size_t) DS_BS * (DS_R + 1) * sizeof(float), "dspark"));
             al(&fold[c], (size_t) (DS_R + 1) * nhp[c]);
             ICHECK(qz_dmalloc((void **) &best[c], 8, "dspark"));
             ICHECK(hipMemset(best[c], 0, 8));
@@ -684,6 +774,13 @@ struct ink2_dspark {
             ICHECK(qz_dmalloc_uncached((void **) &fl[c], 4, "dspark"));
             ICHECK(hipMemset(xbest[c], 0, 8));
             ICHECK(hipMemset(fl[c], 0, 4));
+            al(&lses[c], (size_t) DS_BS * DS_LSEB * 2);
+            al(&lsem[c], DS_BS * 2);
+            ICHECK(hipHostMalloc((void **) &lseh[c], DS_BS * 2 * sizeof(float), 0));
+            ICHECK(qz_dmalloc((void **) &qid_d[c], DS_BS * DS_QID * sizeof(int), "dspark"));
+            ICHECK(qz_dmalloc((void **) &qs_d[c], DS_BS * DS_QID * sizeof(float), "dspark"));
+            ICHECK(hipHostMalloc((void **) &qs_h[c], DS_BS * DS_QID * sizeof(float), 0));
+            if (c == 1) ICHECK(hipHostMalloc((void **) &qid_h, DS_BS * DS_QID * sizeof(int), 0));
             // fold = head . [hidden_out | bias], built here 8 columns per GEMV
             float * rows = nullptr, * y = nullptr;
             ICHECK(hipMalloc(&rows, 8 * D * 4)); ICHECK(hipMalloc(&y, (size_t) 8 * H.N * 4));
@@ -771,8 +868,11 @@ struct ink2_dspark {
         });
         ICHECK(hipSetDevice(qz_dev_of(0)));
     }
-    // the 7 greedy drafts after anchor tok at position a, context rows 0 .. a - 1 filled
-    void draft(int tok, int a, int * out) {
+    // The 7 drafts after anchor tok at position a, context rows 0 .. a - 1 filled. With sa
+    // each draft is drawn from q = softmax(logit * invTq) by Gumbel-max, keyed on the
+    // request's seed and this round's counter; without it the chain is the greedy argmax,
+    // bit for bit as before.
+    void draft(int tok, int a, int * out, const dsamp * sa) {
         each([&](int c, card & k, hipStream_t st) {
             const ink2_card & T = E->C[c];
             k_ds_embed<<<DS_BS, 256, 0, st>>>(T.embd.v, T.embd.s, tok, T.embd_norm, E->hp.eps, k.X, k.mask);
@@ -818,21 +918,46 @@ struct ink2_dspark {
         hipStream_t st = E->C[0].st;
         const float * hid = K[0].hid;
         ICHECK(hipMemsetAsync(state, 0, DS_R * 4, st));
-        // the 7 Markov steps, each chained to the peer through lat1 and the argmax push
+        // the 7 Markov steps, each chained to the peer through lat1 and the argmax push.
+        // With sa the packed value is the Gumbel-max's z, so the drafts are drawn from q.
+        const int nb[2] = { (E->C[0].nvalid + 256 * DS_FE - 1) / (256 * DS_FE),
+                            (E->C[1].nvalid + 256 * DS_FE - 1) / (256 * DS_FE) };
         for (int i = 1; i < DS_BS; i++) {
             const unsigned int sq = ++seq;
-            k_ds_joint<<<3 * DS_R / 8, 512, 0, st>>>(jw, jb, state, w1, i, tok, hid + (size_t) (i - 1) * D, g, joint, best[0], xbest[0],
+            const int r = i - 1;
+            dsamp s0 = { 0.f, 0, 0, nullptr, 0.f }, s1 = { 0.f, 0, 0, nullptr, 0.f };
+            if (sa) {
+                s0 = { sa->invTq, sa->seed, sa->rnd, lses[0] + (size_t) r * DS_LSEB * 2, sa->cap };
+                s1 = { sa->invTq, sa->seed, sa->rnd, lses[1] + (size_t) r * DS_LSEB * 2, sa->cap };
+            }
+            k_ds_joint<<<3 * DS_R / 8, 512, 0, st>>>(jw, jb, state, w1, i, tok, hid + (size_t) r * D, g, joint, best[0], xbest[0],
                                                      fl[0], sq - 1, out_d + 7, out_d);
-            k_ds_markov<<<1, 256, 0, st>>>(joint, state, lat1[0], lat1[1], best[0], xbest[0], fl[1], sq);
-            k_ds_fold_argmax<false><<<(E->C[0].nvalid + 256 * DS_FE - 1) / (256 * DS_FE), 256, 0, st>>>(base[0] + (size_t) (i - 1) * E->C[0].head.N,
-                                                                                 fold[0], nhp[0], E->C[0].nvalid, lat1[0],
-                                                                                 E->C[0].id0, best[0], fl[0], sq, out_d + 7);
+            k_ds_markov<<<1, 256, 0, st>>>(joint, state, lat1[0] + (size_t) r * (DS_R + 1), lat1[1] + (size_t) r * (DS_R + 1),
+                                           best[0], xbest[0], fl[1], sq);
+            const float * L0 = lat1[0] + (size_t) r * (DS_R + 1), * L1 = lat1[1] + (size_t) r * (DS_R + 1);
+            const float * B0 = base[0] + (size_t) r * E->C[0].head.N, * B1 = base[1] + (size_t) r * E->C[1].head.N;
+            if (sa)
+                k_ds_fold_argmax<false, true><<<nb[0], 256, 0, st>>>(B0, fold[0], nhp[0], E->C[0].nvalid, L0,
+                                                                     E->C[0].id0, best[0], fl[0], sq, out_d + 7, s0, (unsigned int) r);
+            else
+                k_ds_fold_argmax<false, false><<<nb[0], 256, 0, st>>>(B0, fold[0], nhp[0], E->C[0].nvalid, L0,
+                                                                      E->C[0].id0, best[0], fl[0], sq, out_d + 7, s0, 0u);
             ICHECK(hipSetDevice(qz_dev_of(1)));
-            hipStream_t s1 = E->C[1].st;
-            k_ds_fold_argmax<true><<<(E->C[1].nvalid + 256 * DS_FE - 1) / (256 * DS_FE), 256, 0, s1>>>(base[1] + (size_t) (i - 1) * E->C[1].head.N,
-                                                                                fold[1], nhp[1], E->C[1].nvalid, lat1[1],
-                                                                                E->C[1].id0, best[1], fl[1], sq, out_d + 7);
-            k_ds_best_push<<<1, 64, 0, s1>>>(best[1], xbest[0], fl[0], sq);
+            hipStream_t s1s = E->C[1].st;
+            if (sa)
+                k_ds_fold_argmax<true, true><<<nb[1], 256, 0, s1s>>>(B1, fold[1], nhp[1], E->C[1].nvalid, L1,
+                                                                     E->C[1].id0, best[1], fl[1], sq, out_d + 7, s1, (unsigned int) r);
+            else
+                k_ds_fold_argmax<true, false><<<nb[1], 256, 0, s1s>>>(B1, fold[1], nhp[1], E->C[1].nvalid, L1,
+                                                                      E->C[1].id0, best[1], fl[1], sq, out_d + 7, s1, 0u);
+            k_ds_best_push<<<1, 64, 0, s1s>>>(best[1], xbest[0], fl[0], sq);
+            ICHECK(hipSetDevice(qz_dev_of(0)));
+        }
+        if (sa) {   // each card's per-row (max, sum) of the halves, merged before the host
+            for (int c = 0; c < 2; c++) {
+                ICHECK(hipSetDevice(qz_dev_of(c)));
+                k_ds_lse_merge<<<DS_BS - 1, 64, 0, E->C[c].st>>>(lses[c], nb[c], lsem[c]);
+            }
             ICHECK(hipSetDevice(qz_dev_of(0)));
         }
         k_ds_last<<<1, 64, 0, st>>>(best[0], xbest[0], fl[0], seq, out_d + 7, out_d);
@@ -840,5 +965,31 @@ struct ink2_dspark {
         ICHECK(hipStreamSynchronize(st));
         for (int i = 0; i < DS_BS - 1; i++) out[i] = out_h[i];
         if (out_h[7]) { fprintf(stderr, "dspark: the Markov chain's cross-card wait timed out (step %u)\n", seq), exit(1); }
+    }
+    // ---- sampled rounds, after the verify
+    // The drafter's logit of the target's candidate ids: ids is the host's [DS_BS][DS_QID]
+    // list (-1 padded, row r slot 0 = draft r), lg the host's logits in the same layout and
+    // lse the per-row logsumexp of the whole vocab. Each card evaluates the ids it owns.
+    void qlog(const int * ids, float * lg, float * lse) {
+        memcpy(qid_h, ids, DS_BS * DS_QID * sizeof(int));
+        for (int c = 0; c < 2; c++) {
+            const ink2_card & T = E->C[c];
+            ICHECK(hipSetDevice(qz_dev_of(c)));
+            hipStream_t st = E->C[c].st;
+            ICHECK(hipMemcpyAsync(qid_d[c], qid_h, DS_BS * DS_QID * sizeof(int), hipMemcpyHostToDevice, st));
+            k_ds_qids<<<dim3(DS_QID, DS_BS - 1), 64, 0, st>>>(base[c], T.head.N, fold[c], nhp[c], T.nvalid, T.id0, qid_d[c],
+                                                             lat1[c], qs_d[c]);
+            ICHECK(hipMemcpyAsync(qs_h[c], qs_d[c], DS_BS * DS_QID * sizeof(float), hipMemcpyDeviceToHost, st));
+            ICHECK(hipMemcpyAsync(lseh[c], lsem[c], DS_BS * 2 * sizeof(float), hipMemcpyDeviceToHost, st));
+        }
+        for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(E->C[c].st)); }
+        ICHECK(hipSetDevice(qz_dev_of(0)));
+        for (int r = 0; r < DS_BS - 1; r++)            // an id's logit sits on the card that owns it
+            for (int j = 0; j < DS_QID; j++)
+                lg[r * DS_QID + j] = qs_h[ids[r * DS_QID + j] < E->C[1].id0 ? 0 : 1][r * DS_QID + j];
+        for (int r = 0; r < DS_BS - 1; r++) {          // logaddexp of the two cards' halves
+            const float m = fmaxf(lseh[0][2 * r], lseh[1][2 * r]);
+            lse[r] = m + logf(lseh[0][2 * r + 1] * expf(lseh[0][2 * r] - m) + lseh[1][2 * r + 1] * expf(lseh[1][2 * r] - m));
+        }
     }
 };
