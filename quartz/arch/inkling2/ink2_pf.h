@@ -327,20 +327,42 @@ static __global__ __launch_bounds__(16 * FA_R / RPT) void k_pf_fattn(pfat a, int
     for (int i = 0; i < RPT; i++) { mx[i] = -INFINITY; l[i] = 0.f; for (int d = 0; d < 8; d++) o[i][d] = 0.f; }
     const int plast = a.pos0 + r0 + rows - 1;
     const int k0 = a.full ? 0 : max(0, a.pos0 + r0 - (WIN - 1));
+    // K and V rows go through registers: this tile's V and the next tile's K load while
+    // the Q.K runs.
+    constexpr int NLD = FA_K * HD / 8 / NTH;
+    static_assert(NLD * NTH == FA_K * HD / 8, "the K / V tile splits evenly over the block");
+    uint4 kr[NLD], vr[NLD];
+    auto ld = [&](const __half * c, int kb, uint4 * r) {
+        #pragma unroll
+        for (int u = 0; u < NLD; u++) {
+            const int e = t + u * NTH, j = kb + e / (HD / 8), c8 = e % (HD / 8);
+            r[u] = make_uint4(0, 0, 0, 0);
+            if (j <= plast) { const int rr = a.full ? j : j % PF_RING; r[u] = *(const uint4 *) (c + (size_t) rr * KVL + kvh * HD + c8 * 8); }
+        }
+    };
+    auto st = [&](const uint4 * r) {
+        #pragma unroll
+        for (int u = 0; u < NLD; u++) { const int e = t + u * NTH; *(uint4 *) (sKV + (e / (HD / 8)) * FA_QS + (e % (HD / 8)) * 8) = r[u]; }
+    };
+    if (k0 <= plast) ld(a.kc, k0, kr);
     for (int kb = k0; kb <= plast; kb += FA_K) {
-        __syncthreads();
-        for (int e = t; e < FA_K * HD / 8; e += NTH) {
-            const int r = e / (HD / 8), c8 = e % (HD / 8), j = kb + r;
-            uint4 v = make_uint4(0, 0, 0, 0);
-            if (j <= plast) { const int rr = a.full ? j : j % PF_RING; v = *(const uint4 *) (a.kc + (size_t) rr * KVL + kvh * HD + c8 * 8); }
-            *(uint4 *) (sKV + r * FA_QS + c8 * 8) = v;
-        }
         const int dlo = pfirst - (kb + FA_K - 1);              // distance of window row 0
-        for (int e = t; e < (FA_R + FA_K - 1) * DREL; e += NTH) {
-            const int ii = e / DREL, k = e % DREL, d = dlo + ii;
-            sB[ii][k] = d >= 0 && d < REL_EXT ? a.relb[(size_t) d * DREL + k] : 0.f;
-        }
+        // near: some distance in the tile is below REL_EXT. Otherwise every basis row is
+        // zero, the bias sum is +0 and the far path adds it as 0.f - sk (same bits).
+        const bool near = dlo < REL_EXT;
+        // inner: every key of the tile is inside every row's causal window
+        const bool inner = kb + FA_K - 1 <= pfirst && (a.full || kb >= plast - (WIN - 1));
         __syncthreads();
+        st(kr);
+        if (near)
+            for (int e = t; e < (FA_R + FA_K - 1) * DREL; e += NTH) {
+                const int ii = e / DREL, k = e % DREL, d = dlo + ii;
+                sB[ii][k] = d >= 0 && d < REL_EXT ? a.relb[(size_t) d * DREL + k] : 0.f;
+            }
+        __syncthreads();
+        // a barrier waits for every outstanding load, so the loads start right after one
+        ld(a.vc, kb, vr);
+        if (kb + FA_K <= plast) ld(a.kc, kb + FA_K, kr);
         float sc[RPT][4] = {};
         #pragma unroll 4
         for (int d = 0; d < HD; d += 4) {
@@ -364,19 +386,30 @@ static __global__ __launch_bounds__(16 * FA_R / RPT) void k_pf_fattn(pfat a, int
         for (int i = 0; i < RPT; i++) {
             const int pos = rpos[i], lo = a.full ? 0 : max(0, pos - (WIN - 1));
             float tm = -INFINITY;
-            #pragma unroll
-            for (int c = 0; c < 4; c++) {
-                const int j = kb + cg + 16 * c;
-                float s = -INFINITY;
-                if (j <= pos && j >= lo) {
-                    const float * bb = sB[pos - j - dlo];
-                    float bias = 0.f;
-                    #pragma unroll
-                    for (int k = 0; k < DREL; k++) bias += bb[k] * rvr[i][k];
-                    s = sc[i][c] * scale + (bias - skr[i]);
+            if (near) {
+                #pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    const int j = kb + cg + 16 * c;
+                    float s = -INFINITY;
+                    if (j <= pos && j >= lo) {
+                        const float * bb = sB[pos - j - dlo];
+                        float bias = 0.f;
+                        #pragma unroll
+                        for (int k = 0; k < DREL; k++) bias += bb[k] * rvr[i][k];
+                        s = sc[i][c] * scale + (bias - skr[i]);
+                    }
+                    sc[i][c] = s;
+                    tm = fmaxf(tm, s);
                 }
-                sc[i][c] = s;
-                tm = fmaxf(tm, s);
+            } else {
+                const float bz = 0.f - skr[i];
+                #pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    const int j = kb + cg + 16 * c;
+                    const float s = inner || (j <= pos && j >= lo) ? sc[i][c] * scale + bz : -INFINITY;
+                    sc[i][c] = s;
+                    tm = fmaxf(tm, s);
+                }
             }
             #pragma unroll
             for (int off = 8; off > 0; off >>= 1) tm = fmaxf(tm, __shfl_xor(tm, off, 16));
@@ -397,12 +430,7 @@ static __global__ __launch_bounds__(16 * FA_R / RPT) void k_pf_fattn(pfat a, int
             for (int d = 0; d < 8; d++) o[i][d] *= cr;
         }
         __syncthreads();
-        for (int e = t; e < FA_K * HD / 8; e += NTH) {
-            const int r = e / (HD / 8), c8 = e % (HD / 8), j = kb + r;
-            uint4 v = make_uint4(0, 0, 0, 0);
-            if (j <= plast) { const int rr = a.full ? j : j % PF_RING; v = *(const uint4 *) (a.vc + (size_t) rr * KVL + kvh * HD + c8 * 8); }
-            *(uint4 *) (sKV + r * FA_QS + c8 * 8) = v;
-        }
+        st(vr);
         __syncthreads();
         #pragma unroll 4
         for (int kk = 0; kk < FA_K; kk++) {
