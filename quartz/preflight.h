@@ -1,17 +1,19 @@
-// Start-up peer link check, so a broken link fails in seconds instead of minutes
-// into the weight load. Writes cross the link in both directions, then the words
-// are read back. The per-architecture memory check lives in arch/<arch>/*_preflight.h.
+// Start-up link check, so a broken link fails in seconds instead of minutes into the
+// weight load. p2p: writes cross the link in both directions, then the words are read back.
+// host: a kernel on one card fills the pinned mailbox and a kernel on the other checks it,
+// both ways, then a flag ping-pong says what a round trip costs (core/link.cpp, its own
+// translation unit so the archs' device code stays as it was). The per-architecture memory
+// check lives in arch/<arch>/*_preflight.h.
 #pragma once
 #include <hip/hip_runtime.h>
 
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <thread>
 #include <vector>
 
 #include "core/devices.h"
+#include "core/link.h"     // qz_xalloc / qz_xfree, qz_link
 
 static __global__ void qz_p2p_fill(unsigned * __restrict__ dst, size_t n, unsigned seed) {
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
@@ -21,9 +23,8 @@ static __global__ void qz_p2p_fill(unsigned * __restrict__ dst, size_t n, unsign
 // One card's kernel writes into the other card's memory, on the uncached pages
 // the engine's exchange uses, and the words are read back from the owner. Returns
 // 0 when both directions are intact, 1 on refusal with the reason printed.
-inline int qz_p2p_check() {
+inline int qz_link_check_p2p(double timeout_s, double * gbs) {
     const size_t n = (size_t) 16 << 20;              // 64 MB of words
-    const double timeout_s = 10.0;
     for (int c = 0; c < 2; c++) {
         if (hipSetDevice(qz_dev_of(c)) != hipSuccess) return 1;
         hipError_t e = hipDeviceEnablePeerAccess(qz_dev_of(1 - c), 0);
@@ -34,7 +35,6 @@ inline int qz_p2p_check() {
             return 1;
         }
     }
-    double gbs[2] = {};
     std::vector<unsigned> host(n);
     for (int c = 0; c < 2; c++) {
         const int src = qz_dev_of(c), dst = qz_dev_of(1 - c);
@@ -48,6 +48,8 @@ inline int qz_p2p_check() {
             return 1;
         }
         const unsigned seed = 0x9e3779b9u + (unsigned) c;
+        char what[64];
+        snprintf(what, sizeof what, "HIP %d writing into HIP %d", src, dst);
         (void) hipSetDevice(src);
         (void) hipStreamCreateWithFlags(&st, hipStreamNonBlocking);
         (void) hipEventCreate(&e0); (void) hipEventCreate(&e1);
@@ -55,21 +57,9 @@ inline int qz_p2p_check() {
             (void) hipEventRecord(e0, st);
             hipLaunchKernelGGL(qz_p2p_fill, dim3(1024), dim3(256), 0, st, buf, n, seed);
             (void) hipEventRecord(e1, st);
-            const auto t0 = std::chrono::steady_clock::now();
-            hipError_t q;
-            while ((q = hipStreamQuery(st)) == hipErrorNotReady) {
-                if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > timeout_s) {
-                    fprintf(stderr, "quartz: peer check: HIP %d writing into HIP %d did not finish in %.0f s: the peer link hangs\n",
-                            src, dst, timeout_s);
-                    return 1;      // the kernel may still be stuck, nothing can be freed safely
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-            if (q != hipSuccess) {
-                fprintf(stderr, "quartz: peer check: HIP %d writing into HIP %d failed: %s\n", src, dst, hipGetErrorString(q));
-                rc = 1;
-            }
+            rc = qz_link_wait(st, "quartz: peer check", what, "the peer link hangs", timeout_s);
         }
+        if (rc == 2) return 2;                           // stuck: nothing can be freed safely
         float ms = 0.f;
         if (!rc && hipEventElapsedTime(&ms, e0, e1) == hipSuccess && ms > 0) gbs[c] = n * 4 / (ms * 1e6);
         if (!rc) {
@@ -94,8 +84,40 @@ inline int qz_p2p_check() {
         (void) hipFree(buf);
         if (rc) return 1;
     }
+    return 0;
+}
+
+// host mode, in core/link.cpp: no peer access at all, both cards reach one pinned host
+// mailbox through the same pointer, so the test's kernels live there
+int qz_link_check_host(double timeout_s, double * gbs, double * rt_us);
+
+// 0 when the link carries the exchange, 1 on refusal with the reason printed. Takes the
+// mode from devices.h: with peer access (p2p) as it always did, else through host memory.
+inline int qz_link_check() {
+    const double timeout_s = 10.0;
+    double gbs[2] = {};
+    if (qz_link == QZ_LINK_P2P) {
+        const int rc = qz_link_check_p2p(timeout_s, gbs);
+        // auto: a peer link that fails its check (not a hang: that kernel may still be
+        // running) is not used; the exchange goes through host memory instead. Nothing
+        // cross-card is allocated yet, so the mode can still change here.
+        if (rc == 1 && qz_link_auto) {
+            fprintf(stderr, "quartz: the peer link failed its check, so the exchange goes through host memory (QZ_LINK=p2p refuses instead)\n");
+            qz_link = QZ_LINK_HOST;
+        } else if (rc) {
+            return 1;
+        }
+    }
+    if (qz_link == QZ_LINK_P2P) {
+        (void) hipSetDevice(qz_dev_of(0));
+        fprintf(stderr, "quartz: peer link ok: HIP %d -> %d %.1f GB/s, HIP %d -> %d %.1f GB/s\n",
+                qz_dev_of(0), qz_dev_of(1), gbs[0], qz_dev_of(1), qz_dev_of(0), gbs[1]);
+        return 0;
+    }
+    double rt_us = 0;
+    if (qz_link_check_host(timeout_s, gbs, &rt_us)) return 1;
     (void) hipSetDevice(qz_dev_of(0));
-    fprintf(stderr, "quartz: peer link ok: HIP %d -> %d %.1f GB/s, HIP %d -> %d %.1f GB/s\n",
-            qz_dev_of(0), qz_dev_of(1), gbs[0], qz_dev_of(1), qz_dev_of(0), gbs[1]);
+    fprintf(stderr, "quartz: link host (no P2P): HIP %d -> %d %.1f GB/s, HIP %d -> %d %.1f GB/s, flag round trip %.2f us\n",
+            qz_dev_of(0), qz_dev_of(1), gbs[0], qz_dev_of(1), qz_dev_of(0), gbs[1], rt_us);
     return 0;
 }

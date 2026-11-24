@@ -9,10 +9,13 @@
 #include <cstdlib>
 
 #include "core/devices.h"
+#include "core/link.h"
 #include "mem.h"
 
 // Peer access both ways between the two chosen cards (devices.h); false, with a message.
+// Host mode has none to enable: the mailboxes are pinned host memory (core/link.h).
 inline bool qz_peer_enable() {
+    if (qz_link == QZ_LINK_HOST) return true;
     for (int c = 0; c < 2; c++) {
         if (hipSetDevice(qz_dev_of(c)) != hipSuccess) return false;
         hipError_t e = hipDeviceEnablePeerAccess(qz_dev_of(1 - c), 0);
@@ -25,22 +28,23 @@ inline bool qz_peer_enable() {
     return true;
 }
 
-// One card's exchange buffers (kernels/xchg.h): the uncached inbox [2][rows][dm] with
-// its checksums [2][rows][dm/32], the head-merge pairs [2][rows][2] of {value, id bits},
-// the flags in their own allocation, the exchange counter and the error words [8].
+// One card's exchange buffers (kernels/xchg.h): the inbox [2][rows][dm] with its checksums
+// [2][rows][dm/32], the head-merge pairs [2][rows][2] of {value, id bits}, the flags in
+// their own allocation, the exchange counter and the error words [8]. The first three are
+// cross-card mailboxes (qz_xalloc); the counter and the error words are this card's own.
 struct qz_xbufs {
     float * xin = nullptr, * xhm = nullptr;
     unsigned int * xflag = nullptr, * xseq = nullptr;
     int * xerr = nullptr;
     size_t xin_bytes = 0;
 
-    // on the current device, zeroed
-    hipError_t alloc(int rows, int dm) {
+    // on the current device, zeroed; card is the owner, for the link's ledger
+    hipError_t alloc(int rows, int dm, int card) {
         hipError_t e;
         xin_bytes = ((size_t) 2 * rows * dm + (size_t) 2 * rows * (dm / 32)) * 4;
-        if ((e = qz_dmalloc_uncached((void **) &xin, xin_bytes)) || (e = hipMemset(xin, 0, xin_bytes))) return e;
-        if ((e = qz_dmalloc_uncached((void **) &xhm, (size_t) 2 * rows * 2 * 4)) || (e = hipMemset(xhm, 0, (size_t) 2 * rows * 2 * 4))) return e;
-        if ((e = qz_dmalloc_uncached((void **) &xflag, 256)) || (e = hipMemset(xflag, 0, 256))) return e;
+        if ((e = qz_xalloc((void **) &xin, xin_bytes, card, "xin")) ||
+            (e = qz_xalloc((void **) &xhm, (size_t) 2 * rows * 2 * 4, card, "xhm")) ||
+            (e = qz_xalloc((void **) &xflag, 256, card, "xflag"))) return e;
         if ((e = qz_dmalloc((void **) &xseq, 64)) || (e = hipMemset(xseq, 0, 64))) return e;
         if ((e = qz_dmalloc((void **) &xerr, 8 * sizeof(int))) || (e = hipMemset(xerr, 0, 8 * sizeof(int)))) return e;
         return hipSuccess;

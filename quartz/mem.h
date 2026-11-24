@@ -28,11 +28,15 @@ static inline void qz_stamp(FILE * f) {
 
 struct qz_mem_ledger {
     struct rec { int card; size_t bytes; std::string tag; };
+    struct hrec { size_t bytes; std::string tag; void * host; };   // pinned host: device pointer -> its host pointer
     std::mutex mu;
     std::unordered_map<void *, rec> live;
     std::map<std::string, size_t> by[QZ_MEM_CARDS];
     size_t tracked[QZ_MEM_CARDS] = {};
     long long base[QZ_MEM_CARDS] = { -1, -1, -1, -1, -1, -1, -1, -1 };   // used bytes before the engine allocates
+    std::unordered_map<void *, hrec> hlive;   // the cross-card mailboxes of host mode (core/link.h)
+    std::map<std::string, size_t> hby;
+    size_t htracked = 0;
 };
 inline qz_mem_ledger & qz_mem() { static qz_mem_ledger l; return l; }
 
@@ -162,6 +166,33 @@ inline hipError_t qz_dfree(void * p) {
     return hipFree(p);
 }
 
+// A pinned host mailbox (core/link.h): counted on its own, not against a card, and kept
+// with the host pointer the free needs since the cards see the device one. Tag host/<sub>.
+inline void qz_mem_host_add(void * dev_p, void * host_p, size_t bytes, const char * sub) {
+    if (!dev_p) return;
+    std::string tag = "host";
+    if (sub && *sub) tag += std::string("/") + sub;
+    qz_mem_ledger & L = qz_mem();
+    std::lock_guard<std::mutex> g(L.mu);
+    L.hlive[dev_p] = { bytes, tag, host_p };
+    L.hby[tag] += bytes;
+    L.htracked += bytes;
+}
+
+// the host pointer behind a mailbox, or nullptr when `p` is not one
+inline void * qz_mem_host_del(void * p) {
+    qz_mem_ledger & L = qz_mem();
+    std::lock_guard<std::mutex> g(L.mu);
+    auto it = L.hlive.find(p);
+    if (it == L.hlive.end()) return nullptr;
+    void * host_p = it->second.host;
+    L.hby[it->second.tag] -= it->second.bytes;
+    if (!L.hby[it->second.tag]) L.hby.erase(it->second.tag);
+    L.htracked -= it->second.bytes;
+    L.hlive.erase(it);
+    return host_p;
+}
+
 // used memory on each card before the engine allocates, so the report can tell
 // the baseline from untracked growth
 inline void qz_mem_baseline(int n_cards) {
@@ -208,6 +239,26 @@ inline void qz_mem_report(FILE * f, int n_cards, double min_gb = 0.05) {
             else rest += v[i].second;
         }
         fprintf(f, " rest %.1f\n", rest / 1e9);
+    }
+    // host mode: what the cross-card mailboxes pin, one line, its own counter
+    if (qz_link == QZ_LINK_HOST) {
+        std::vector<std::pair<std::string, size_t>> v;
+        size_t tracked = 0;
+        {
+            std::lock_guard<std::mutex> g(L.mu);
+            tracked = L.htracked;
+            v.assign(L.hby.begin(), L.hby.end());
+        }
+        std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+        size_t rest = 0;
+        qz_stamp(f);
+        fprintf(f, "host pinned %.1f MB:", tracked / 1e6);
+        for (size_t i = 0; i < v.size(); i++) {
+            if (i < 4) fprintf(f, " %s %.1f,", v[i].first.c_str(), v[i].second / 1e6);
+            else rest += v[i].second;
+        }
+        if (rest) fprintf(f, " rest %.1f", rest / 1e6);
+        fprintf(f, "\n");
     }
     (void) hipSetDevice(dev0);
 }

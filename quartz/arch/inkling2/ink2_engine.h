@@ -201,7 +201,7 @@ struct ink2_engine {
         for (int s = 0; s < NAPP; s++) { K.kc[s] = (__half *) nx_(); K.vc[s] = (__half *) nx_(); }
         K.hist = (float *) nx_();
         ICHECK(hipEventCreateWithFlags(&K.ev, hipEventDisableTiming));
-        ICHECK(K.x.alloc(VR + 1, D));              // the verify rows' inbox past the decode's 2 D
+        ICHECK(K.x.alloc(VR + 1, D, c));           // the verify rows' inbox past the decode's 2 D
         K.apsz = (size_t) HKVL * ATT_SPL * GQ * ATT_PW;
         ICHECK(qz_dmalloc(&K.apart, K.apsz * sizeof(float), "state"));   // the decode's (verify: vws)
         ICHECK(qz_dmalloc(&K.acnt, HKVL * sizeof(int), "state"));

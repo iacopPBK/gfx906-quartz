@@ -52,7 +52,7 @@ directory and a few table entries and leaves the others alone.
    read the hparams with `qz_gguf::u32`, `f32`, `flag` and `ints`.
 5. **Memory check.** Estimate the per-card need from the GGUF and the context
    before the load, and refuse with the largest `--max-ctx` that fits (see
-   `qwen35_preflight.h`). Call `qz_p2p_check()` after it.
+   `qwen35_preflight.h`). Call `qz_link_check()` after it.
 6. **Prefix cache.** Name the arch's fixed-size state as `qz_blob`s (a live
    buffer and a mid-chunk staging buffer per card). Call `qz_pcache::prefill`
    with the message-boundary token and the hooks: `reset` (fresh state),

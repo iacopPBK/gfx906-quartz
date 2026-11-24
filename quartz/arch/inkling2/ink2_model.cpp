@@ -449,7 +449,7 @@ static qz_ctx * create(const char * path, const qz_create_opts & o) {
     if (!parse(g, hp) || !check_tensors(g)) { fprintf(stderr, "inkling2: %s is not a supported Inkling-2-Mini GGUF\n", path); return nullptr; }
     const int ctx = std::min(o.max_ctx > 0 ? o.max_ctx : 32768, 262144);
     // Check memory and the peer link both ways before the weights.
-    if (ink2_vram_check(g, ctx, getenv("QZ_DSPINE")) || qz_p2p_check()) return nullptr;
+    if (ink2_vram_check(g, ctx, getenv("QZ_DSPINE")) || qz_link_check()) return nullptr;
     ink2_ctx * c = new ink2_ctx();
     c->name = g.str("general.name");
     c->E.hp = hp;

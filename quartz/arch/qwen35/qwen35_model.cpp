@@ -467,7 +467,7 @@ static qz_ctx * create(const char * model, const qz_create_opts & o) {
     // the scratch the cycle's partials share with batched prefill and the DSpine verify
     const size_t scratch = std::max(qz_prefill::bytes(2048), mv12::mv_partial_bytes());
     // before the weights: memory for this context on both cards, then the peer link
-    if (qz_vram_check(model, max_ctx, steps, scratch, getenv("QZ_DSPINE"), getenv("QZ_MMPROJ")) || qz_p2p_check())
+    if (qz_vram_check(model, max_ctx, steps, scratch, getenv("QZ_DSPINE"), getenv("QZ_MMPROJ")) || qz_link_check())
         return nullptr;
     q35_ctx * c = new q35_ctx();
     c->eng.scratch_min = scratch;

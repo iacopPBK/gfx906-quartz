@@ -257,7 +257,7 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
             fz((void **) &K.kvv_m, K.mtp_arena_rows * 2);
         }
         // exchange: inbox data, checksums, head-merge pairs, flag on its own line
-        CHECK(K.x.alloc(QZ_TMAX, D));
+        CHECK(K.x.alloc(QZ_TMAX, D, c));
 
         std::vector<qz_trunk_w> wh(n_layer);
         int nr = 0, na = 0;

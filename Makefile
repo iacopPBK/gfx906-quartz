@@ -7,7 +7,7 @@ UNI       := third_party/llama-unicode
 ARCH    := --offload-arch=gfx906
 CXXFLAGS := -O2 -std=c++17 $(ARCH)
 INC     := -I quartz -I $(UNI) -I third_party
-ENGINE  := quartz/loader.cpp $(wildcard quartz/vision/*.cpp) $(wildcard quartz/arch/*/*.cpp)
+ENGINE  := quartz/loader.cpp $(wildcard quartz/core/*.cpp) $(wildcard quartz/vision/*.cpp) $(wildcard quartz/arch/*/*.cpp)
 UNICODE := $(UNI)/unicode.cpp $(UNI)/unicode-data.cpp
 HEADERS := $(wildcard quartz/*.h quartz/*.hip quartz/core/*.h quartz/kernels/*.h quartz/vision/*.h quartz/arch/*/*.h quartz/arch/*/*.hip) $(UNI)/unicode.h third_party/stb/stb_image.h
 
