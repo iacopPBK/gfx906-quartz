@@ -569,10 +569,8 @@ struct qz_prefill {
     // Reaching the peer: under p2p the GEMM's C2 epilogue stores straight into its VRAM.
     // In host mode it cannot, so the GEMM writes only the local pl and one staged copy per
     // card moves the tile-aligned rows into the peer's pr, which its owner then reads
-    // without leaving the card. The plan's variant A instead puts pr in pinned host memory,
-    // so the epilogue stores into it and the peer's addnorm reads it back over PCIe, no
-    // copy at all; measured on the 1422-token prompt it gave 535-585 t/s of prefill against
-    // 657-659 for these copies and 709-726 for p2p, so this is the variant kept. Neither
+    // without leaving the card. Putting pr in pinned host memory instead (the epilogue stores
+    // into it, the peer's addnorm reads it over PCIe) needs no copy but was slower. Neither
     // changes the arithmetic, only where the partial is written.
     void rowpar(qz_engine & e, int h, const char * const * W, const __half * const * sw, int K, bool ffn) {
         const half & H = hv[h];
