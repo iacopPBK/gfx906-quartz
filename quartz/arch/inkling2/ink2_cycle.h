@@ -66,7 +66,6 @@ struct cyc_args {
     // the head launch: mix into F, norm into aq3 / as3 (block 0), then the vocab GEMV
     // into hg.y, with the softcap on the first nvalid rows
     sptrs hmix; const float * hq_out; njob hn; gjob hg; int nvalid; float softcap;
-    float * cpart;                // the chain groups' partial sums, CP_SZ per group
     // TP2 exchange (the names kernels/xchg.h expects)
     float * xin_mine, * xin_peer;
     unsigned int * xflag_mine, * xflag_peer, * xseq;
@@ -248,18 +247,28 @@ CYC_NI void c_head_gemv(CK gjob * J, int nv, float cap) {
 // mix and its norms. Block w owns columns 64 w + l + 256 k, with l < 64 and k < D / 256.
 // That is exactly wave w's share of every full-row sum in d_mix_lds / d_norm_quant, where
 // each lane sums over k, qz_wsum_dpp reduces, and waves 0 .. 3 are added in order. Each
-// block publishes its wave-w partials, the group syncs on flags, and every block adds the
-// CG partials in that order, so the bits match. The element-wise parts (output pass,
-// y / quant, xconv, copies) work on the owned columns with the same thread for the same
-// column throughout, so they need no barrier.
+// block publishes its wave-w partials in slots, every block polls the group's slots and
+// adds the CG partials in that order, so the bits match. The element-wise parts (output
+// pass, xconv, copies) work on the owned columns with the same thread for the same column
+// throughout, so they need no barrier.
 constexpr int CG = 4, CQ = D / CG, CNK = D / 256;
 static_assert(CQ == 64 * CNK && CNK * 256 == D, "chain group columns");
 constexpr int CYC_NBX = CYC_NBMAX + 2 * CG;      // bst words: the grid barrier's, then the chain groups'
 constexpr int CP_1 = 0, CP_2 = CP_1 + CG * 6, CP_N = CP_2 + CG * 6 * 4, CP_SZ = CP_N + CG * 4;   // partial slots per group
+constexpr int CYC_NBS = CYC_NBX + 2 * 2 * CP_SZ;  // bst words: the flags, then the two groups' 64-bit slots
 __device__ __forceinline__ int ccol(int w, int q) { return 64 * w + (q & 63) + 256 * (q >> 6); }
-// After cg_sync a plain load suffices, because the sync's fence dropped the CU's L1.
-__device__ __forceinline__ float cld(const float * p) { return *p; }
-struct cgrp { unsigned int * fl; float * cp; int w; };     // w is this block's index within the group
+// A partial slot holds (epoch << 32 | value bits) in one 64-bit store, and a reader polls
+// the slot itself until it carries the epoch, so a partial needs no fence, flag or reload.
+// The slots sit in the launch's zeroed flag buffer, so a stale slot never matches.
+struct cgrp { unsigned int * fl; unsigned long long * cp; int w; };     // w is this block's index within the group
+__device__ __forceinline__ void cg_put(unsigned long long * p, float v, unsigned int e) {
+    __hip_atomic_store(p, ((unsigned long long) e << 32) | __float_as_uint(v), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+__device__ __forceinline__ float cg_get(unsigned long long * p, unsigned int e) {
+    unsigned long long x;
+    do { x = __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT); } while ((unsigned int) (x >> 32) != e);
+    return __uint_as_float((unsigned int) x);
+}
 // Returns once every CG block has published epoch e, each partial fenced by its writer.
 CYC_NI void cg_sync(const cgrp & g, unsigned int e) {
     __syncthreads();
@@ -270,7 +279,6 @@ CYC_NI void cg_sync(const cgrp & g, unsigned int e) {
     }
     __syncthreads();
 }
-__device__ __forceinline__ void cg_put(float * p, float v) { *p = v; __threadfence(); }
 // d_xconv_blk's values on the owned columns, thread q = tid and tid + 512. With tap, it
 // also takes the new x: the DSpark feature, the residual entering the next application.
 CYC_NI void c_cxconv(const float * own, const float * peer, const float * w, float * hs, float * x, float * blk, int cw, int tid,
@@ -307,37 +315,44 @@ CYC_NI void c_cpre(int pre, float * P, float * X, float * po, int cw, int tid) {
         }
     }
 }
-// d_norm_quant of NJ rows held in LDS v[j][CQ], owned columns; wave j handles row j
+// d_norm_quant of NJ rows held in LDS v[j][CQ], owned columns. Wave j sums row j; the
+// scaled and quantized output then spreads over all waves, one (row, 64 columns) item each.
+constexpr int CN_IT = (3 * CNK + 7) / 8;      // output items per wave, NJ <= 3
 CYC_NI void c_cnorm_tail(int NJ, const float * v, CK njob * nj, float eps, const cgrp & g, unsigned int & ce, int tid) {
     const int wave = tid >> 6, lane = tid & 63;
-    float wv[CNK];                       // the norm weights in flight over the sync
-    {
-        const float * wn = qz_gp(nj[wave < NJ ? wave : 0].w);
-        #pragma unroll
-        for (int k = 0; k < CNK; k++) wv[k] = wn[ccol(g.w, lane + 64 * k)];
+    float wv[CN_IT];                     // the norm weights in flight over the sync
+    #pragma unroll
+    for (int u = 0; u < CN_IT; u++) {
+        const int it = wave + 8 * u;
+        if (it < NJ * CNK) wv[u] = qz_gp(nj[it / CNK].w)[ccol(g.w, lane + 64 * (it % CNK))];
     }
     float ss = 0.f;
     if (wave < NJ)
         #pragma unroll
         for (int k = 0; k < CNK; k++) { const float x = v[wave * CQ + lane + 64 * k]; ss += x * x; }
     ss = qz_wsum_dpp(ss);
-    if (wave < NJ && lane == 0) cg_put(&g.cp[CP_N + g.w * 4 + wave], ss);
-    cg_sync(g, ++ce);
-    __shared__ float cpn[CG * 4];
-    if (tid < CG * 4) cpn[tid] = cld(&g.cp[CP_N + tid]);
+    ++ce;
+    if (wave < NJ && lane == 0) cg_put(&g.cp[CP_N + g.w * 4 + wave], ss, ce);
+    __shared__ float cpn[CG * 4], crn[4];
+    if (tid < CG * 4 && (tid & 3) < NJ) cpn[tid] = cg_get(&g.cp[CP_N + tid], ce);
     __syncthreads();
-    if (wave < NJ) {
+    if (tid < NJ) {
         float a = 0.f;
         #pragma unroll
-        for (int i = 0; i < CG; i++) a += cpn[i * 4 + wave];
-        const float r = rsqrtf(a / D + eps);
-        CK njob * j = nj + wave;
-        float * y = j->y ? qz_gp(j->y) : nullptr;
-        unsigned char * qv = qz_gp(j->q); float * qs = qz_gp(j->qs);
-        #pragma unroll
-        for (int k = 0; k < CNK; k++) {
+        for (int i = 0; i < CG; i++) a += cpn[i * 4 + tid];
+        crn[tid] = rsqrtf(a / D + eps);
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int u = 0; u < CN_IT; u++) {
+        const int it = wave + 8 * u;
+        if (it < NJ * CNK) {
+            const int jr = it / CNK, k = it % CNK;
+            CK njob * j = nj + jr;
+            float * y = j->y ? qz_gp(j->y) : nullptr;
+            unsigned char * qv = qz_gp(j->q); float * qs = qz_gp(j->qs);
             const int i = ccol(g.w, lane + 64 * k);
-            const float yv = v[wave * CQ + lane + 64 * k] * r * wv[k];
+            const float yv = v[jr * CQ + lane + 64 * k] * crn[jr] * wv[u];
             if (y) y[i] = yv;
             quant32(yv, qv, qs, i);
         }
@@ -389,11 +404,11 @@ template <int MQ, bool NRM> CYC_NI void c_cmix(CK sptrs * S, const float * qy, f
             #pragma unroll
             for (int k = 0; k < CNK; k++) { const float v = sv[wave * CQ + lane + 64 * k]; r += v * v; }
         r = qz_wsum_dpp(r);
-        if (wave < 6 && lane == 0) cg_put(&g.cp[CP_1 + g.w * 6 + wave], r);
+        if (wave < 6 && lane == 0) cg_put(&g.cp[CP_1 + g.w * 6 + wave], r, ce + 1);
     }
-    cg_sync(g, ++ce);
+    ++ce;
     __shared__ float cp1[CG * 6];
-    if (tid < CG * 6) cp1[tid] = cld(&g.cp[CP_1 + tid]);
+    if (tid < CG * 6) cp1[tid] = cg_get(&g.cp[CP_1 + tid], ce);
     __syncthreads();
     if (tid < 6) {
         float a = 0.f;
@@ -418,30 +433,28 @@ template <int MQ, bool NRM> CYC_NI void c_cmix(CK sptrs * S, const float * qy, f
         for (int j = 0; j < MQ; j++) r[j] = qz_wsum_dpp(r[j]);
         if (lane == 0)
             #pragma unroll
-            for (int j = 0; j < MQ; j++) cg_put(&g.cp[CP_2 + (g.w * 6 + wave) * 4 + j], r[j]);
+            for (int j = 0; j < MQ; j++) cg_put(&g.cp[CP_2 + (g.w * 6 + wave) * 4 + j], r[j], ce + 1);
     }
-    cg_sync(g, ++ce);
+    ++ce;
     __shared__ float cpl[CG * 6 * 4];
-    if (tid < CG * 6 * 4) cpl[tid] = cld(&g.cp[CP_2 + tid]);
+    if (tid < CG * 6 * 4) cpl[tid] = (tid & 3) < MQ ? cg_get(&g.cp[CP_2 + tid], ce) : 0.f;
     __syncthreads();
-    if (tid < MQ) {                        // d_mix_lds's softmax, query j = tid
-        float v[6];
-        #pragma unroll
-        for (int s = 0; s < 6; s++) {
-            float a = 0.f;
+    if (tid < 64) {                        // d_mix_lds's softmax: lane s * 4 + j holds state s, query j
+        const int ss = lane >> 2, jq = lane & 3;
+        float v = 0.f;
+        if (ss < 6) {
             #pragma unroll
-            for (int i = 0; i < CG; i++) a += cpl[(i * 6 + s) * 4 + tid];
-            v[s] = a;
+            for (int i = 0; i < CG; i++) v += cpl[(i * 6 + ss) * 4 + jq];
         }
         const float scale = 1.f / sqrtf((float) D);
         float mx = -INFINITY;
         #pragma unroll
-        for (int s = 0; s < 6; s++) if (s < n) mx = fmaxf(mx, v[s] * scale);
-        float sum = 0.f, ev[6];
+        for (int s = 0; s < 6; s++) { const float vs = __shfl(v, s * 4 + jq, 64); if (s < n) mx = fmaxf(mx, vs * scale); }
+        const float ev = expf(v * scale - mx);
+        float sum = 0.f;
         #pragma unroll
-        for (int s = 0; s < 6; s++) if (s < n) { ev[s] = expf(v[s] * scale - mx); sum += ev[s]; }
-        #pragma unroll
-        for (int s = 0; s < 6; s++) if (s < n) cws[s][tid] = ev[s] / sum;
+        for (int s = 0; s < 6; s++) { const float es = __shfl(ev, s * 4 + jq, 64); if (s < n) sum += es; }
+        if (ss < n && jq < MQ) cws[ss][jq] = ev / sum;
     }
     __syncthreads();
     #pragma unroll
@@ -639,8 +652,9 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
     if (b0) d_embed(Ag->ev, Ag->es, tok, Ag->embd_norm, Ag->eps, Ag->X, tid_k, tid_k < 256);
     const int napp = Ag->napp;
     // the chain groups: blocks 0 .. CG-1 and CG .. 2 CG-1, with flags zeroed per launch
-    const cgrp g1 = {bst + CYC_NBMAX, Ag->cpart, (int) blockIdx.x};
-    const cgrp g2 = {bst + CYC_NBMAX + CG, Ag->cpart + CP_SZ, (int) blockIdx.x - CG};
+    unsigned long long * slots = (unsigned long long *) (bst + CYC_NBX);
+    const cgrp g1 = {bst + CYC_NBMAX, slots, (int) blockIdx.x};
+    const cgrp g2 = {bst + CYC_NBMAX + CG, slots + CP_SZ, (int) blockIdx.x - CG};
     unsigned int ce1 = 0, ce2 = 0;
     if (blockIdx.x < CG) cg_sync(g1, ++ce1);          // block 0's embedding (X) before the group reads its columns
     for (int ai = 0; ai < napp; ai++) {

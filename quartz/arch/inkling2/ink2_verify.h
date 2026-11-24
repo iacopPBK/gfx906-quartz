@@ -22,14 +22,15 @@
 
 #define VR_NI __device__ __forceinline__
 constexpr int VR = 8;
+constexpr int VBS_SL = (CYC_NBMAX + VR * CG + 1) & ~1, VBS_N = VBS_SL + 2 * VR * CP_SZ;   // vbst words: the flags, then the groups' 64-bit slots
 #ifndef VG_S
 #define VG_S 2
 #endif
 
 struct vtok { int t[VR]; float tau[VR]; };        // tau from the host's tau_at
 
-// The verify arguments: the decode args with tab at the VR-row table, cpart at the VR
-// groups, aq3 / hq / ... at row 0, plus the row-replicated buffers.
+// The verify arguments: the decode args with tab at the VR-row table, aq3 / hq / ... at
+// row 0, plus the row-replicated buffers.
 struct vargs {
     cyc_args A;
     int rs, rsf;                          // the activation row stride, in bytes and floats
@@ -849,7 +850,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
     if (chain && cw == 0)
         d_embed(Vp->A.ev, Vp->A.es, tv.t[tr], Vp->A.embd_norm, Vp->A.eps,
                 (float *) ((char *) Vp->A.X + (size_t) tr * rs), tid_k, tid_k < 256);
-    const cgrp g = {vbst + CYC_NBMAX + cr * CG, Vp->A.cpart + (size_t) cr * CP_SZ, cw};
+    const cgrp g = {vbst + CYC_NBMAX + cr * CG, (unsigned long long *) (vbst + VBS_SL) + (size_t) cr * CP_SZ, cw};
     unsigned int ce = 0;
     if (chain) cg_sync(g, ++ce);
     const int napp = Vp->A.napp;

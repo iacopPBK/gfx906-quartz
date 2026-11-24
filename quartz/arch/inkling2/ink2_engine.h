@@ -208,9 +208,9 @@ struct ink2_engine {
         ICHECK(qz_dmalloc(&K.apart, K.apsz * sizeof(float), "state"));   // the decode's (verify: vws)
         ICHECK(qz_dmalloc(&K.acnt, HKVL * sizeof(int), "state"));
         ICHECK(hipMemset(K.acnt, 0, HKVL * sizeof(int)));
-        ICHECK(qz_dmalloc((void **) &K.bst, CYC_NBX * sizeof(unsigned int), "state"));
-        ICHECK(qz_dmalloc((void **) &K.vbst, (CYC_NBMAX + VR * CG) * sizeof(unsigned int), "state"));
-        ICHECK(hipMemset(K.vbst, 0, (CYC_NBMAX + VR * CG) * sizeof(unsigned int)));
+        ICHECK(qz_dmalloc((void **) &K.bst, CYC_NBS * sizeof(unsigned int), "state"));
+        ICHECK(qz_dmalloc((void **) &K.vbst, VBS_N * sizeof(unsigned int), "state"));
+        ICHECK(hipMemset(K.vbst, 0, VBS_N * sizeof(unsigned int)));
         ICHECK(qz_dmalloc((void **) &K.uh, (size_t) NAPP * VR * CHL * sizeof(float), "state"));
         ICHECK(qz_dmalloc((void **) &K.LOGV, (size_t) VR * K.nvalid * sizeof(float), "state"));
         ICHECK(hipMalloc((void **) &K.vtk, (size_t) VR * QZ_TOPK_NB * QZ_TOPK * sizeof(float2)));
@@ -233,7 +233,6 @@ struct ink2_engine {
         A.F = K.F; A.FN = K.FN; A.H = K.H; A.IDS = K.IDS; A.WTS = K.WTS; A.aq3 = K.aq[3]; A.as3 = K.as[3]; A.hq = K.hq; A.hs = K.hs; A.GU = K.LOG;
         ICHECK(qz_dmalloc(&A.gcnt, NE_USED * FFL / 32 * sizeof(int), "state"));
         ICHECK(hipMemset(A.gcnt, 0, NE_USED * FFL / 32 * sizeof(int)));
-        ICHECK(qz_dmalloc((void **) &A.cpart, VR * CP_SZ * sizeof(float), "state"));
         A.route_scale = hp.route_scale; A.beta = hp.situ_beta; A.lb = hp.situ_lin_beta;
         A.xin_mine = K.x.xin; A.xflag_mine = K.x.xflag; A.xseq = K.x.xseq; A.xerr = K.x.xerr;
         tkh[c].resize((size_t) QZ_TOPK_NB * QZ_TOPK);
@@ -430,7 +429,7 @@ struct ink2_engine {
         for (int c = 0; c < 2; c++) {
             ink2_card & K = C[c];
             ICHECK(hipSetDevice(qz_dev_of(c)));
-            ICHECK(hipMemsetAsync(K.bst, 0, CYC_NBX * sizeof(unsigned int), K.st));
+            ICHECK(hipMemsetAsync(K.bst, 0, CYC_NBS * sizeof(unsigned int), K.st));
             hipLaunchKernelGGL(ink2_cycle, dim3(K.ncu), dim3(512), CYC_LDS, K.st, K.bst, (const cyc_args *) K.ca_d, tok, pos, tau_at(pos), head ? 1 : 0);
             ICHECK(hipGetLastError());
         }
@@ -519,7 +518,7 @@ struct ink2_engine {
         for (int c = 0; c < 2; c++) {
             ink2_card & K = C[c];
             ICHECK(hipSetDevice(qz_dev_of(c)));
-            ICHECK(hipMemsetAsync(K.vbst, 0, (CYC_NBMAX + VR * CG) * sizeof(unsigned int), K.st));
+            ICHECK(hipMemsetAsync(K.vbst, 0, VBS_N * sizeof(unsigned int), K.st));
             hipLaunchKernelGGL(ink2_verify, dim3(K.ncu), dim3(512), VER_LDS, K.st, K.vbst, (const vargs *) K.vargs_d, tv, pos, 1, nr);
             ICHECK(hipGetLastError());
             qz_topk_rows<<<dim3(QZ_TOPK_NB, nr), 256, 0, K.st>>>(K.LOGV, K.nvalid, K.id0, K.vtk);
