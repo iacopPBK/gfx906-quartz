@@ -17,6 +17,7 @@
 // kernel waits for the peer's argmax through peer memory flags, and card 1's fold waits for
 // card 0's lat1 the same way. Only the round's tokens come back.
 // Included after ink2_engine.h / ink2_pf.h (same TU).
+#include "core/link.h"           // qz_xcopy / qz_xdst: the partials and the feature planes
 
 constexpr int DS_BS = 8, DS_NL = 3, DS_R = 256, DS_FF = 9216, DS_Q = 3072, DS_KV = 1024, DS_NQ = 24, DS_NKV = 8;
 constexpr int DS_NQL = DS_NQ / 2, DS_NKVL = DS_NKV / 2, DS_QL = DS_Q / 2, DS_KVL = DS_KV / 2, DS_FFL = DS_FF / 2;   // per card
@@ -661,7 +662,11 @@ struct ink2_dspark {
     unsigned long long * best[2] = {};         // this card's fold target (local, zeroed per step)
     unsigned long long * xbest[2] = {};        // the peer's argmax pushed here (uncached)
     unsigned int * fl[2] = {};                 // the peer's handshake flag (uncached)
-    int * out_d = nullptr, * out_h = nullptr;  // the 7 tokens + the chain's error word
+    int * out_d = nullptr, * out_h = nullptr;  // the 7 tokens (card 0's)
+    // ds_wait's timeout word, one per card: a wait reads and CASes it, so it must be in the
+    // waiting card's own memory. In p2p a single card-0 word served both cards, which host
+    // mode cannot do -- card 1 would touch card 0's VRAM.
+    int * errd[2] = {};
     unsigned int seq = 0;                      // the chain's step counter (monotone)
     // Sampled rounds: each draft row's (max, sumexp) partials and merged logsumexp, the
     // target's candidate ids to evaluate, and their drafter logits.
@@ -765,16 +770,18 @@ struct ink2_dspark {
             const qw & H = E->C[c].head;
             nhp[c] = (H.N + 63) & ~63;             // 128-byte aligned fold rows
             al(&hq[c], DS_BS * D); al(&hs[c], DS_BS * D / 32); al(&base[c], (size_t) DS_BS * H.N);
-            // lat1 comes over P2P from the peer's Markov step, so it is allocated uncached.
-            // One slot per draft row: the candidate logits are evaluated after the chain.
-            ICHECK(qz_dmalloc_uncached((void **) &lat1[c], (size_t) DS_BS * (DS_R + 1) * sizeof(float), "dspark"));
+            // The peer's Markov step writes lat1 and fl, and its argmax push writes xbest:
+            // the other card's kernel stores into them, so they are mailboxes (uncached VRAM
+            // under p2p, pinned host memory under host mode) and qz_xalloc zeroes them.
+            // One lat1 slot per draft row: the candidate logits are evaluated after the chain.
+            ICHECK(qz_xalloc((void **) &lat1[c], (size_t) DS_BS * (DS_R + 1) * sizeof(float), c, "dspark"));
             al(&fold[c], (size_t) (DS_R + 1) * nhp[c]);
-            ICHECK(qz_dmalloc((void **) &best[c], 8, "dspark"));
+            ICHECK(qz_dmalloc((void **) &best[c], 8, "dspark"));      // this card's fold target only
             ICHECK(hipMemset(best[c], 0, 8));
-            ICHECK(qz_dmalloc_uncached((void **) &xbest[c], 8, "dspark"));
-            ICHECK(qz_dmalloc_uncached((void **) &fl[c], 4, "dspark"));
-            ICHECK(hipMemset(xbest[c], 0, 8));
-            ICHECK(hipMemset(fl[c], 0, 4));
+            ICHECK(qz_xalloc((void **) &xbest[c], 8, c, "dspark"));
+            ICHECK(qz_xalloc((void **) &fl[c], 4, c, "dspark"));
+            al(&errd[c], 1);
+            ICHECK(hipMemset(errd[c], 0, sizeof(int)));
             al(&lses[c], (size_t) DS_BS * DS_LSEB * 2);
             al(&lsem[c], DS_BS * 2);
             ICHECK(hipHostMalloc((void **) &lseh[c], DS_BS * 2 * sizeof(float), 0));
@@ -821,11 +828,15 @@ struct ink2_dspark {
         for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); fn(c, K[c], E->C[c].st); }
     }
     // copy Y into the peer's Yp slot and return the slot. The caller sums Y and Yp.
+    // qz_xdst: the consumer (the add on the peer's stream, below) is already ordered by the
+    // ev handshake at the end of this function, so p2p keeps the single peer copy on this
+    // card's stream and adds no event; host mode queues its H2D on the peer's stream, where
+    // the consumer runs, and therefore after the peer's previous reader of the slot as well.
     int exchange() {
         const int s = xk;
         xk ^= 1;
         each([&](int c, card & k, hipStream_t st) {
-            ICHECK(hipMemcpyPeerAsync(K[1 - c].Yp[s], qz_dev_of(1 - c), k.Y, qz_dev_of(c), (size_t) DS_BS * D * 4, st));
+            ICHECK(qz_xcopy(K[1 - c].Yp[s], 1 - c, qz_xdst(E->C[1 - c].st), k.Y, c, st, (size_t) DS_BS * D * 4));
             ICHECK(hipEventRecord(k.ev, st));
         });
         each([&](int c, card &, hipStream_t st) { ICHECK(hipStreamWaitEvent(st, K[1 - c].ev, 0)); });
@@ -848,8 +859,12 @@ struct ink2_dspark {
             for (int l = 0; l < DS_NL; l++)
                 k_ds_mixq<<<m, 256, 0, st>>>(taps, tstride, alpha[l], k.L[l].dn, k.fq + (size_t) l * m * D, k.fs + (size_t) l * m * (D / 32), DS_EPS);
             k_ds_mixnorm<<<1, 256, 0, st>>>(taps + (size_t) (m - 1) * tstride, tstride, alpha[DS_NL], dsn, g, D, DS_EPS);
-            ICHECK(hipMemcpyPeerAsync(K[1].fq, qz_dev_of(1), k.fq, qz_dev_of(0), (size_t) DS_NL * m * D, st));
-            ICHECK(hipMemcpyPeerAsync(K[1].fs, qz_dev_of(1), k.fs, qz_dev_of(0), (size_t) DS_NL * m * (D / 32) * 4, st));
+            // qz_xdst: card 1's gemvs below are ordered by the k.ev handoff that follows, so
+            // p2p stays the two peer copies on card 0's stream; host mode puts the H2Ds on
+            // card 1's stream, ahead of those gemvs and after the last fill's readers of the
+            // planes, which are on that stream too.
+            ICHECK(qz_xcopy(K[1].fq, 1, qz_xdst(E->C[1].st), k.fq, 0, st, (size_t) DS_NL * m * D));
+            ICHECK(qz_xcopy(K[1].fs, 1, qz_xdst(E->C[1].st), k.fs, 0, st, (size_t) DS_NL * m * (D / 32) * 4));
             ICHECK(hipEventRecord(k.ev, st));
         }
         each([&](int c, card & k, hipStream_t st) {
@@ -934,25 +949,25 @@ struct ink2_dspark {
                 s1 = { sa->invTq, sa->seed, sa->rnd, lses[1] + (size_t) r * DS_LSEB * 2, sa->cap };
             }
             k_ds_joint<<<3 * DS_R / 8, 512, 0, st>>>(jw, jb, state, w1, i, tok, hid + (size_t) r * D, g, joint, best[0], xbest[0],
-                                                     fl[0], sq - 1, out_d + 7, out_d);
+                                                     fl[0], sq - 1, errd[0], out_d);
             k_ds_markov<<<1, 256, 0, st>>>(joint, state, lat1[0] + (size_t) r * (DS_R + 1), lat1[1] + (size_t) r * (DS_R + 1),
                                            best[0], xbest[0], fl[1], sq);
             const float * L0 = lat1[0] + (size_t) r * (DS_R + 1), * L1 = lat1[1] + (size_t) r * (DS_R + 1);
             const float * B0 = base[0] + (size_t) r * E->C[0].head.N, * B1 = base[1] + (size_t) r * E->C[1].head.N;
             if (sa)
                 k_ds_fold_argmax<false, true><<<nb[0], 256, 0, st>>>(B0, fold[0], nhp[0], E->C[0].nvalid, L0,
-                                                                     E->C[0].id0, best[0], fl[0], sq, out_d + 7, s0, (unsigned int) r);
+                                                                     E->C[0].id0, best[0], fl[0], sq, errd[0], s0, (unsigned int) r);
             else
                 k_ds_fold_argmax<false, false><<<nb[0], 256, 0, st>>>(B0, fold[0], nhp[0], E->C[0].nvalid, L0,
-                                                                      E->C[0].id0, best[0], fl[0], sq, out_d + 7, s0, 0u);
+                                                                      E->C[0].id0, best[0], fl[0], sq, errd[0], s0, 0u);
             ICHECK(hipSetDevice(qz_dev_of(1)));
             hipStream_t s1s = E->C[1].st;
             if (sa)
                 k_ds_fold_argmax<true, true><<<nb[1], 256, 0, s1s>>>(B1, fold[1], nhp[1], E->C[1].nvalid, L1,
-                                                                     E->C[1].id0, best[1], fl[1], sq, out_d + 7, s1, (unsigned int) r);
+                                                                     E->C[1].id0, best[1], fl[1], sq, errd[1], s1, (unsigned int) r);
             else
                 k_ds_fold_argmax<true, false><<<nb[1], 256, 0, s1s>>>(B1, fold[1], nhp[1], E->C[1].nvalid, L1,
-                                                                      E->C[1].id0, best[1], fl[1], sq, out_d + 7, s1, 0u);
+                                                                      E->C[1].id0, best[1], fl[1], sq, errd[1], s1, 0u);
             k_ds_best_push<<<1, 64, 0, s1s>>>(best[1], xbest[0], fl[0], sq);
             ICHECK(hipSetDevice(qz_dev_of(0)));
         }
@@ -963,11 +978,16 @@ struct ink2_dspark {
             }
             ICHECK(hipSetDevice(qz_dev_of(0)));
         }
-        k_ds_last<<<1, 64, 0, st>>>(best[0], xbest[0], fl[0], seq, out_d + 7, out_d, nd - 1);
+        k_ds_last<<<1, 64, 0, st>>>(best[0], xbest[0], fl[0], seq, errd[0], out_d, nd - 1);
         ICHECK(hipMemcpyAsync(out_h, out_d, 8 * sizeof(int), hipMemcpyDeviceToHost, st));
         ICHECK(hipStreamSynchronize(st));
         for (int i = 0; i < nd; i++) out[i] = out_h[i];
-        if (out_h[7]) { fprintf(stderr, "dspark: the Markov chain's cross-card wait timed out (step %u)\n", seq), exit(1); }
+        for (int c = 0; c < 2; c++) {                  // either card's wait may have given up
+            ICHECK(hipSetDevice(qz_dev_of(c)));
+            ICHECK(hipStreamSynchronize(E->C[c].st));
+            ICHECK(hipMemcpy(&out_h[7], errd[c], sizeof(int), hipMemcpyDeviceToHost));
+            if (out_h[7]) { fprintf(stderr, "dspark: the Markov chain's cross-card wait timed out (step %u, card %d)\n", seq, c), exit(1); }
+        }
     }
     // ---- sampled rounds, after the verify
     // The drafter's logit of the target's candidate ids: ids is the host's [DS_BS][DS_QID]

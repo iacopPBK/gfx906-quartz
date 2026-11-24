@@ -2,7 +2,9 @@
 // docs/inkling2.md, on both cards. Decode runs in the persistent kernel (ink2_cycle.h),
 // one launch per card per token. TP2: each card runs its q / kv heads and half of every
 // expert's FF. The attention output and the expert down projection are summed across the
-// cards, each card reading the peer's partial over P2P after a cross-stream event wait.
+// cards, each card reading the other's partial after a cross-stream event wait: out of its
+// VRAM over P2P, or out of a pinned host mailbox both cards address (core/link.h) when
+// there is no peer access. The kernels are the same either way.
 #pragma once
 
 #include "ink2_verify.h"     // the speculative round's VR-row kernel (after ink2_cycle.h)
@@ -265,7 +267,9 @@ struct ink2_engine {
         else if (m == 3) k_mix<3><<<1, 512, MIX_LDS, C[c].st>>>(S, q, out);
         else k_mix<4><<<1, 512, MIX_LDS, C[c].st>>>(S, q, out);
     }
-    // record each card's partials, then let each wait for the peer's event before reading
+    // record each card's partials, then let each wait for the peer's event before reading.
+    // Ordering only: no pointer crosses, so host mode needs nothing here (the partials go
+    // through the xin mailbox, which qz_xbufs allocates per mode).
     void exchange() {
         for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipEventRecord(C[c].ev, C[c].st)); }
         for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamWaitEvent(C[c].st, C[1 - c].ev, 0)); }

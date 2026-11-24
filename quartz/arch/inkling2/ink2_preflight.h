@@ -18,6 +18,13 @@ inline double ink2_ctx_bytes(int ctx, int card, bool ds) {
 // 256 MB of headroom on top. Measured at ctx 262144: 20.6 GB per card, this estimate 20.9.
 constexpr double INK_PF_FIXED = 1.5e9, INK_PF_DS0 = 0.25e9, INK_PF_DS1 = 0.2e9, INK_PF_HEADROOM = 0.25e9;
 
+// host mode only: each card's copy of the peer's two prefill partial slots (ink2_pf.h
+// PARTP), 2 x PF_M x D floats. Under p2p the conv reads the peer's VRAM and these do not
+// exist, so the estimate is unchanged there.
+inline double ink2_partp_bytes() {
+    return qz_link == QZ_LINK_HOST ? 2.0 * PF_M * D * 4 : 0.0;
+}
+
 // the vision encoder (QZ_MMPROJ, set by the server's --mmproj) on card 0. Covers the weight
 // file and its activations at the 4096-token image limit.
 constexpr double INK_PF_VIS = 1.15e9;
@@ -53,13 +60,14 @@ inline int ink2_vram_check(const qz_gguf & g, int ctx, const char * dspark) {
         size_t fr = 0, tot = 0;
         if (hipSetDevice(qz_dev_of(c)) != hipSuccess || hipMemGetInfo(&fr, &tot) != hipSuccess) return 0;
         w[c] = (double) L.need_bytes; free_b[c] = (double) fr; total_b[c] = (double) tot;
-        need[c] = w[c] + ink2_ctx_bytes(ctx, c, ds) + INK_PF_FIXED + INK_PF_HEADROOM +
+        need[c] = w[c] + ink2_ctx_bytes(ctx, c, ds) + INK_PF_FIXED + INK_PF_HEADROOM + ink2_partp_bytes() +
                   (ds ? ink2_ds_weight_bytes(dspark, c) + (c == 0 ? INK_PF_DS0 : INK_PF_DS1) : 0.0) +
                   (c == 0 ? ink2_vis_bytes() : 0.0);
     }
     (void) hipSetDevice(qz_dev_of(0));
     fprintf(stderr, "inkling2: memory per card: weights %.1f + context %.1f (ctx %d)%s + buffers %.1f = %.1f / %.1f GB; free %.1f and %.1f GB\n",
-            w[0] / 1e9, ink2_ctx_bytes(ctx, 0, ds) / 1e9, ctx, ds ? " with DSpark" : "", (INK_PF_FIXED + INK_PF_HEADROOM) / 1e9,
+            w[0] / 1e9, ink2_ctx_bytes(ctx, 0, ds) / 1e9, ctx, ds ? " with DSpark" : "",
+            (INK_PF_FIXED + INK_PF_HEADROOM + ink2_partp_bytes()) / 1e9,
             need[0] / 1e9, need[1] / 1e9, free_b[0] / 1e9, free_b[1] / 1e9);
     int bad = -1;
     for (int c = 0; c < 2; c++)
