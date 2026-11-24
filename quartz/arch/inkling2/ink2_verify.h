@@ -129,7 +129,7 @@ VR_NI void d_head_post_v(const hpost & a, int b, int t, bool act, int dmax, int 
         float n2[1] = {v_gsum2(x * x, red, grp)};
         const float nr = sqrtf(n2[0]) + 1e-6f;
         x *= fminf(fmaxf(a.qk_clip / nr, 0.f), 1.f);
-        if (act) a.q[i] = x * a.tau;
+        if (act) { a.q[i] = x * a.tau; a.qh[i] = __float2half(x * a.tau * FL_QSC); }
         float r_ = t < DREL ? a.rr[h * DREL + t] * a.rclip[h * DREL + t] : 0.f;
         float r2[1] = {v_gsum2(r_ * r_, red, grp)};
         const float rn = sqrtf(r2[0]) + 1e-6f;
@@ -192,7 +192,7 @@ VR_NI void v_head_post(CK hpost * e, int pos, float tau, int v, int tid, int r, 
     h.qr = qz_gp(h.qr); h.rr = qz_gp(h.rr); h.sk = qz_gp(h.sk); h.kr = qz_gp(h.kr); h.vr = qz_gp(h.vr);
     h.dk = h.dk ? qz_gp(h.dk) : nullptr; h.dv = h.dv ? qz_gp(h.dv) : nullptr;
     h.qclip = qz_gp(h.qclip); h.rclip = qz_gp(h.rclip); h.relb = qz_gp(h.relb); h.kconv = qz_gp(h.kconv); h.vconv = qz_gp(h.vconv);
-    h.hist = qz_gp(h.hist); h.q = qz_gp(h.q); h.tb = qz_gp(h.tb);
+    h.hist = qz_gp(h.hist); h.q = qz_gp(h.q); h.qh = qz_gp(h.qh); h.tb = qz_gp(h.tb);
     h.kc = qz_gp(h.kc + (size_t) row * KVL); h.vc = qz_gp(h.vc + (size_t) row * KVL);
     h.tau = e->dk ? tau : 1.f;
     d_head_post_v(h, v, tid & 127, true, min(TBW, pos + 1), r, uh, rsf, hb, tid >> 7);
@@ -786,106 +786,17 @@ template <int NJ> VR_NI void v_ctrl_up(CK cjob * cj, int rsf, int tid) {
     }
 }
 
-// The attention of the VR rows in two phases. Phase A, one wave per unit (KV head,
-// split, decode wave w2) with wave w = row w, runs exactly decode wave w2's groups
-// (sp * 8 + w2) * 4 + lane / 16 of d_attn, the key loop and the xor joins, and stores the
-// wave's state to ws. A wave whose 4 groups have no keys (lo + group > pos) skips, its
-// state being (-inf, 0, 0), which every att_join leaves unchanged. Phase B, after a grid
-// barrier: unit (row, KV head), thread (head, dim), d_attn's folds in their order, per
-// split from its first non-empty wave, then the sink and the splits, the gate and the quant.
-constexpr size_t VWS = (size_t) HKVL * ATT_SPL * 8 * GQ * ATT_PW; // ws: [VR][HKVL][ATT_SPL][8][GQ][ATT_PW]
+// The attention of the VR rows: phase A, one (kv head, split) unit per block with wave w =
+// row w, every wave running the flash body's 3 q heads against the block's one K/V staging
+// (ink2_flash.h). Phase B, after the grid barrier: unit (row, kv head), thread (head, dim),
+// the splits merged in ascending order on top of the sink, then the gate and the quant.
+constexpr size_t VWS = (size_t) HKVL * FL_NS * GQ * ATT_PW;   // ws: [VR][HKVL][FL_NS][GQ][ATT_PW]
+static_assert(FL_LDS8 <= VER_LDS, "the attention fits the verify's dynamic LDS");
 VR_NI void v_attn_a(CK appk * tab, int napp, int ai, int pos, int v, float * ws, int tid, int nr) {
     asm volatile ("" : "+v"(tid));
-    const int kvh = v % HKVL, sp = v / (HKVL * 8), w2 = (v / HKVL) % 8;   // KV head minor, so the units with keys spread over the grid
-    const int wave = tid >> 6, lane = tid & 63, li = lane & 15, row = wave;
-    if (row >= nr) return;                                       // wave-uniform: an inactive row
-    CK attn_args * ea = &((CK appk *) tab + (size_t) row * napp + ai)->at;
-    const int full = ea->full, rp = pos + row;
-    const int lo = full ? 0 : max(0, rp - (WIN - 1));
-    if (lo + (sp * 8 + w2) * 4 > rp) return;                     // wave-uniform: no keys
-    const float * aq = qz_gp(ea->q), * atb = qz_gp(ea->tb);
-    const __half * kc = qz_gp(ea->kc), * vc = qz_gp(ea->vc);
-    const int h0 = kvh * GQ, c0 = kvh * HD + li * 8, g = (sp * 8 + w2) * 4 + (lane >> 4);
-    float m[GQ], l[GQ], o[GQ][8];
-    {
-        const float scale = 1.f / sqrtf((float) HD);
-        float q[GQ][8];
-        #pragma unroll
-        for (int hh = 0; hh < GQ; hh++) {
-            #pragma unroll
-            for (int k = 0; k < 8; k++) { q[hh][k] = aq[(h0 + hh) * HD + li * 8 + k] * scale; o[hh][k] = 0.f; }
-            m[hh] = -INFINITY; l[hh] = 0.f;
-        }
-        for (int j0 = lo + g; j0 <= rp; j0 += 2 * ATT_G) {
-            const int j1 = j0 + ATT_G;
-            const bool two = j1 <= rp;
-            const int r0 = full ? j0 : j0 % PF_RING, r1 = two ? (full ? j1 : j1 % PF_RING) : r0;
-            const uint4 k0u = *(const uint4 *) (kc + (size_t) r0 * KVL + c0);
-            const uint4 k1u = *(const uint4 *) (kc + (size_t) r1 * KVL + c0);
-            const uint4 v0u = *(const uint4 *) (vc + (size_t) r0 * KVL + c0);
-            const uint4 v1u = *(const uint4 *) (vc + (size_t) r1 * KVL + c0);
-            const int d0 = min(rp - j0, REL_EXT), d1 = min(rp - j1, REL_EXT);
-            float kf[8], vf[8];
-            float s0[GQ], s1[GQ];
-            att_h8(k0u, kf);
-            #pragma unroll
-            for (int hh = 0; hh < GQ; hh++) {
-                float x = 0.f;
-                #pragma unroll
-                for (int k = 0; k < 8; k++) x += q[hh][k] * kf[k];
-                s0[hh] = att_row16(x) + atb[(h0 + hh) * TBW + d0];
-            }
-            att_h8(k1u, kf);
-            #pragma unroll
-            for (int hh = 0; hh < GQ; hh++) {
-                float x = 0.f;
-                #pragma unroll
-                for (int k = 0; k < 8; k++) x += q[hh][k] * kf[k];
-                x = att_row16(x);
-                s1[hh] = two ? x + atb[(h0 + hh) * TBW + max(d1, 0)] : -INFINITY;
-            }
-            float p0[GQ], p1[GQ];
-            #pragma unroll
-            for (int hh = 0; hh < GQ; hh++) {
-                const float mn = fmaxf(m[hh], fmaxf(s0[hh], s1[hh])), c = expf(m[hh] - mn);
-                p0[hh] = expf(s0[hh] - mn); p1[hh] = two ? expf(s1[hh] - mn) : 0.f;
-                l[hh] = l[hh] * c + p0[hh] + p1[hh];
-                #pragma unroll
-                for (int k = 0; k < 8; k++) o[hh][k] *= c;
-                m[hh] = mn;
-            }
-            att_h8(v0u, vf);
-            #pragma unroll
-            for (int hh = 0; hh < GQ; hh++)
-                #pragma unroll
-                for (int k = 0; k < 8; k++) o[hh][k] += p0[hh] * vf[k];
-            att_h8(v1u, vf);
-            #pragma unroll
-            for (int hh = 0; hh < GQ; hh++)
-                #pragma unroll
-                for (int k = 0; k < 8; k++) o[hh][k] += p1[hh] * vf[k];
-        }
-    }
-    #pragma unroll
-    for (int off = 16; off <= 32; off <<= 1) {
-        #pragma unroll
-        for (int hh = 0; hh < GQ; hh++) {
-            float o2[8];
-            #pragma unroll
-            for (int k = 0; k < 8; k++) o2[k] = __shfl_xor(o[hh][k], off, 64);
-            const float m2 = __shfl_xor(m[hh], off, 64), l2 = __shfl_xor(l[hh], off, 64);
-            att_join(m[hh], l[hh], o[hh], m2, l2, o2, 8);
-        }
-    }
-    if (lane < 16) {
-        float * W = qz_gp(ws) + (size_t) row * VWS + ((((size_t) kvh * ATT_SPL + sp) * 8 + w2) * GQ) * ATT_PW;
-        #pragma unroll
-        for (int hh = 0; hh < GQ; hh++) {
-            #pragma unroll
-            for (int k = 0; k < 8; k++) W[hh * ATT_PW + 2 + li * 8 + k] = o[hh][k];
-            if (lane == 0) { W[hh * ATT_PW] = m[hh]; W[hh * ATT_PW + 1] = l[hh]; }
-        }
-    }
+    const int kvh = v % HKVL, sp = v / HKVL;      // KV head minor, so the units with keys spread over the grid
+    const attn_args * at0 = &((CK appk *) tab + ai)->at;
+    fl_attn_rows(at0, (size_t) napp * sizeof(appk), qz_gp(ws), VWS, pos, kvh, sp, tid, nr, cyc_lds);
 }
 VR_NI void v_attn_b(CK appk * tab, int napp, int ai, int pos, int u, const float * ws, int tid, int nr) {
     asm volatile ("" : "+v"(tid));
@@ -893,31 +804,8 @@ VR_NI void v_attn_b(CK appk * tab, int napp, int ai, int pos, int u, const float
     if (row >= nr) return;                                       // block-uniform: an inactive row
     if (tid >= GQ * HD) return;
     CK attn_args * ea = &((CK appk *) tab + (size_t) row * napp + ai)->at;
-    const int full = ea->full, rp = pos + row;
-    const int lo = full ? 0 : max(0, rp - (WIN - 1));
-    const int hh = tid >> 7, d = tid & (HD - 1), h0 = kvh * GQ;
-    const float * W = qz_gp(ws) + (size_t) row * VWS + (size_t) kvh * ATT_SPL * 8 * GQ * ATT_PW + hh * ATT_PW;
-    float M = 0.f, L = 1.f, O = 0.f;                       // the sink: logit 0, value 0
-    #pragma unroll 1
-    for (int sp = 0; sp < ATT_SPL; sp++) {
-        if (lo + sp * 32 > rp) break;                      // no keys here or in the later splits
-        const float * B = W + (size_t) sp * 8 * GQ * ATT_PW;
-        const int nw = min(8, (rp - lo - sp * 32) / 4 + 1);   // the non-empty waves, wave 0 never empty
-        float sm[8], sl[8], so[8];
-        #pragma unroll
-        for (int w2 = 0; w2 < 8; w2++) {                    // all in flight, the empty waves' slots unused
-            const float * S = B + (size_t) w2 * GQ * ATT_PW;
-            sm[w2] = S[0]; sl[w2] = S[1]; so[w2] = S[2 + d];
-        }
-        float pm = sm[0], pl = sl[0], po = so[0];
-        #pragma unroll
-        for (int w2 = 1; w2 < 8; w2++)
-            if (w2 < nw) att_join(pm, pl, &po, sm[w2], sl[w2], &so[w2], 1);
-        att_join(M, L, &O, pm, pl, &po, 1);
-    }
-    const int i = (h0 + hh) * HD + d;
-    const float y = O / L * sigm(qz_gp(ea->gate)[i]);
-    quant32(y, qz_gp(ea->oq), qz_gp(ea->os), i);
+    fl_merge(qz_gp(ws) + (size_t) row * VWS + (size_t) kvh * FL_NS * GQ * ATT_PW,
+             qz_gp(ea->gate), qz_gp(ea->oq), qz_gp(ea->os), kvh * GQ, tid >> 7, tid & (HD - 1));
 }
 
 // The conv history commit: hist[k][ch] = s[m + k], with s[3 + j] row j's u from uh.
@@ -1027,7 +915,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
             v_head_post(&VROW(Av.tab, r, ai)->hp, pos + r, tv.tau[r], u, tid, r, Vq->uh, rsf, Vq->hist);
         }
         cyc_barrier(vbst, ++kb);
-        for (int v = blockIdx.x; v < HKVL * ATT_SPL * 8; v += nb) v_attn_a((CK appk *) Av.tab, napp, ai, pos, v, Vq->ws, tid, nr);
+        for (int v = blockIdx.x; v < HKVL * FL_NS; v += nb) v_attn_a((CK appk *) Av.tab, napp, ai, pos, v, Vq->ws, tid, nr);
         cyc_barrier(vbst, ++kb);
         for (int u = blockIdx.x; u < nr * HKVL; u += nb) v_attn_b((CK appk *) Av.tab, napp, ai, pos, u, Vq->ws, tid, nr);
         cyc_barrier(vbst, ++kb);

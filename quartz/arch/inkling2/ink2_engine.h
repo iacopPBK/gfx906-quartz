@@ -32,6 +32,7 @@ struct ink2_card {
     // activations (f32 [D] unless noted)
     float * X, * P, * OUT[2], * BLK[8], * IN[3], * MSG[NCTRL], * CT[NCTRL], * F, * FN, * G;
     float * QR, * GR, * RR, * SK, * KR, * VR, * DK, * DV, * Q, * TB, * PART[2], * H, * WTS, * LOG;
+    __half * qh;                              // Q as f16 * log2(e)/sqrt(HD): the attention's q
     int * IDS;
     unsigned char * aq[4]; float * as[4];      // input planes: Q, K, V, then the ffn / head input
     unsigned char * oq; float * os;           // attention output planes [QL]
@@ -157,7 +158,7 @@ struct ink2_engine {
         for (int i = 0; i < 1 + 1 + 2 + 8 + 3 + NCTRL + NCTRL + 2; i++) add(f32(nD));   // X P OUT BLK IN MSG CT F FN
         add(f32(NCTRL * GRANK));                                                          // G
         add(f32(QL)); add(f32(QL)); add(f32(HQL * DREL)); add(f32(64)); add(f32(KVL)); add(f32(KVL));
-        add(f32(64)); add(f32(64)); add(f32(QL)); add(f32(HQL * TBW)); add(f32(nD)); add(f32(nD));
+        add(f32(64)); add(f32(64)); add(f32(QL)); add(f32(QL / 2)); add(f32(HQL * TBW)); add(f32(nD)); add(f32(nD));
         add(f32(NE_USED * FFE)); add(f32(NE_USED)); add(f32(VOCAB / 2)); add(f32(NE_USED));
         for (int i = 0; i < 4; i++) { add(f32(nD / 4)); add(f32(nD / 32)); }              // planes (int8 = n/4 floats)
         add(f32(QL / 4)); add(f32(QL / 32));
@@ -190,7 +191,7 @@ struct ink2_engine {
         K.G = (float *) nx_();
         K.QR = (float *) nx_(); K.GR = (float *) nx_(); K.RR = (float *) nx_(); K.SK = (float *) nx_();
         K.KR = (float *) nx_(); K.VR = (float *) nx_(); K.DK = (float *) nx_(); K.DV = (float *) nx_();
-        K.Q = (float *) nx_(); K.TB = (float *) nx_(); K.PART[0] = (float *) nx_(); K.PART[1] = (float *) nx_();
+        K.Q = (float *) nx_(); K.qh = (__half *) nx_(); K.TB = (float *) nx_(); K.PART[0] = (float *) nx_(); K.PART[1] = (float *) nx_();
         K.H = (float *) nx_(); K.WTS = (float *) nx_(); K.LOG = (float *) nx_(); K.IDS = (int *) nx_();
         for (int i = 0; i < 4; i++) { K.aq[i] = (unsigned char *) nx_(); K.as[i] = (float *) nx_(); }
         K.oq = (unsigned char *) nx_(); K.os = (float *) nx_();
@@ -341,11 +342,11 @@ struct ink2_engine {
         a.dk = full ? K.DK : nullptr; a.dv = full ? K.DV : nullptr;
         a.qclip = L.qclip; a.rclip = L.rclip; a.relb = L.relb; a.kconv = L.kconv; a.vconv = L.vconv;
         a.hist = K.hist + (size_t) slot * 3 * CHL;
-        a.q = K.Q; a.tb = K.TB;
+        a.q = K.Q; a.qh = K.qh; a.tb = K.TB;
         a.kc = K.kc[slot]; a.vc = K.vc[slot];              // + the row, per token
         a.tau = 1.f; a.qk_clip = hp.qk_clip; a.rel_clip = hp.rel_clip; a.eps = hp.eps;
         attn_args & t = e.at;
-        t.q = K.Q; t.tb = K.TB; t.gate = K.GR; t.kc = K.kc[slot]; t.vc = K.vc[slot]; t.full = full;
+        t.q = K.Q; t.qh = K.qh; t.tb = K.TB; t.gate = K.GR; t.kc = K.kc[slot]; t.vc = K.vc[slot]; t.full = full;
         t.oq = K.oq; t.os = K.os; t.part = K.apart; t.cnt = K.acnt;
         e.go = gj({job(L.out, K.oq, K.os, K.PART[0])}, e.ngo);
         e.pconv = L.pconv; e.hsa = K.hist + (size_t) slot * 3 * CHL + H_A; e.blk = push >= 0 ? K.BLK[push] : nullptr;
@@ -461,9 +462,9 @@ struct ink2_engine {
         hpost & h = e.hp;
         h.qr = shp(h.qr, o); h.rr = shp(h.rr, o); h.sk = shp(h.sk, o); h.kr = shp(h.kr, o); h.vr = shp(h.vr, o);
         h.dk = shp(h.dk, o); h.dv = shp(h.dv, o);
-        h.q = shp(h.q, o); h.tb = shp(h.tb, o);
+        h.q = shp(h.q, o); h.qh = shp(h.qh, o); h.tb = shp(h.tb, o);
         attn_args & t = e.at;
-        t.q = shp(t.q, o); t.tb = shp(t.tb, o); t.gate = shp(t.gate, o); t.oq = shp(t.oq, o); t.os = shp(t.os, o);
+        t.q = shp(t.q, o); t.qh = shp(t.qh, o); t.tb = shp(t.tb, o); t.gate = shp(t.gate, o); t.oq = shp(t.oq, o); t.os = shp(t.os, o);
         e.blk = shp(e.blk, o);
         sh_sptrs(e.mff, o);
         sh_cjob(e.cb.j[0], o);

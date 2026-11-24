@@ -92,7 +92,7 @@ template <class XA> __device__ __forceinline__ void cyc_xwait(const XA & A, unsi
 #define CK const
 #endif
 constexpr int CYC_LDS = 6 * D * 4;           // dynamic LDS: the mix states, also the attention scratch
-static_assert(ATT_LDS <= CYC_LDS, "attention scratch fits the dynamic LDS");
+static_assert(FL_LDS1 <= CYC_LDS, "the attention fits the dynamic LDS");
 extern __shared__ float cyc_lds[];
 #define CYC_NI __device__ __forceinline__
 template <int MQ> CYC_NI void c_mix(CK sptrs * S, const float * q, float * o, int tid) {
@@ -485,10 +485,10 @@ CYC_NI void c_head_post(CK hpost * e, int pos, float tau, int v, int tid) {
 CYC_NI void c_attn(CK attn_args * e, int pos, int v, int tid) {
     asm volatile ("" : "+v"(tid));
     attn_args t = *e;
-    t.q = qz_gp(t.q); t.tb = qz_gp(t.tb); t.gate = qz_gp(t.gate); t.kc = qz_gp(t.kc); t.vc = qz_gp(t.vc); t.oq = qz_gp(t.oq); t.os = qz_gp(t.os);
-    t.part = qz_gp(t.part); t.cnt = qz_gp(t.cnt);
+    t.q = qz_gp(t.q); t.qh = qz_gp(t.qh); t.tb = qz_gp(t.tb); t.gate = qz_gp(t.gate); t.kc = qz_gp(t.kc); t.vc = qz_gp(t.vc);
+    t.oq = qz_gp(t.oq); t.os = qz_gp(t.os); t.part = qz_gp(t.part); t.cnt = qz_gp(t.cnt);
     t.pos = pos;
-    d_attn(t, v / ATT_SPL, v % ATT_SPL, tid, cyc_lds);   // the mix states are dead here
+    fl_attn_plain(t, v / ATT_SPL, v % ATT_SPL, tid, cyc_lds);   // the mix states are dead here
 }
 CYC_NI void c_xconv_b0(const float * own, const float * peer, const float * w, float * hs, float * x, float * blk, int tid) {
     d_xconv_blk<512>(qz_gp(own), qz_gp(peer), qz_gp(w), qz_gp(hs), qz_gp(x), blk ? qz_gp(blk) : nullptr, tid);

@@ -22,6 +22,11 @@ static_assert(PF_RING >= WIN + PF_M, "the SWA ring holds a window plus a chunk")
 constexpr int CHL = 2 * KVL + 2 * D;                   // local conv history channels: K | V | attn post | ffn post
 constexpr int H_K = 0, H_V = KVL, H_A = 2 * KVL, H_F = 2 * KVL + D;
 constexpr int TBW = REL_EXT + 1;                       // bias table width (the zero column past the extent)
+// the attention's score scale: it works in log2 units (ink2_flash.h), so the table bias
+// is multiplied by log2(e) and the f16 copy of q head post writes is pre-scaled by
+// log2(e) / sqrt(HD), which then costs one v_dot2 per (lane = key, head, 2 dims)
+constexpr float FL_L2E = 1.4426950408889634f;
+constexpr float FL_QSC = 0.12751743082459868f;
 
 // Sum of N values over the first nw waves of the block; every thread gets the sums.
 template <int N, bool DPP = true> __device__ __forceinline__ void bsum(float (&v)[N], float * red, int nw) {
@@ -275,6 +280,7 @@ struct hpost {
     const float * qclip, * rclip, * relb, * kconv, * vconv;
     float * hist;                                            // this slot's [3][CHL]
     float * q, * tb;                                         // out: q [QL], table [HQL][TBW]
+    __half * qh;                                             // out: q as f16 * log2(e)/sqrt(HD), [QL]
     __half * kc, * vc;                                       // the cache rows to write
     float tau, qk_clip, rel_clip, eps;
 };
@@ -289,7 +295,7 @@ __device__ __forceinline__ void d_head_post(const hpost & a, int b, int t, bool 
         bsum<1>(n2, red, 2);
         const float nr = sqrtf(n2[0]) + 1e-6f;
         x *= fminf(fmaxf(a.qk_clip / nr, 0.f), 1.f);
-        if (act) a.q[i] = x * a.tau;
+        if (act) { a.q[i] = x * a.tau; a.qh[i] = __float2half(x * a.tau * FL_QSC); }
         float r = t < DREL ? a.rr[h * DREL + t] * a.rclip[h * DREL + t] : 0.f;
         float r2[1] = {r * r};
         bsum<1>(r2, red, 2);
@@ -341,168 +347,25 @@ __device__ __forceinline__ void d_head_post(const hpost & a, int b, int t, bool 
     }
 }
 
-// ---- attention output for one query row: softmax(q.k / sqrt(HD) + table[d]) with a zero
-// sink, times sigmoid(gate), into int8 planes for attn_output. A local KV head's keys are
-// shared by its GQ query heads and read once, split over ATT_SPL virtual blocks of 8
-// waves (512 threads). A wave is 4 row groups of 16 lanes, a lane holding 8 dims. Group g
-// of the ATT_G takes keys lo + g, lo + g + ATT_G, ... two per step, with the online
-// softmax per head. Partials merge in a fixed order: the wave's 4 groups by xor 16 and
-// 32, the block's 8 waves in LDS into part, then the KV head's last block to finish
-// (cnt) merges the ATT_SPL block partials. Both paths run this body, so the bits match.
-constexpr int GQ = HQ / HKV, ATT_SPL = 15, ATT_G = ATT_SPL * 8 * 4, ATT_PW = HD + 2;
+// ---- attention: the flash body of ink2_flash.h (lane = key position, q in wave-uniform
+// registers, K/V tiles in LDS, one wave per query row), shared by the plain step and the
+// DSpark verify so that a verify row is bit-identical to a plain step at the same rp.
+// ATT_SPL splits of the KV cache per KV head serve the plain step; the verify uses FL_NS.
+constexpr int GQ = HQ / HKV, ATT_SPL = 15, ATT_PW = HD + 2;
 struct attn_args {
     const float * q, * tb, * gate;
+    const __half * qh;            // q as f16 * log2(e)/sqrt(HD) (the attention's copy)
     const __half * kc, * vc;      // cache base: row r at r * KVL
     int pos, full;
     unsigned char * oq; float * os;
     float * part;                 // [HKVL][ATT_SPL][GQ][ATT_PW]
     int * cnt;                    // [HKVL], zero between uses (the merger resets it)
 };
-// A partial (m, l, o) absorbs another, both rescaled by the exponents against the joint
-// max. With m = m2 = -inf, nothing has been seen yet.
-__device__ __forceinline__ void att_join(float & m, float & l, float * o, float m2, float l2, const float * o2, int n) {
-    const float M = fmaxf(m, m2);
-    const float a = m == -INFINITY ? 0.f : expf(m - M), b = m2 == -INFINITY ? 0.f : expf(m2 - M);
-    l = l * a + l2 * b;
-    for (int k = 0; k < n; k++) o[k] = o[k] * a + o2[k] * b;
-    m = M;
-}
-__device__ __forceinline__ float att_row16(float x) {   // sum over the 16-lane DPP row
-    x += qz_dpp<0x128>(x);
-    x += qz_dpp<0x124>(x);
-    x += qz_dpp<0x4E>(x);
-    x += qz_dpp<0xB1>(x);
-    return x;
-}
 __device__ __forceinline__ void att_h8(const uint4 & u, float * f) {
     const __half2 * h = (const __half2 *) &u;
     #pragma unroll
     for (int k = 0; k < 4; k++) { f[2 * k] = __low2float(h[k]); f[2 * k + 1] = __high2float(h[k]); }
 }
-constexpr int ATT_LDS = 8 * GQ * (HD + 2) * 4;   // the block's wave partials (lds: the caller's)
-__device__ __forceinline__ void d_attn(const attn_args & a, int kvh, int sp, int tid, float * lds) {
-    float (*wo)[GQ][HD] = (float (*)[GQ][HD]) lds;
-    float (*wm)[GQ] = (float (*)[GQ]) (lds + 8 * GQ * HD), (*wl)[GQ] = (float (*)[GQ]) (lds + 8 * GQ * (HD + 1));
-    __shared__ int last;
-    const int wave = tid >> 6, lane = tid & 63, li = lane & 15, g = (sp * 8 + wave) * 4 + (lane >> 4);
-    const int h0 = kvh * GQ, c0 = kvh * HD + li * 8;
-    float m[GQ], l[GQ], o[GQ][8];
-    {
-        const float scale = 1.f / sqrtf((float) HD);
-        float q[GQ][8];
-        #pragma unroll
-        for (int hh = 0; hh < GQ; hh++) {
-            #pragma unroll
-            for (int k = 0; k < 8; k++) { q[hh][k] = a.q[(h0 + hh) * HD + li * 8 + k] * scale; o[hh][k] = 0.f; }
-            m[hh] = -INFINITY; l[hh] = 0.f;
-        }
-        const int lo = a.full ? 0 : max(0, a.pos - (WIN - 1));
-        for (int j0 = lo + g; j0 <= a.pos; j0 += 2 * ATT_G) {
-            const int j1 = j0 + ATT_G;
-            const bool two = j1 <= a.pos;
-            const int r0 = a.full ? j0 : j0 % PF_RING, r1 = two ? (a.full ? j1 : j1 % PF_RING) : r0;
-            const uint4 k0u = *(const uint4 *) (a.kc + (size_t) r0 * KVL + c0);
-            const uint4 k1u = *(const uint4 *) (a.kc + (size_t) r1 * KVL + c0);
-            const uint4 v0u = *(const uint4 *) (a.vc + (size_t) r0 * KVL + c0);
-            const uint4 v1u = *(const uint4 *) (a.vc + (size_t) r1 * KVL + c0);
-            const int d0 = min(a.pos - j0, REL_EXT), d1 = min(a.pos - j1, REL_EXT);
-            float kf[8], vf[8];
-            float s0[GQ], s1[GQ];
-            att_h8(k0u, kf);
-            #pragma unroll
-            for (int hh = 0; hh < GQ; hh++) {
-                float x = 0.f;
-                #pragma unroll
-                for (int k = 0; k < 8; k++) x += q[hh][k] * kf[k];
-                s0[hh] = att_row16(x) + a.tb[(h0 + hh) * TBW + d0];
-            }
-            att_h8(k1u, kf);
-            #pragma unroll
-            for (int hh = 0; hh < GQ; hh++) {
-                float x = 0.f;
-                #pragma unroll
-                for (int k = 0; k < 8; k++) x += q[hh][k] * kf[k];
-                x = att_row16(x);
-                s1[hh] = two ? x + a.tb[(h0 + hh) * TBW + max(d1, 0)] : -INFINITY;
-            }
-            float p0[GQ], p1[GQ];
-            #pragma unroll
-            for (int hh = 0; hh < GQ; hh++) {
-                const float mn = fmaxf(m[hh], fmaxf(s0[hh], s1[hh])), c = expf(m[hh] - mn);
-                p0[hh] = expf(s0[hh] - mn); p1[hh] = two ? expf(s1[hh] - mn) : 0.f;
-                l[hh] = l[hh] * c + p0[hh] + p1[hh];
-                #pragma unroll
-                for (int k = 0; k < 8; k++) o[hh][k] *= c;
-                m[hh] = mn;
-            }
-            att_h8(v0u, vf);
-            #pragma unroll
-            for (int hh = 0; hh < GQ; hh++)
-                #pragma unroll
-                for (int k = 0; k < 8; k++) o[hh][k] += p0[hh] * vf[k];
-            att_h8(v1u, vf);
-            #pragma unroll
-            for (int hh = 0; hh < GQ; hh++)
-                #pragma unroll
-                for (int k = 0; k < 8; k++) o[hh][k] += p1[hh] * vf[k];
-        }
-    }
-    // the wave's 4 row groups: lanes li, li + 16, li + 32, li + 48 hold the same dims
-    #pragma unroll
-    for (int off = 16; off <= 32; off <<= 1) {
-        #pragma unroll
-        for (int hh = 0; hh < GQ; hh++) {
-            float o2[8];
-            #pragma unroll
-            for (int k = 0; k < 8; k++) o2[k] = __shfl_xor(o[hh][k], off, 64);
-            const float m2 = __shfl_xor(m[hh], off, 64), l2 = __shfl_xor(l[hh], off, 64);
-            att_join(m[hh], l[hh], o[hh], m2, l2, o2, 8);   // symmetric: both lanes get the same bits
-        }
-    }
-    if (lane < 16) {
-        #pragma unroll
-        for (int hh = 0; hh < GQ; hh++) {
-            #pragma unroll
-            for (int k = 0; k < 8; k++) wo[wave][hh][li * 8 + k] = o[hh][k];
-            if (lane == 0) { wm[wave][hh] = m[hh]; wl[wave][hh] = l[hh]; }
-        }
-    }
-    __syncthreads();
-    const int hh = tid >> 7, d = tid & (HD - 1);
-    float * P = a.part + (size_t) kvh * ATT_SPL * GQ * ATT_PW;
-    if (tid < GQ * HD) {   // the block's 8 waves, in order
-        float M = wm[0][hh], L = wl[0][hh], O = wo[0][hh][d];
-        for (int w = 1; w < 8; w++) att_join(M, L, &O, wm[w][hh], wl[w][hh], &wo[w][hh][d], 1);
-        float * B = P + ((size_t) sp * GQ + hh) * ATT_PW;
-        if (d == 0) { B[0] = M; B[1] = L; }
-        B[2 + d] = O;
-    }
-    __syncthreads();
-    if (tid == 0) {
-        __threadfence();
-        const int old = atomicAdd(&a.cnt[kvh], 1);
-        last = old == ATT_SPL - 1;
-        if (last) { a.cnt[kvh] = 0; __threadfence(); }     // acquire: the other blocks' partials
-    }
-    __syncthreads();
-    if (!last) return;                                     // block-uniform
-    if (tid < GQ * HD) {
-        float M = 0.f, L = 1.f, O = 0.f;                   // the sink: logit 0, value 0
-        float bm[ATT_SPL], bl[ATT_SPL], bo[ATT_SPL];
-        #pragma unroll
-        for (int b = 0; b < ATT_SPL; b++) {
-            const float * B = P + ((size_t) b * GQ + hh) * ATT_PW;
-            bm[b] = B[0]; bl[b] = B[1]; bo[b] = B[2 + d];
-        }
-        #pragma unroll
-        for (int b = 0; b < ATT_SPL; b++) att_join(M, L, &O, bm[b], bl[b], &bo[b], 1);
-        const int i = (h0 + hh) * HD + d;
-        const float y = O / L * sigm(a.gate[i]);
-        quant32(y, a.oq, a.os, i);
-    }
-    __syncthreads();
-}
-// grid HKVL * ATT_SPL
 
 // ---- the TP2 sum of the two cards' partials, then a short conv with its history and no
 // dynamic taps. blk null: x += a. Otherwise blk = x and x = a, a new residual block. One
@@ -573,5 +436,7 @@ static __global__ void k_softcap(float * y, int n, float cap) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = cap * tanhf(y[i] / cap);
 }
+
+#include "ink2_flash.h"
 
 #pragma clang fp contract(fast)
