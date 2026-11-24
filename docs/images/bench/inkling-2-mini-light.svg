@@ -3,11 +3,11 @@
 <text x="30" y="58" font-size="12" fill="#656d76">tok/s, higher is better; DSpark samples by speculative sampling (same distribution as plain)</text>
 <text x="30" y="96" font-size="14" font-weight="600" fill="#1f2328">Prefill, pp2048</text>
 <text x="30" y="125" font-size="12" fill="#1f2328">0 ctx</text>
-<rect x="150" y="112" width="434.9" height="18" rx="3" fill="#3b82f6"/>
-<text x="592.9" y="125" font-size="12" fill="#1f2328">1864  <tspan fill="#656d76">quartz</tspan></text>
+<rect x="150" y="112" width="439.6" height="18" rx="3" fill="#3b82f6"/>
+<text x="597.6" y="125" font-size="12" fill="#1f2328">1884  <tspan fill="#656d76">quartz</tspan></text>
 <text x="30" y="161" font-size="12" fill="#1f2328">16k ctx</text>
-<rect x="150" y="148" width="303.3" height="18" rx="3" fill="#3b82f6"/>
-<text x="461.3" y="161" font-size="12" fill="#1f2328">1300  <tspan fill="#656d76">quartz</tspan></text>
+<rect x="150" y="148" width="322.2" height="18" rx="3" fill="#3b82f6"/>
+<text x="480.2" y="161" font-size="12" fill="#1f2328">1381  <tspan fill="#656d76">quartz</tspan></text>
 <text x="30" y="206" font-size="14" font-weight="600" fill="#1f2328">Decode, 400 tokens, sampled</text>
 <rect x="520" y="194" width="12" height="12" rx="2" fill="#9aa4af"/><text x="538" y="205" font-size="12" fill="#1f2328">Plain</text>
 <rect x="610" y="194" width="12" height="12" rx="2" fill="#8b5cf6"/><text x="628" y="205" font-size="12" fill="#1f2328">DSpark</text>
