@@ -3,6 +3,7 @@
 // Included by qwen35_model.cpp in namespace q35.
 #pragma once
 
+#include "core/link.h"
 #include "dspine.h"
 #include <initializer_list>
 
@@ -940,7 +941,9 @@ inline void qz_ds_block_round2(qz_ds_block * D, qz_ds_ctx * CX, int anchor, int 
     };
     auto exchange = [&]() {          // ship the partials in t1, then x += own + peer on both cards
         each([&](int c, qz_ds_block & d, qz_ds_ctx &, hipStream_t s) {
-            DS_CHECK(hipMemcpyPeerAsync(D[1 - c].xin[xk], D[1 - c].dev, d.t1, d.dev, (size_t) DS_T * H * 4, s));
+            // into the peer's inbox: a peer copy on this card's stream under p2p, a D2H and
+            // an H2D on the peer's stream under the host link (qz_xdst, so p2p is unchanged)
+            DS_CHECK(qz_xcopy(D[1 - c].xin[xk], 1 - c, qz_xdst(D[1 - c].st), d.t1, c, s, (size_t) DS_T * H * 4));
             DS_CHECK(hipEventRecord(d.ev, s));
         });
         each([&](int c, qz_ds_block & d, qz_ds_ctx &, hipStream_t s) {
@@ -1019,15 +1022,18 @@ inline void qz_ds_block_round2(qz_ds_block * D, qz_ds_ctx * CX, int anchor, int 
                                                                       d.hh_v, d.hh_s, d.bas_l);
         ds_rows_l<<<(DS_T - 1) * DS_TOPK + 1, 256, 0, s>>>(d.TG, d.TSV, d.tki, c * V2, anchor, d.tg_l, d.tsv_l, d.tsva_l);
     });
+    // card 1's top-16 lists into card 0's staging: six copies on card 1's stream under
+    // p2p. Under the host link the H2D lands on card 0's stream (qz_xdst), which is where
+    // ds_top16_m reads them, so the event below and its wait stay as they are.
     DS_CHECK(hipSetDevice(D[1].dev));
-    DS_CHECK(hipMemcpyPeerAsync(D[0].ptkv, D[0].dev, D[1].tkv, D[1].dev, (size_t) (DS_T - 1) * DS_TOPK * 4, D[1].st));
-    DS_CHECK(hipMemcpyPeerAsync(D[0].ptki, D[0].dev, D[1].tki, D[1].dev, (size_t) (DS_T - 1) * DS_TOPK * 4, D[1].st));
-    DS_CHECK(hipMemcpyPeerAsync(D[0].pbas, D[0].dev, D[1].bas_l, D[1].dev, (size_t) (DS_T - 1) * DS_TOPK * 4, D[1].st));
+    DS_CHECK(qz_xcopy(D[0].ptkv, 0, qz_xdst(D[0].st), D[1].tkv, 1, D[1].st, (size_t) (DS_T - 1) * DS_TOPK * 4));
+    DS_CHECK(qz_xcopy(D[0].ptki, 0, qz_xdst(D[0].st), D[1].tki, 1, D[1].st, (size_t) (DS_T - 1) * DS_TOPK * 4));
+    DS_CHECK(qz_xcopy(D[0].pbas, 0, qz_xdst(D[0].st), D[1].bas_l, 1, D[1].st, (size_t) (DS_T - 1) * DS_TOPK * 4));
     {
         const size_t nr = (size_t) (DS_T - 1) * DS_TOPK;
-        DS_CHECK(hipMemcpyPeerAsync(D[0].ptg, D[0].dev, D[1].tg_l, D[1].dev, nr * DS_R * 4, D[1].st));
-        DS_CHECK(hipMemcpyPeerAsync(D[0].ptsv, D[0].dev, D[1].tsv_l, D[1].dev, nr * 2 * DS_R * 4, D[1].st));
-        if (anchor >= V2) DS_CHECK(hipMemcpyPeerAsync(D[0].ptsva, D[0].dev, D[1].tsva_l, D[1].dev, 2 * DS_R * 4, D[1].st));
+        DS_CHECK(qz_xcopy(D[0].ptg, 0, qz_xdst(D[0].st), D[1].tg_l, 1, D[1].st, nr * DS_R * 4));
+        DS_CHECK(qz_xcopy(D[0].ptsv, 0, qz_xdst(D[0].st), D[1].tsv_l, 1, D[1].st, nr * 2 * DS_R * 4));
+        if (anchor >= V2) DS_CHECK(qz_xcopy(D[0].ptsva, 0, qz_xdst(D[0].st), D[1].tsva_l, 1, D[1].st, 2 * DS_R * 4));
     }
     DS_CHECK(hipEventRecord(D[1].ev, D[1].st));
     DS_CHECK(hipSetDevice(D[0].dev));

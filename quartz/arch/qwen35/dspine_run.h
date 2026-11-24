@@ -3,6 +3,7 @@
 #include <chrono>
 
 #include "core/devices.h"
+#include "core/link.h"
 #include <random>
 #include <vector>
 
@@ -72,8 +73,10 @@ struct qz_dsrun {
             DS_CHECK(hipMemset(fca[c], 0, (size_t) DS_FR * QZ_D));
             DS_CHECK(hipMemset(fcas[c], 0, (size_t) DS_FR * QZ_D / 32 * 4));
             DS_CHECK(qz_dmalloc(&topk_d[c], (size_t) MVW * QZ_TOPK_NB * QZ_TOPK * sizeof(float2)));
-            DS_CHECK(hipMemset(mv[c].xflag, 0, 512));
-            DS_CHECK(hipMemset(mw[c].xflag, 0, 512));
+            // the exchange flags: p2p memsets the card's VRAM, host mode writes the pinned
+            // mailbox itself (no kernel is in flight yet)
+            DS_CHECK(qz_xzero(mv[c].xflag, 512));
+            DS_CHECK(qz_xzero(mw[c].xflag, 512));
         }
         DS_CHECK(hipSetDevice(qz_dev_of(0)));
         DS_CHECK(hipEventCreateWithFlags(&fev, hipEventDisableTiming));
@@ -100,8 +103,12 @@ struct qz_dsrun {
             DS_CHECK(hipEventRecord(fev, cx[0].st));
             DS_CHECK(hipSetDevice(qz_dev_of(1)));
             DS_CHECK(hipStreamWaitEvent(cx[1].st, fev, 0));
-            DS_CHECK(hipMemcpyPeerAsync(fa[1], qz_dev_of(1), fa[0], qz_dev_of(0), (size_t) Mp * KF, cx[1].st));
-            DS_CHECK(hipMemcpyPeerAsync(fas[1], qz_dev_of(1), fas[0], qz_dev_of(0), (size_t) Mp * KF / 32 * 4, cx[1].st));
+            // the quantized features card 0 just wrote, into card 1's copies: the source
+            // is card 0's, so the copy is queued on its stream and card 1's stream waits
+            // for it (both modes: under p2p the copy no longer runs on card 1's stream, so
+            // the qz_xcopy event is what orders the GEMMs below).
+            DS_CHECK(qz_xcopy(fa[1], 1, cx[1].st, fa[0], 0, cx[0].st, (size_t) Mp * KF));
+            DS_CHECK(qz_xcopy(fas[1], 1, cx[1].st, fas[0], 0, cx[0].st, (size_t) Mp * KF / 32 * 4));
             for (int c = 0; c < 2; c++) {
                 DS_CHECK(hipSetDevice(qz_dev_of(c)));
                 qz_ds_ctx & d = cx[c];

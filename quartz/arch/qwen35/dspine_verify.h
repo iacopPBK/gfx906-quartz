@@ -540,10 +540,10 @@ inline int mv_init(mv_ctx & m, qz_engine & eng, int c, float * ring_share = null
     for (const auto & W : m.wh) n_recr += W.recr != 0;
     if (ring_share) m.ring8 = ring_share;
     else fz((void **) &m.ring8, n_recr * 2 * (size_t) qz_geo<MV_TR>::RING_PAR * 4);
-    CHECK(qz_dmalloc_uncached((void **) &m.xhm, (size_t) 2 * MV_T * 2 * 4));
-    CHECK(hipMemset(m.xhm, 0, (size_t) 2 * MV_T * 2 * 4));
-    CHECK(qz_dmalloc_uncached((void **) &m.xflag, 512));
-    CHECK(hipMemset(m.xflag, 0, 512));
+    // the two peers' mailboxes: uncached VRAM under p2p, pinned host memory under the
+    // host link, which both cards reach with one pointer. Nothing else changes.
+    CHECK(qz_xalloc((void **) &m.xhm, (size_t) 2 * MV_T * 2 * 4, c, "xhm"));
+    CHECK(qz_xalloc((void **) &m.xflag, 512, c, "xflag"));
     fu((void **) &m.ctl_d, 8 * 4);
     fz((void **) &m.g8a, (size_t) MV_T * Gm::FF * 4);
     fz((void **) &m.g8b, (size_t) MV_T * Gm::FF * 4);
@@ -579,9 +579,8 @@ inline int mv_init(mv_ctx & m, qz_engine & eng, int c, float * ring_share = null
     fz(&A.y_head, (size_t) MV_T * eng.hrows * 4);
     fz(&A.out_tok, (size_t) MV_T * 4);
     fz(&A.y_part, (size_t) MV_DKC * MV_T * QZ_D * 4);
-    CHECK(qz_dmalloc_uncached((void **) &A.xin_mine,
-                             ((size_t) 2 * MV_T * QZ_D + (size_t) 2 * MV_T * (QZ_D / 32)) * 4));
-    CHECK(hipMemset(A.xin_mine, 0, ((size_t) 2 * MV_T * QZ_D + (size_t) 2 * MV_T * (QZ_D / 32)) * 4));
+    CHECK(qz_xalloc((void **) &A.xin_mine,
+                    ((size_t) 2 * MV_T * QZ_D + (size_t) 2 * MV_T * (QZ_D / 32)) * 4, c, "xin"));
     A.xhm_mine = m.xhm;
     A.xflag_mine = m.xflag;
     A.ctl = m.ctl_d;

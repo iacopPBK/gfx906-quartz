@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "core/devices.h"
+#include "core/link.h"
 
 // Per-card geometry. The PF_ prefix avoids the D, S, G macros engine.h defines.
 constexpr int PF_D = 5120, PF_CCH = 5120, PF_HK = 8, PF_HV = 24, PF_S = 128, PF_G = 3072, PF_AQ = 6144,
@@ -491,10 +492,10 @@ struct qz_prefill {
         hipStream_t aux = nullptr;
     } c[2];
 
-    // the per-card buffers of init(max_rows): (pointer, bytes) for M rows
+    // the per-card buffers of init(max_rows): (pointer, bytes) for M rows.
     static std::vector<std::pair<void **, size_t>> bufs(card & k, size_t M) {
-        const size_t xb = 2;                             // bytes per bf16 cross-card partial
-        return { { (void **) &k.x, M * PF_D * 4 }, { (void **) &k.part, M * PF_D * 4 }, { (void **) &k.y, M * PF_AQ * 4 },
+        const size_t xb = 2, pb = M * PF_D * xb;         // bytes per bf16 cross-card partial
+        std::vector<std::pair<void **, size_t>> v = { { (void **) &k.x, M * PF_D * 4 }, { (void **) &k.part, M * PF_D * 4 }, { (void **) &k.y, M * PF_AQ * 4 },
                  { (void **) &k.conv, M * PF_CCH * 4 }, { (void **) &k.z, M * PF_G * 4 }, { (void **) &k.ba, M * 2 * PF_HV * 4 },
                  { (void **) &k.qn, M * PF_HK * PF_S * 4 }, { (void **) &k.kn, M * PF_HK * PF_S * 4 },
                  { (void **) &k.beta, M * PF_HV * 4 }, { (void **) &k.dec, M * PF_HV * 4 }, { (void **) &k.o, M * PF_HV * PF_S * 4 },
@@ -503,8 +504,9 @@ struct qz_prefill {
                  { (void **) &k.aq2, M * 2 * PF_D }, { (void **) &k.as2, M * 2 * PF_D / 32 * 4 },
                  { (void **) &k.hn, M * PF_D * 4 }, { (void **) &k.cat, M * 2 * PF_D * 4 },
                  { (void **) &k.q16, M * PF_HQ * PF_HD * 2 }, { (void **) &k.tok, M * 4 }, { (void **) &k.edge, (size_t) 64 * 3 * PF_CCH * 4 },
-                 { &k.pl[0], M * PF_D * xb }, { &k.pr[0], M * PF_D * xb }, { &k.pl[1], M * PF_D * xb }, { &k.pr[1], M * PF_D * xb },
+                 { &k.pl[0], pb }, { &k.pr[0], pb }, { &k.pl[1], pb }, { &k.pr[1], pb },
                  { (void **) &k.irow, M * 4 }, { (void **) &k.rpos, M * 3 * 4 } };
+        return v;
     }
     static size_t rows(int max_rows) { return (size_t) ((max_rows + PF_MT - 1) / PF_MT * PF_MT + PF_MT); }
     // device bytes per card that init(max_rows) needs, buffers 256-byte aligned
@@ -549,7 +551,9 @@ struct qz_prefill {
     half hv[2];
     int nh = 1;
     int hset[2] = {0, 0}, hpn[2] = {0, 0};          // per half: the partial set in use (hset) and a pending sum flag (hpn)
-    hipEvent_t evx[2][2] = {}, evh[2][4] = {};      // [card][half]: a partial is written. [card][kind]: half 0's conv, scan or kv is done, or the join
+    hipEvent_t evx[2][2] = {}, evh[2][4] = {}, evc[2][2] = {};
+                                                    // [card][half]: a partial is written. [card][kind]: half 0's conv, scan or kv is done, or the join.
+                                                    // evc[card][half]: the copy of the peer's partial into that card has landed (host mode)
 
     hipStream_t hs(qz_engine & e, int i, int h) { return h == 0 ? e.C[i].st : c[i].aux; }
 
@@ -562,14 +566,36 @@ struct qz_prefill {
     }
     // Row-parallel projection. Each card writes its bf16 partial locally and to the peer.
     // The next norm() applies x += p0 + p1. Two partial sets alternate.
+    // Reaching the peer: under p2p the GEMM's C2 epilogue stores straight into its VRAM.
+    // In host mode it cannot, so the GEMM writes only the local pl and one staged copy per
+    // card moves the tile-aligned rows into the peer's pr, which its owner then reads
+    // without leaving the card. The plan's variant A instead puts pr in pinned host memory,
+    // so the epilogue stores into it and the peer's addnorm reads it back over PCIe, no
+    // copy at all; measured on the 1422-token prompt it gave 535-585 t/s of prefill against
+    // 657-659 for these copies and 709-726 for p2p, so this is the variant kept. Neither
+    // changes the arithmetic, only where the partial is written.
     void rowpar(qz_engine & e, int h, const char * const * W, const __half * const * sw, int K, bool ffn) {
         const half & H = hv[h];
         hset[h] ^= 1;
+        const int s_ = hset[h];
+        const bool xc = qz_link == QZ_LINK_HOST;   // partial by copy, no peer store
         for (int i = 0; i < 2; i++) {
             CHECK(hipSetDevice(qz_dev_of(i)));
             hipLaunchKernelGGL(pf_gemm<0>, dim3(PF_D / 64, H.nty), dim3(256), 0, hs(e, i, h), ffn ? c[i].aq2 : c[i].aq, ffn ? c[i].as2 : c[i].as, Mp, W[i], sw[i],
-                               K, K, (float *) c[i].pl[hset[h]], PF_D, PF_D, H.ty0, 1, (unsigned short *) c[1 - i].pr[hset[h]]);
+                               K, K, (float *) c[i].pl[s_], PF_D, PF_D, H.ty0, 1,
+                               xc ? (unsigned short *) nullptr : (unsigned short *) c[1 - i].pr[s_]);
             CHECK(hipEventRecord(evx[i][h], hs(e, i, h)));
+        }
+        if (xc) {
+            // the rows this half's GEMM wrote, straight into the peer's pr: the source is
+            // this card's stream, the destination the peer's, and evc says it has landed
+            const size_t off = (size_t) H.r0 * PF_D * 2, nb = (size_t) (H.rp - H.r0) * PF_D * 2;
+            for (int i = 0; i < 2; i++) {
+                CHECK(qz_xcopy((char *) c[1 - i].pr[s_] + off, 1 - i, hs(e, 1 - i, h),
+                               (const char *) c[i].pl[s_] + off, i, hs(e, i, h), nb));
+                CHECK(hipSetDevice(qz_dev_of(1 - i)));
+                CHECK(hipEventRecord(evc[1 - i][h], hs(e, 1 - i, h)));
+            }
         }
         hpn[h] = 1;
     }
@@ -582,6 +608,8 @@ struct qz_prefill {
         const int r1 = rows_end >= 0 ? rows_end : H.rp;
         if (hpn[h]) {
             CHECK(hipStreamWaitEvent(st, evx[1 - i][h], 0));
+            if (qz_link == QZ_LINK_HOST)   // the peer's partial arrived by copy
+                CHECK(hipStreamWaitEvent(st, evc[i][h], 0));
             const int s_ = hset[h];
             const void * p0 = i == 0 ? k.pl[s_] : k.pr[s_], * p1 = i == 0 ? k.pr[s_] : k.pl[s_];
             hipLaunchKernelGGL(pf_addnorm_quant<PF_D>, dim3(r1 - H.r0), dim3(256), 0, st, k.x, (const unsigned short *) p0,
@@ -701,6 +729,7 @@ struct qz_prefill {
             if (!evx[i][0]) {
                 for (int h = 0; h < 2; h++) CHECK(hipEventCreateWithFlags(&evx[i][h], hipEventDisableTiming));
                 for (int j = 0; j < 4; j++) CHECK(hipEventCreateWithFlags(&evh[i][j], hipEventDisableTiming));
+                for (int h = 0; h < 2; h++) CHECK(hipEventCreateWithFlags(&evc[i][h], hipEventDisableTiming));
             }
             // in the shared scratch the buffers still hold the decode's partials, so zero
             // them like fresh buffers. Rows past n are padding the kernels skip.
@@ -712,7 +741,9 @@ struct qz_prefill {
             CHECK(hipSetDevice(qz_dev_of(i)));
             // the first row-parallel partial lands in the peer's scratch, so wait until
             // the peer has zeroed it: the peer may still be busy with the last chunk's
-            // snapshot copies, and its memset would then wipe this card's partial.
+            // snapshot copies, and its memset would then wipe this card's partial. In host
+            // mode the partial arrives by copy instead, ordered by evc, so this wait is no
+            // longer load-bearing there; it stays so both modes queue work the same way.
             CHECK(hipStreamWaitEvent(K.st, c[1 - i].ev, 0));
             CHECK(hipMemcpyAsync(c[i].tok, toks, (size_t) n * 4, hipMemcpyHostToDevice, K.st));
             if (mm) { mm_stage(e, mm, p0, n, i); CHECK(hipSetDevice(qz_dev_of(i))); }   // after the scratch memset

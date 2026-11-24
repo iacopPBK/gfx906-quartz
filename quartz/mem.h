@@ -179,6 +179,14 @@ inline void qz_mem_host_add(void * dev_p, void * host_p, size_t bytes, const cha
     L.htracked += bytes;
 }
 
+// the host pointer behind a mailbox, or nullptr when `p` is not one. Keeps the record.
+inline void * qz_mem_host_of(void * p) {
+    qz_mem_ledger & L = qz_mem();
+    std::lock_guard<std::mutex> g(L.mu);
+    auto it = L.hlive.find(p);
+    return it == L.hlive.end() ? nullptr : it->second.host;
+}
+
 // the host pointer behind a mailbox, or nullptr when `p` is not one
 inline void * qz_mem_host_del(void * p) {
     qz_mem_ledger & L = qz_mem();

@@ -2,6 +2,7 @@
 #include "qwen3vl.h"
 #include "loader.h"
 #include "core/devices.h"
+#include "core/link.h"
 #include "gguf.h"
 #include "mem.h"
 #include "resize.h"
@@ -348,7 +349,8 @@ struct vcard {
     unsigned char * rgb = nullptr;
     size_t rgb_cap = 0;
     __half * P = nullptr, * h = nullptr, * Q = nullptr, * K = nullptr, * V = nullptr, * O = nullptr, * G = nullptr;
-    // inbox holds the peer's partials, allocated uncached
+    // inbox holds the peer's partials: uncached VRAM under p2p, a host mailbox both cards
+    // reach with one pointer under the host link (core/link.h)
     float * x = nullptr, * y = nullptr, * part = nullptr, * inbox[2] = {};
 };
 
@@ -443,6 +445,9 @@ qz_vision * qz_vision_load(const char * path) {
     {                                      // the per-card slices
         for (int c = 0; c < 2; c++) {   // peer access both ways, already-enabled is fine
             if (hipSetDevice(v->C[c].dev) != hipSuccess) return fail("bad device");
+            // host mode never enables it: the mailboxes are pinned host memory the two
+            // cards map, and the weight copies below are staged (qz_xcopy_sync)
+            if (qz_link == QZ_LINK_HOST) continue;
             const hipError_t e = hipDeviceEnablePeerAccess(v->C[1 - c].dev, 0);
             if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled) return fail("no peer access between the cards");
             (void) hipGetLastError();
@@ -463,9 +468,12 @@ qz_vision * qz_vision_load(const char * path) {
             ok = ok && hipMemcpy2D(d, dp, src, sp, w, rows, hipMemcpyDefault) == hipSuccess;
         };
         vcard & c1 = v->C[1];
+        // card 0's tensors onto card 1: peer copies under p2p, staged through pinned host
+        // memory under the host link (qz_xcopy_sync; hipMemcpyDefault needs peer access)
+        auto xcp = [&](void * d, const void * src, size_t bytes) { ok = ok && qz_xcopy_sync(d, 1, src, 0, bytes) == hipSuccess; };
         auto dup = [&](const float * src, size_t n) -> const float * {
             float * d = (float *) al(c1, n * 4);
-            if (d) cp(d, src, n * 4);
+            if (d) xcp(d, src, n * 4);
             return d;
         };
         std::vector<char> hb[6];
@@ -508,7 +516,7 @@ qz_vision * qz_vision_load(const char * path) {
         fclose(fp);
         if (ok) {
             __half * w0 = (__half *) al(c1, (size_t) V_D * V_K * 2), * w1 = (__half *) al(c1, (size_t) V_D * V_K * 2);
-            if (ok) { cp(w0, c0.patch_w0, (size_t) V_D * V_K * 2); cp(w1, c0.patch_w1, (size_t) V_D * V_K * 2); }
+            if (ok) { xcp(w0, c0.patch_w0, (size_t) V_D * V_K * 2); xcp(w1, c0.patch_w1, (size_t) V_D * V_K * 2); }
             c1.patch_w0 = w0; c1.patch_w1 = w1;
             c1.patch_b = dup(c0.patch_b, V_D);
             c1.pos = dup(c0.pos, (size_t) V_GRID * V_GRID * V_D);
@@ -532,8 +540,8 @@ qz_vision * qz_vision_load(const char * path) {
                 && qz_dmalloc(&C.V, np * hd * 2, "act") == hipSuccess
                 && qz_dmalloc(&C.O, np * hd * 2, "act") == hipSuccess;
         ok = ok && qz_dmalloc(&C.part, np * V_D * 4, "exchange") == hipSuccess
-                    && qz_dmalloc_uncached(&C.inbox[0], np * V_D * 4, "exchange") == hipSuccess
-                    && qz_dmalloc_uncached(&C.inbox[1], np * V_D * 4, "exchange") == hipSuccess;
+                    && qz_xalloc((void **) &C.inbox[0], np * V_D * 4, c, "exchange") == hipSuccess
+                    && qz_xalloc((void **) &C.inbox[1], np * V_D * 4, c, "exchange") == hipSuccess;
         if (c == 0) ok = ok && qz_dmalloc(&v->out, (size_t) v->max_tok * v->n_out * 4, "out") == hipSuccess;
         ok = ok && rocblas_create_handle(&C.blas) == rocblas_status_success && rocblas_set_stream(C.blas, C.st) == rocblas_status_success;
     }
@@ -574,7 +582,10 @@ int qz_vision_encode_rgb(qz_vision * v, const unsigned char * rgb, int w, int h,
     };
     auto exchange = [&](auto bias) {   // part to the peer's inbox, then the two-card sum
         each([&](int c, vcard & C, hipStream_t s) {
-            VCHK(hipMemcpyPeerAsync(v->C[1 - c].inbox[v->xk], v->C[1 - c].dev, C.part, C.dev, (size_t) N * V_D * 4, s));
+            // this card's partials into the peer's inbox. p2p: the peer copy on this card's
+            // stream. host: D2H here, H2D on the peer's stream, which is the stream the
+            // add below runs on, so it is ordered behind the copy.
+            VCHK(qz_xcopy(v->C[1 - c].inbox[v->xk], 1 - c, qz_xdst(v->C[1 - c].st), C.part, c, s, (size_t) N * V_D * 4));
             VCHK(hipEventRecord(C.ev, s));
             return 0;
         });
@@ -647,9 +658,11 @@ void qz_vision_free(qz_vision * v) {
         if (C.dev < 0 || hipSetDevice(C.dev) != hipSuccess) continue;
         if (C.st) (void) hipStreamSynchronize(C.st);
         for (void * p : { (void *) C.rgb, (void *) C.P, (void *) C.x, (void *) C.h, (void *) C.y, (void *) C.G, (void *) C.Q,
-                          (void *) C.K, (void *) C.V, (void *) C.O, (void *) C.part, (void *) C.inbox[0], (void *) C.inbox[1],
+                          (void *) C.K, (void *) C.V, (void *) C.O, (void *) C.part,
                           c == 0 ? (void *) v->out : nullptr })
             if (p) (void) qz_dfree(p);
+        for (void * p : { (void *) C.inbox[0], (void *) C.inbox[1] })   // qz_xalloc mailboxes
+            if (p) (void) qz_xfree(p);
         for (void * p : C.own) (void) qz_dfree(p);
         if (c == 0) for (auto & t : v->ld.ts) if (!t.shared && t.vals) (void) qz_dfree(t.vals);
         if (C.blas) rocblas_destroy_handle(C.blas);
