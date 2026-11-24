@@ -19,7 +19,6 @@
 
 constexpr int DS_BS = 8, DS_NL = 3, DS_R = 256, DS_FF = 9216, DS_Q = 3072, DS_KV = 1024, DS_NQ = 24, DS_NKV = 8;
 constexpr int DS_NQL = DS_NQ / 2, DS_NKVL = DS_NKV / 2, DS_QL = DS_Q / 2, DS_KVL = DS_KV / 2, DS_FFL = DS_FF / 2;   // per card
-constexpr int DS_SPL = 16;                     // attention key splits (4 waves each)
 constexpr int DS_NT = 256;                     // the drafter GEMV's block (4 waves, 4 rows each)
 constexpr float DS_EPS = 1e-6f, DS_THETA = 1e6f;
 constexpr long long DS_SPIN = 2000000000ll;    // clock64 ticks a cross-card wait may spin
@@ -215,62 +214,166 @@ static __global__ void k_ds_store(const float * k, const float * v, __half * ck,
     ck[(size_t) pos0 * DS_KVL + i] = __float2half(k[i]);
     cv[(size_t) pos0 * DS_KVL + i] = __float2half(v[i]);
 }
-// attention of the block's DS_BS query rows, head blockIdx.x of this card, over context
-// keys [lo, a) of the f16 cache and the DS_BS block keys in f32, with no mask. The head
-// runs DS_SPL blocks of 4 waves, each leaving an (m, l, o[128]) partial per row.
-constexpr int DS_PW = HD + 2, DS_NP = DS_SPL * 4;
-static __global__ __launch_bounds__(256) void k_ds_attn(const float * q, const __half * ck, const __half * cv,
-                                                        const float * kb, const float * vb, int lo, int a, float * part) {
-    const int h = blockIdx.x, kh = h / (DS_NQL / DS_NKVL), wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
-    const int vw = blockIdx.y * 4 + wave;
-    const float scale = 1.f / sqrtf((float) HD);
-    float q0[DS_BS], q1[DS_BS], m[DS_BS], l[DS_BS], o0[DS_BS], o1[DS_BS];
+// attention of the block's DS_BS query rows, KV head blockIdx.x of this card, over the
+// context keys [lo, a) of the f16 cache and the DS_BS block keys in f32, with no mask.
+// One block per (KV head, key split): its DS_NQV = 3 q heads x 8 rows query vectors share
+// each key tile, which is staged in LDS as f32 so the inner loop is plain f32 FMAs and
+// 128-bit LDS reads. Each 8-lane group of a block owns one query vector and 16 of the 128
+// dims; the score sums the group's 8 lanes with 3 DPP steps. Every split leaves an
+// (m, l, o[128]) partial per query vector, and the last split also folds in the block's
+// own DS_BS f32 keys. Only the split count varies with the context length.
+constexpr int DS_GQA = DS_NQL / DS_NKVL;                     // 3 q heads per KV head
+constexpr int DS_NQV = DS_BS * DS_GQA;                       // 24 query vectors of one KV head
+constexpr int DS_NSPL = 64;                                  // key splits per KV head (bounds the partials)
+constexpr int DS_TILE = 12;                                  // cache keys staged per tile
+constexpr int DS_ATT_T = DS_NQV * 8;                         // 192 threads: one 8-lane group per query vector
+constexpr int DS_PW = HD + 2;
+// The LDS tile: one row of DS_TROW floats per key, cut into 8 blocks of 16 dims with 4
+// floats of padding. The pad puts the 8 lanes of a group on 8 different 4-bank windows,
+// without it they all read banks 0-3 or 16-19 and every tile read is 4-way conflicted.
+constexpr int DS_TPAD = 20, DS_TROW = (HD / 16) * DS_TPAD;
+__device__ __forceinline__ void ds_st8(float * p, const float * f) {
+    float4 * q = (float4 *) p;
+    q[0] = make_float4(f[0], f[1], f[2], f[3]); q[1] = make_float4(f[4], f[5], f[6], f[7]);
+}
+__device__ __forceinline__ void ds_ld16(const float * p, float * f) {
+    const float4 * q = (const float4 *) p;
+    const float4 a = q[0], b = q[1], c = q[2], d = q[3];
+    f[0] = a.x; f[1] = a.y; f[2] = a.z; f[3] = a.w; f[4] = b.x; f[5] = b.y; f[6] = b.z; f[7] = b.w;
+    f[8] = c.x; f[9] = c.y; f[10] = c.z; f[11] = c.w; f[12] = d.x; f[13] = d.y; f[14] = d.z; f[15] = d.w;
+}
+// sum of x over its 8-lane group, in every lane: the quad pair of the two quad_perm
+// steps, then row_half_mirror for lane ^ 7
+__device__ __forceinline__ float ds_row8(float x) {
+    x += qz_dpp<0x4E>(x);     // quad_perm [2,3,0,1]
+    x += qz_dpp<0xB1>(x);     // quad_perm [1,0,3,2]
+    x += qz_dpp<0x141>(x);    // row_half_mirror
+    return x;
+}
+// one key's contribution to a query vector: the score of the group's 16 dims, then the
+// online softmax and the value accumulation (c == 1 leaves o as it is)
+__device__ __forceinline__ void ds_attn_key(const float * qq, const float * kf, const float * vf, float * o,
+                                            float & m, float & l) {
+    float x0 = 0.f, x1 = 0.f, x2 = 0.f, x3 = 0.f;         // 4 chains: the lane sum is a 4-way tree
     #pragma unroll
-    for (int r = 0; r < DS_BS; r++) {
-        q0[r] = q[((size_t) r * DS_NQL + h) * HD + 2 * lane] * scale;
-        q1[r] = q[((size_t) r * DS_NQL + h) * HD + 2 * lane + 1] * scale;
-        m[r] = -INFINITY; l[r] = 0.f; o0[r] = o1[r] = 0.f;
+    for (int k = 0; k < 16; k += 4) {
+        x0 += qq[k] * kf[k]; x1 += qq[k + 1] * kf[k + 1];
+        x2 += qq[k + 2] * kf[k + 2]; x3 += qq[k + 3] * kf[k + 3];
     }
-    const int nk = a - lo + DS_BS;
-    for (int j = vw; j < nk; j += DS_NP) {
-        float k0, k1, v0, v1;
-        if (j < a - lo) {
-            const size_t o = (size_t) (lo + j) * DS_KVL + kh * HD + 2 * lane;
-            const __half2 kk = *(const __half2 *) (ck + o), vv = *(const __half2 *) (cv + o);
-            k0 = __low2float(kk); k1 = __high2float(kk); v0 = __low2float(vv); v1 = __high2float(vv);
-        } else {
-            const size_t o = (size_t) (j - (a - lo)) * DS_KVL + kh * HD + 2 * lane;
-            k0 = kb[o]; k1 = kb[o + 1]; v0 = vb[o]; v1 = vb[o + 1];
-        }
+    const float s = ds_row8((x0 + x1) + (x2 + x3));
+    const float mn = fmaxf(m, s), c = expf(m - mn), p = expf(s - mn);
+    l = l * c + p;
+    if (c < 1.f)
         #pragma unroll
-        for (int r = 0; r < DS_BS; r++) {
-            float s = q0[r] * k0 + q1[r] * k1;
-            #pragma unroll
-            for (int off = 32; off > 0; off >>= 1) s += __shfl_xor(s, off, 64);
-            const float mn = fmaxf(m[r], s), c = expf(m[r] - mn), p = expf(s - mn);
-            l[r] = l[r] * c + p; o0[r] = o0[r] * c + p * v0; o1[r] = o1[r] * c + p * v1; m[r] = mn;
-        }
-    }
+        for (int k = 0; k < 16; k++) o[k] *= c;
     #pragma unroll
-    for (int r = 0; r < DS_BS; r++) {
-        float * P = part + (((size_t) h * DS_NP + vw) * DS_BS + r) * DS_PW;
-        if (lane == 0) { P[0] = m[r]; P[1] = l[r]; }
-        P[2 + 2 * lane] = o0[r]; P[3 + 2 * lane] = o1[r];
+    for (int k = 0; k < 16; k++) o[k] += p * vf[k];
+    m = mn;
+}
+// one tile of DS_TILE cache keys for one query vector: the scores of the whole tile first,
+// then a single rescale against the tile's max, then an expf and a value accumulate per
+// key. The keys of a tile are independent, unlike the one-key-at-a-time update, so the
+// softmax latency no longer serializes the tile. Keys past n are masked to -infinity.
+__device__ __forceinline__ void ds_attn_tile(const float * qq, const float * sk, const float * sv, int li,
+                                             float * o, float & m, float & l, int n) {
+    float s[DS_TILE];
+    #pragma unroll
+    for (int t = 0; t < DS_TILE; t++) {
+        float kf[16];
+        ds_ld16(sk + t * DS_TROW + li * DS_TPAD, kf);
+        float x0 = 0.f, x1 = 0.f, x2 = 0.f, x3 = 0.f;        // 4 chains: the lane sum is a 4-way tree
+        #pragma unroll
+        for (int k = 0; k < 16; k += 4) {
+            x0 += qq[k] * kf[k]; x1 += qq[k + 1] * kf[k + 1];
+            x2 += qq[k + 2] * kf[k + 2]; x3 += qq[k + 3] * kf[k + 3];
+        }
+        s[t] = t < n ? ds_row8((x0 + x1) + (x2 + x3)) : -INFINITY;
+    }
+    float mt = s[0];
+    #pragma unroll
+    for (int t = 1; t < DS_TILE; t++) mt = fmaxf(mt, s[t]);
+    const float mn = fmaxf(m, mt), c = expf(m - mn);
+    l *= c;
+    if (c < 1.f)
+        #pragma unroll
+        for (int k = 0; k < 16; k++) o[k] *= c;
+    m = mn;
+    #pragma unroll
+    for (int t = 0; t < DS_TILE; t++) {
+        const float p = expf(s[t] - mn);
+        l += p;
+        float vf[16];
+        ds_ld16(sv + t * DS_TROW + li * DS_TPAD, vf);
+        #pragma unroll
+        for (int k = 0; k < 16; k++) o[k] += p * vf[k];
     }
 }
-// merge the DS_NP partials of head blockIdx.x, row blockIdx.y, into o [row][DS_QL]
-static __global__ __launch_bounds__(128) void k_ds_attn_merge(const float * part, float * o) {
+static __global__ __launch_bounds__(DS_ATT_T) void k_ds_attn(const float * q, const __half * ck, const __half * cv,
+                                                            const float * kb, const float * vb, int lo, int a, int nspl,
+                                                            int cks, float * part) {
+    __shared__ float sk[DS_TILE * DS_TROW], sv[DS_TILE * DS_TROW];
+    const int kh = blockIdx.x, sp = blockIdx.y, tid = threadIdx.x;
+    const int grp = tid >> 3, li = tid & 7;                  // query vector, its 16 dims
+    const int r = grp % DS_BS, gq = grp / DS_BS, h = kh * DS_GQA + gq;
+    const float scale = 1.f / sqrtf((float) HD);
+    float qq[16], o[16];
+    #pragma unroll
+    for (int k = 0; k < 16; k++) {
+        qq[k] = q[((size_t) r * DS_NQL + h) * HD + li * 16 + k] * scale;
+        o[k] = 0.f;
+    }
+    float m = -INFINITY, l = 0.f;
+    const int jb = sp * cks, je = min(a - lo, jb + cks);
+    // One tile of global loads per thread (DS_TILE * HD / 8 == DS_ATT_T), issued a tile
+    // ahead of the LDS staging so the next tile's latency is covered by the compute.
+    static_assert(DS_TILE * (HD / 8) == DS_ATT_T, "one uint4 of each cache per thread and tile");
+    const int lt = tid / (HD / 8), ldq = (tid % (HD / 8)) * 8;
+    const int lds = lt * DS_TROW + (ldq >> 4) * DS_TPAD + (ldq & 15);
+    uint4 kc, vc;
+    auto fetch = [&](int t0, int n) {
+        const size_t so = (size_t) (lo + t0 + min(lt, n - 1)) * DS_KVL + kh * HD + ldq;
+        kc = *(const uint4 *) (ck + so); vc = *(const uint4 *) (cv + so);
+    };
+    if (jb < je) fetch(jb, min(DS_TILE, je - jb));
+    for (int t0 = jb; t0 < je; t0 += DS_TILE) {
+        const int n = min(DS_TILE, je - t0);
+        float f[8];
+        __syncthreads();                                     // the previous tile is consumed
+        att_h8(kc, f); ds_st8(sk + lds, f);
+        att_h8(vc, f); ds_st8(sv + lds, f);
+        if (t0 + DS_TILE < je) fetch(t0 + DS_TILE, min(DS_TILE, je - t0 - DS_TILE));
+        __syncthreads();
+        ds_attn_tile(qq, sk, sv, li, o, m, l, n);
+    }
+    if (sp == nspl - 1)                                      // the block's own keys, f32, once
+        for (int t = 0; t < DS_BS; t++) {
+            float kf[16], vf[16];
+            ds_ld16(kb + (size_t) t * DS_KVL + kh * HD + li * 16, kf);
+            ds_ld16(vb + (size_t) t * DS_KVL + kh * HD + li * 16, vf);
+            ds_attn_key(qq, kf, vf, o, m, l);
+        }
+    float * P = part + (((size_t) kh * DS_NSPL + sp) * DS_NQV + grp) * DS_PW;
+    if (li == 0) { P[0] = m; P[1] = l; }
+    #pragma unroll
+    for (int k = 0; k < 16; k++) P[2 + li * 16 + k] = o[k];
+}
+// merge the nspl partials of q head blockIdx.x, row blockIdx.y, into o [row][DS_QL]
+static __global__ __launch_bounds__(128) void k_ds_attn_merge(const float * part, float * o, int nspl) {
     const int h = blockIdx.x, r = blockIdx.y, d = threadIdx.x;
+    const int kh = h / DS_GQA, grp = (h % DS_GQA) * DS_BS + r;
+    const float * B = part + ((size_t) kh * DS_NSPL * DS_NQV + grp) * DS_PW;
     float M = -INFINITY;
-    for (int w = 0; w < DS_NP; w++) M = fmaxf(M, part[(((size_t) h * DS_NP + w) * DS_BS + r) * DS_PW]);
+    for (int s = 0; s < nspl; s++) M = fmaxf(M, B[(size_t) s * DS_NQV * DS_PW]);
     float L = 0.f, O = 0.f;
     #pragma unroll 1
-    for (int w0 = 0; w0 < DS_NP; w0 += 16) {               // 16 partial loads in flight, folded in order
+    for (int w0 = 0; w0 < nspl; w0 += 16) {                // 16 partial loads in flight, folded in order
         float pm[16], pl[16], po[16];
         #pragma unroll
-        for (int k = 0; k < 16; k++) {
-            const float * P = part + (((size_t) h * DS_NP + w0 + k) * DS_BS + r) * DS_PW;
-            pm[k] = P[0]; pl[k] = P[1]; po[k] = P[2 + d];
+        for (int k = 0; k < 16; k++) {                     // past the end: the last partial, masked below
+            const int s = min(w0 + k, nspl - 1);
+            const float * P = B + (size_t) s * DS_NQV * DS_PW;
+            pm[k] = w0 + k < nspl ? P[0] : -INFINITY;
+            pl[k] = P[1]; po[k] = P[2 + d];
         }
         #pragma unroll
         for (int k = 0; k < 16; k++) {
@@ -566,7 +669,7 @@ struct ink2_dspark {
             al(&k.X, DS_BS * D); al(&k.Y, DS_BS * D); al(&k.Yp[0], DS_BS * D); al(&k.Yp[1], DS_BS * D);
             al(&k.Q, DS_BS * DS_QL); al(&k.Kb, DS_BS * DS_KVL); al(&k.Vb, DS_BS * DS_KVL);
             al(&k.O, DS_BS * DS_QL); al(&k.G, DS_BS * DS_FFL); al(&k.U, DS_BS * DS_FFL); al(&k.hid, DS_BS * D);
-            al(&k.part, (size_t) DS_NQL * DS_NP * DS_BS * DS_PW);
+            al(&k.part, (size_t) DS_NKVL * DS_NSPL * DS_NQV * DS_PW);
             al(&k.aq, DS_BS * DS_FFL); al(&k.as, DS_BS * DS_FFL / 32);
             ICHECK(hipEventCreateWithFlags(&k.ev, hipEventDisableTiming));
             const qw & H = E->C[c].head;
@@ -682,8 +785,12 @@ struct ink2_dspark {
                 const layer & y = k.L[l];
                 gemv(st, k.aq, k.as, y.q, k.Q, 8); gemv(st, k.aq, k.as, y.k, k.Kb, 8); gemv(st, k.aq, k.as, y.v, k.Vb, 8);
                 k_ds_hnorm_rope<<<dim3(DS_NQL + DS_NKVL, DS_BS), 128, 0, st>>>(k.Q, y.qn, DS_NQL, k.Kb, y.kn, DS_NKVL, a, DS_EPS);
-                k_ds_attn<<<dim3(DS_NQL, DS_SPL), 256, 0, st>>>(k.Q, k.ck[l], k.cv[l], k.Kb, k.Vb, lo, a, k.part);
-                k_ds_attn_merge<<<dim3(DS_NQL, DS_BS), 128, 0, st>>>(k.part, k.O);
+                // the cache keys split into nsp tile-aligned chunks, so the grid keeps
+                // DS_NKVL * nsp blocks busy at every context length
+                const int nc = a - lo, cks = std::max(DS_TILE, ((nc + DS_NSPL - 1) / DS_NSPL + DS_TILE - 1) / DS_TILE * DS_TILE);
+                const int nsp = std::max(1, (nc + cks - 1) / cks);
+                k_ds_attn<<<dim3(DS_NKVL, nsp), DS_ATT_T, 0, st>>>(k.Q, k.ck[l], k.cv[l], k.Kb, k.Vb, lo, a, nsp, cks, k.part);
+                k_ds_attn_merge<<<dim3(DS_NQL, DS_BS), 128, 0, st>>>(k.part, k.O, nsp);
                 k_ds_quant<<<DS_BS, 256, 0, st>>>(k.O, nullptr, DS_QL, k.aq, k.as, nullptr, DS_EPS);
                 gemv(st, k.aq, k.as, y.o, k.Y, 8);
             });
