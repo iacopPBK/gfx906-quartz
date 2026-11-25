@@ -433,7 +433,7 @@ int q35_ctx::generate(const int32_t * prompt, int n_prompt, const int * images, 
             }
         }
         mm.irow = irow.data(); mm.rpos = rpos.data(); mm.n_pos = P; mm.shift = r - P;
-        mm.rows[0] = c->img_dev[0]; mm.rows[1] = c->img_dev[1];
+        for (int i = 0; i < QZ_NC; i++) mm.rows[i] = c->img_dev[i];
     }
 
     c->eng.set_sampling(smp ? &ms : nullptr);

@@ -6,10 +6,13 @@
 
 #include "core/devices.h"
 #include "core/link.h"
+#include "core/nc.h"
 
-// Per-card geometry. The PF_ prefix avoids the D, S, G macros engine.h defines.
-constexpr int PF_D = 5120, PF_CCH = 5120, PF_HK = 8, PF_HV = 24, PF_S = 128, PF_G = 3072, PF_AQ = 6144,
-              PF_AKV = 512, PF_HQ = 12, PF_HKV = 2, PF_HD = 256, PF_FF = 8704;
+// Per-card geometry (QZ_NC cards). The PF_ prefix avoids the D, S, G macros engine.h defines.
+constexpr int PF_D = QZ_D, PF_CCH = QZ_CCH / QZ_NC, PF_HK = QZ_HK / QZ_NC, PF_HV = QZ_HV / QZ_NC, PF_S = QZ_S,
+              PF_G = QZ_G / QZ_NC, PF_AQ = QZ_AQ / QZ_NC, PF_AKV = QZ_AKV / QZ_NC, PF_HQ = QZ_HQ / QZ_NC,
+              PF_HKV = QZ_HKV / QZ_NC, PF_HD = QZ_HD, PF_FF = QZ_FF / QZ_NC;
+static_assert(PF_D == 5120 && PF_HD == 256 && PF_S == 128 && QZ_NC * PF_FF == 17408, "qwen35 prefill geometry");
 #include "kernels/pf_gemm.h"
 
 // ------------------------------------------------------- elementwise ----
@@ -463,7 +466,7 @@ struct qz_mm_view {
     const int * irow = nullptr;
     const int * rpos = nullptr;
     int n_pos = 0, shift = 0;
-    const float * rows[2] = {};
+    const float * rows[QZ_NC] = {};
     int  img(int p) const { return p < n_pos ? irow[p] : -1; }
     void rope(int p, int * o) const {
         if (p < n_pos) { o[0] = rpos[3 * p]; o[1] = rpos[3 * p + 1]; o[2] = rpos[3 * p + 2]; }
@@ -490,7 +493,7 @@ struct qz_prefill {
         size_t scr = 0;                                  // bytes carved from the engine's scratch; 0 means own buffers
         hipEvent_t ev = nullptr, ev_aux = nullptr, evp[4] = {};
         hipStream_t aux = nullptr;
-    } c[2];
+    } c[QZ_NC];
 
     // the per-card buffers of init(max_rows): (pointer, bytes) for M rows.
     static std::vector<std::pair<void **, size_t>> bufs(card & k, size_t M) {
@@ -528,7 +531,7 @@ struct qz_prefill {
     int init(qz_engine & e, int max_rows) {
         Mmax = (int) rows(max_rows);   // one extra tile: the MTP pass has n + 1 rows
         qz_mem_scope mem("prefill");
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < QZ_NC; i++) {
             card & k = c[i];
             CHECK(hipSetDevice(qz_dev_of(i)));
             const auto b = bufs(k, Mmax);
@@ -551,7 +554,7 @@ struct qz_prefill {
     half hv[2];
     int nh = 1;
     int hset[2] = {0, 0}, hpn[2] = {0, 0};          // per half: the partial set in use (hset) and a pending sum flag (hpn)
-    hipEvent_t evx[2][2] = {}, evh[2][4] = {}, evc[2][2] = {};
+    hipEvent_t evx[QZ_NC][2] = {}, evh[QZ_NC][4] = {}, evc[QZ_NC][2] = {};
                                                     // [card][half]: a partial is written. [card][kind]: half 0's conv, scan or kv is done, or the join.
                                                     // evc[card][half]: the copy of the peer's partial into that card has landed (host mode)
 
@@ -645,7 +648,7 @@ struct qz_prefill {
         const int hoff = first - 1 - p0;                      // entry r's hidden lives in hn row r + hoff
         const int save = Mp;
         if (mm) mm_stage(e, mm, first, R);
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < QZ_NC; i++) {
             qz_card & K = e.C[i];
             card & k = c[i];
             CHECK(hipSetDevice(qz_dev_of(i)));
@@ -678,7 +681,7 @@ struct qz_prefill {
     void mtp_rows(qz_engine & e, const int32_t * toks, float * const * hn, int first, int R) {
         for (int r0 = 0; r0 < R; r0 += Mmax - PF_MT) {
             const int n = std::min(Mmax - PF_MT, R - r0), Mr = (n + PF_MT - 1) / PF_MT * PF_MT;
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < QZ_NC; i++) {
                 qz_card & K = e.C[i];
                 card & k = c[i];
                 CHECK(hipSetDevice(qz_dev_of(i)));
@@ -701,7 +704,7 @@ struct qz_prefill {
                 CHECK(hipGetLastError());
             }
         }
-        for (int i = 0; i < 2; i++) { CHECK(hipSetDevice(qz_dev_of(i))); CHECK(hipStreamSynchronize(e.C[i].st)); }
+        for (int i = 0; i < QZ_NC; i++) { CHECK(hipSetDevice(qz_dev_of(i))); CHECK(hipStreamSynchronize(e.C[i].st)); }
         CHECK(hipSetDevice(qz_dev_of(0)));
     }
 
@@ -721,7 +724,7 @@ struct qz_prefill {
         if (nh == 2) { hv[0] = { 0, split, 0, split / PF_MT, split }; hv[1] = { split, n, split / PF_MT, (Mp - split) / PF_MT, Mp }; }
         else hv[0] = { 0, n, 0, Mp / PF_MT, Mp };
         hpn[0] = hpn[1] = 0;
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < QZ_NC; i++) {
             qz_card & K = e.C[i];
             CHECK(hipSetDevice(qz_dev_of(i)));
             if (!evx[i][0]) {
@@ -734,7 +737,7 @@ struct qz_prefill {
             if (c[i].scr) CHECK(hipMemsetAsync(e.C[i].scr, 0, c[i].scr, K.st));
             CHECK(hipEventRecord(c[i].ev, K.st));
         }
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < QZ_NC; i++) {
             qz_card & K = e.C[i];
             CHECK(hipSetDevice(qz_dev_of(i)));
             // the first row-parallel partial lands in the peer's scratch, so wait until
@@ -742,7 +745,7 @@ struct qz_prefill {
             // snapshot copies, and its memset would then wipe this card's partial. In host
             // mode the partial arrives by copy instead, ordered by evc, so this wait is no
             // longer load-bearing there; it stays so both modes queue work the same way.
-            CHECK(hipStreamWaitEvent(K.st, c[1 - i].ev, 0));
+            for (int j = 0; j < QZ_NC; j++) if (j != i) CHECK(hipStreamWaitEvent(K.st, c[j].ev, 0));
             CHECK(hipMemcpyAsync(c[i].tok, toks, (size_t) n * 4, hipMemcpyHostToDevice, K.st));
             if (mm) { mm_stage(e, mm, p0, n, i); CHECK(hipSetDevice(qz_dev_of(i))); }   // after the scratch memset
             hipLaunchKernelGGL(pf_embed, dim3(Mp), dim3(256), 0, K.st, c[i].tok, K.A.emb_vals, K.A.emb_scal, c[i].x, n, Mp,
@@ -755,7 +758,7 @@ struct qz_prefill {
             for (int h = 0; h < nh; h++) {
                 const half & H = hv[h];
                 const int nr = H.r1 - H.r0, np = H.rp - H.r0;
-                for (int i = 0; i < 2; i++) {
+                for (int i = 0; i < QZ_NC; i++) {
                     qz_card & K = e.C[i];
                     const qz_trunk_w & W = K.wh[il];
                     card & k = c[i];
@@ -813,11 +816,11 @@ struct qz_prefill {
                     }
                 }
                 {   // ssm_out or attn_output, both K = 3072 per card, plus the cross-card sum
-                    const char * Wo[2] = { e.C[0].wh[il].out_vals, e.C[1].wh[il].out_vals };
-                    const __half * So[2] = { e.C[0].wh[il].out_scal, e.C[1].wh[il].out_scal };
+                    const char * Wo[QZ_NC]; const __half * So[QZ_NC];
+                    for (int i = 0; i < QZ_NC; i++) { Wo[i] = e.C[i].wh[il].out_vals; So[i] = e.C[i].wh[il].out_scal; }
                     rowpar(e, h, Wo, So, PF_G, false);
                 }
-                for (int i = 0; i < 2; i++) {
+                for (int i = 0; i < QZ_NC; i++) {
                     qz_card & K = e.C[i];
                     const qz_trunk_w & W = K.wh[il];
                     card & k = c[i];
@@ -829,17 +832,17 @@ struct qz_prefill {
                                        W.fu_vals, W.fu_scal, k.aq2, k.as2);
                 }
                 {
-                    const char * Wd[2] = { e.C[0].wh[il].fd_vals, e.C[1].wh[il].fd_vals };
-                    const __half * Sd[2] = { e.C[0].wh[il].fd_scal, e.C[1].wh[il].fd_scal };
+                    const char * Wd[QZ_NC]; const __half * Sd[QZ_NC];
+                    for (int i = 0; i < QZ_NC; i++) { Wd[i] = e.C[i].wh[il].fd_vals; Sd[i] = e.C[i].wh[il].fd_scal; }
                     rowpar(e, h, Wd, Sd, PF_FF, true);
                 }
             }
             if (recr) nrl++;
         }
-        for (int i = 0; i < 2; i++)
+        for (int i = 0; i < QZ_NC; i++)
             if (nh == 2) { CHECK(hipSetDevice(qz_dev_of(i))); ev(e, i, 1, 3); wait(e, i, 0, 3); }   // join: main waits for half 1
         mtp_pass(e, toks, p0, n, next, mm);
-        for (int i = 0; i < 2; i++) { CHECK(hipSetDevice(qz_dev_of(i))); CHECK(hipMemsetAsync(e.C[i].ctl_d, 0, 8 * sizeof(int), e.C[i].st)); }
+        for (int i = 0; i < QZ_NC; i++) { CHECK(hipSetDevice(qz_dev_of(i))); CHECK(hipMemsetAsync(e.C[i].ctl_d, 0, 8 * sizeof(int), e.C[i].st)); }
         e.sync2();
         hpn[0] = hpn[1] = 0;
         return 0;
