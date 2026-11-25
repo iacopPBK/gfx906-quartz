@@ -18,21 +18,21 @@ struct qz_dsrun {
     bool on = false;
     // mv8 and mv12 share a 12-row replay ring, so either replays the last round's rows
     static constexpr int MVW = 12;
-    mv8::mv_ctx mv[2];
-    mv12::mv_ctx mw[2];
-    qz_ds_ctx cx[2];
-    qz_ds_block blk[2];
-    float * feat[2] = {};       // mv12's per-round capture [12][5][QZ_D], per card
-    float * feat8[2] = {};      // mv8's [8][5][QZ_D]
+    mv8::mv_ctx mv[QZ_NC];
+    mv12::mv_ctx mw[QZ_NC];
+    qz_ds_ctx cx[QZ_NC];
+    qz_ds_block blk[QZ_NC];
+    float * feat[QZ_NC] = {};       // mv12's per-round capture [12][5][QZ_D], per card
+    float * feat8[QZ_NC] = {};      // mv8's [8][5][QZ_D]
     // prefill context fill, GEMMs over up to DS_FR rows, per card: quantized features,
     // fc out, its quantized norm, k and v out
     static constexpr int DS_FR = 2048;
-    int8_t * fa[2] = {}, * fca[2] = {};
-    float * fas[2] = {}, * fcas[2] = {}, * fco[2] = {}, * fkv[2] = {};
+    int8_t * fa[QZ_NC] = {}, * fca[QZ_NC] = {};
+    float * fas[QZ_NC] = {}, * fcas[QZ_NC] = {}, * fco[QZ_NC] = {}, * fkv[QZ_NC] = {};
     hipEvent_t fev = nullptr;
     float * bas_d = nullptr;
     int * drafts_d = nullptr;
-    float2 * topk_d[2] = {};    // sampled verify: [MVW][QZ_TOPK_NB][QZ_TOPK] per card
+    float2 * topk_d[QZ_NC] = {};    // sampled verify: [MVW][QZ_TOPK_NB][QZ_TOPK] per card
     float * u_d = nullptr, * q_d = nullptr;   // sampled drafts: [DS_T-1] uniforms, [DS_T-1][DS_TOPK] q
     std::mt19937 qrng;
     float qd_h[(DS_T - 1) * DS_TOPK];
@@ -41,9 +41,9 @@ struct qz_dsrun {
 
     int init(qz_engine & eng, const char * draft) {
         qz_mem_scope mem("dspine run");
-        for (int c = 0; c < 2; c++)
+        for (int c = 0; c < QZ_NC; c++)
             if (mv12::mv_init(mw[c], eng, c)) return 1;
-        for (int c = 0; c < 2; c++)
+        for (int c = 0; c < QZ_NC; c++)
             if (mv8::mv_init(mv[c], eng, c, mw[c].ring8)) return 1;
         mv12::mv_wire_peers(mw);
         mv8::mv_wire_peers(mv);
@@ -55,18 +55,18 @@ struct qz_dsrun {
         // on each card; TG and TSV are built per vocab half too
         auto emb = [&](int c) { return &eng.C[c].ld.ts[eng.C[c].ld.find("token_embd.weight")]; };
         auto hh = [&](int c) { return &eng.C[c].ld.ts[eng.C[c].ld.find("output.weight")]; };
-        if (qz_ds_ctx_load(cx[0], draft, qz_dev_of(0), 0, DS_NKV / 2)) return 1;
-        if (qz_ds_block_load(blk[0], cx[0], draft, emb(0), hh(0))) return 1;
-        if (qz_ds_ctx_load(cx[1], draft, qz_dev_of(1), DS_NKV / 2, DS_NKV / 2)) return 1;
-        if (qz_ds_block_load(blk[1], cx[1], draft, emb(1), hh(1))) return 1;
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
+            if (qz_ds_ctx_load(cx[c], draft, qz_dev_of(c), c * DS_NKV / QZ_NC, DS_NKV / QZ_NC)) return 1;
+            if (qz_ds_block_load(blk[c], cx[c], draft, emb(c), hh(c))) return 1;
+        }
+        for (int c = 0; c < QZ_NC; c++) {
             DS_CHECK(hipSetDevice(qz_dev_of(c)));
             DS_CHECK(qz_dmalloc(&fa[c], (size_t) DS_FR * 5 * QZ_D));
             DS_CHECK(qz_dmalloc(&fas[c], (size_t) DS_FR * 5 * QZ_D / 32 * 4));
             DS_CHECK(qz_dmalloc(&fco[c], (size_t) DS_FR * QZ_D * 4));
             DS_CHECK(qz_dmalloc(&fca[c], (size_t) DS_FR * QZ_D));
             DS_CHECK(qz_dmalloc(&fcas[c], (size_t) DS_FR * QZ_D / 32 * 4));
-            DS_CHECK(qz_dmalloc(&fkv[c], (size_t) DS_FR * (DS_NKV / 2) * DS_HD * 4));
+            DS_CHECK(qz_dmalloc(&fkv[c], (size_t) DS_FR * (DS_NKV / QZ_NC) * DS_HD * 4));
             // rows past n are read by the GEMMs, outputs dropped, so keep them finite
             DS_CHECK(hipMemset(fa[c], 0, (size_t) DS_FR * 5 * QZ_D));
             DS_CHECK(hipMemset(fas[c], 0, (size_t) DS_FR * 5 * QZ_D / 32 * 4));
@@ -109,7 +109,7 @@ struct qz_dsrun {
             // the qz_xcopy event is what orders the GEMMs below).
             DS_CHECK(qz_xcopy(fa[1], 1, cx[1].st, fa[0], 0, cx[0].st, (size_t) Mp * KF));
             DS_CHECK(qz_xcopy(fas[1], 1, cx[1].st, fas[0], 0, cx[0].st, (size_t) Mp * KF / 32 * 4));
-            for (int c = 0; c < 2; c++) {
+            for (int c = 0; c < QZ_NC; c++) {
                 DS_CHECK(hipSetDevice(qz_dev_of(c)));
                 qz_ds_ctx & d = cx[c];
                 const int nr = d.hn * DS_HD;
@@ -130,7 +130,7 @@ struct qz_dsrun {
                 DS_CHECK(hipGetLastError());
             }
             mark(p0 + b0, nb);
-            for (int c = 0; c < 2; c++) { DS_CHECK(hipSetDevice(qz_dev_of(c))); DS_CHECK(hipStreamSynchronize(cx[c].st)); }
+            for (int c = 0; c < QZ_NC; c++) { DS_CHECK(hipSetDevice(qz_dev_of(c))); DS_CHECK(hipStreamSynchronize(cx[c].st)); }
         }
         DS_CHECK(hipSetDevice(qz_dev_of(0)));
     }
@@ -171,22 +171,22 @@ struct qz_dsrun {
 
     // the committed rows' features (mv's capture) into the rings
     void fill_rows(int p, int n, int W) {
-        for (int c = 0; c < 2; c++) { DS_CHECK(hipSetDevice(qz_dev_of(c))); qz_ds_ctx_rows(cx[c], W > 8 ? feat[c] : feat8[c], p, n); }
+        for (int c = 0; c < QZ_NC; c++) { DS_CHECK(hipSetDevice(qz_dev_of(c))); qz_ds_ctx_rows(cx[c], W > 8 ? feat[c] : feat8[c], p, n); }
         mark(p, n);
-        for (int c = 0; c < 2; c++) { DS_CHECK(hipSetDevice(qz_dev_of(c))); DS_CHECK(hipStreamSynchronize(cx[c].st)); }
+        for (int c = 0; c < QZ_NC; c++) { DS_CHECK(hipSetDevice(qz_dev_of(c))); DS_CHECK(hipStreamSynchronize(cx[c].st)); }
         DS_CHECK(hipSetDevice(qz_dev_of(0)));
     }
 
     // the sampled walk over the round's 8 head rows, both cards' halves. out[0 .. n-1]
     // gets the accepted drafts and then the sampled bonus; returns n
     void topk_rows(qz_engine & eng, int W) {
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             DS_CHECK(hipSetDevice(qz_dev_of(c)));
             hipLaunchKernelGGL(qz_topk_rows, dim3(QZ_TOPK_NB, W), dim3(256), 0, mv[c].st, W > 8 ? mw[c].Ah.y_head : mv[c].Ah.y_head,
                                eng.hrows, c * eng.hrows, topk_d[c]);
             DS_CHECK(hipGetLastError());
         }
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             DS_CHECK(hipSetDevice(qz_dev_of(c)));
             DS_CHECK(hipStreamSynchronize(mv[c].st));
             eng.sam.tk[c].resize((size_t) W * QZ_TOPK_NB * QZ_TOPK);
@@ -283,7 +283,7 @@ struct qz_dsrun {
         if (qmode) qrng.seed(eng.sam.smp->seed ^ 0x5bd1e995u);
         int pos = pos0, n_rep = 0, cyc = 0;
         int32_t toks[MVW > DS_T ? MVW : DS_T];
-        int ctl[2][8], out_tok[MVW];
+        int ctl[QZ_NC][8], out_tok[MVW];
         // verify 12 rows after wk rounds in a row accepted >= wth, else 8 rows. 12-row
         // rounds sum in another order, which can flip near ties.
         constexpr int wth = 8, wk = 3;
@@ -307,16 +307,18 @@ struct qz_dsrun {
             }
             if (W > 8) mv12::mv_round(mw, pos, cyc, n_rep, 1, toks, xtok);
             else mv8::mv_round(mv, pos, cyc, n_rep, 1, toks, xtok);
-            for (int c = 0; c < 2; c++) CHECK(hipStreamSynchronize(mv[c].st));
-            const qz_trunk_args & A0 = W > 8 ? mw[0].Ah : mv[0].Ah, & A1 = W > 8 ? mw[1].Ah : mv[1].Ah;
-            CHECK(hipSetDevice(qz_dev_of(0)));
-            CHECK(hipMemcpy(ctl[0], A0.ctl, 8 * 4, hipMemcpyDeviceToHost));
-            CHECK(hipMemcpy(out_tok, A0.out_tok, W * 4, hipMemcpyDeviceToHost));
-            CHECK(hipSetDevice(qz_dev_of(1)));
-            CHECK(hipMemcpy(ctl[1], A1.ctl, 8 * 4, hipMemcpyDeviceToHost));
+            for (int c = 0; c < QZ_NC; c++) CHECK(hipStreamSynchronize(mv[c].st));
+            bool same = true;
+            for (int c = 0; c < QZ_NC; c++) {
+                const qz_trunk_args & Ac = W > 8 ? mw[c].Ah : mv[c].Ah;
+                CHECK(hipSetDevice(qz_dev_of(c)));
+                CHECK(hipMemcpy(ctl[c], Ac.ctl, 8 * 4, hipMemcpyDeviceToHost));
+                if (c == 0) CHECK(hipMemcpy(out_tok, Ac.out_tok, W * 4, hipMemcpyDeviceToHost));
+                else same = same && !memcmp(ctl[0], ctl[c], 8 * 4);
+            }
             CHECK(hipSetDevice(qz_dev_of(0)));
             int n_acc = ctl[0][0];
-            if (n_acc < 1 || n_acc > W || ctl[0][2] != pos + n_acc || memcmp(ctl[0], ctl[1], 8 * 4)) { st.stop = -1; break; }
+            if (n_acc < 1 || n_acc > W || ctl[0][2] != pos + n_acc || !same) { st.stop = -1; break; }
             if (nf) {   // forced rows stand; acceptance from the last one (a sampled run keeps a draft only if equal)
                 int n = nf - 1;
                 if (eng.sam.smp) {

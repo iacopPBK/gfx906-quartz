@@ -612,7 +612,7 @@ __global__ void __launch_bounds__(256) ds_rows_l(const float * TG, const float *
         const size_t r = (size_t) (ids[w] - id0);
         for (int e = t; e < DS_R; e += 256) tg[(size_t) w * DS_R + e] = TG[r * DS_R + e];
         for (int e = t; e < 2 * DS_R; e += 256) tsv[(size_t) w * 2 * DS_R + e] = TSV[r * 2 * DS_R + e];
-    } else if (anchor >= id0 && anchor < id0 + DS_V / 2) {
+    } else if (anchor >= id0 && anchor < id0 + DS_V / QZ_NC) {
         const size_t r = (size_t) (anchor - id0);
         for (int e = t; e < 2 * DS_R; e += 256) tsva[e] = TSV[r * 2 * DS_R + e];
     }
@@ -635,11 +635,11 @@ struct qz_ds_block {
     // target emb / head planes + the tables
     const unsigned char * emb_v = nullptr;
     const unsigned short * emb_s = nullptr;
-    const unsigned char * hh_v = nullptr;             // this card's head half: rows [dev V/2, (dev + 1) V/2)
+    const unsigned char * hh_v = nullptr;             // this card's head rows [dev V/NC, (dev + 1) V/NC)
     const unsigned short * hh_s = nullptr;
     float * bas_l = nullptr;                          // [T-1][16] bas of this card's half top-16 (tki)
     float * pbas = nullptr;                           // card 0: the peer half's
-    float * TG = nullptr, * TSV = nullptr;             // this card's rows [dev V/2, (dev + 1) V/2) of [V][R], [V][2R]
+    float * TG = nullptr, * TSV = nullptr;             // this card's rows [dev V/NC, (dev + 1) V/NC) of [V][R], [V][2R]
     float * tg_l = nullptr, * tsv_l = nullptr, * tsva_l = nullptr;   // ds_rows_l's output: this card's top-16 rows and the anchor's
     float * ptg = nullptr, * ptsv = nullptr, * ptsva = nullptr;      // card 0: the peer's
     float * tg_s = nullptr, * tsv_s = nullptr, * tsva_s = nullptr;   // card 0: ds_rows_pick's staged rows
@@ -787,10 +787,10 @@ inline int qz_ds_block_load(qz_ds_block & d, qz_ds_ctx & cx, const char * draft,
         fprintf(stderr, "qz_ds_block: the shared token_embd is not the dense [%d x %d] Q8_0 the drafter reads\n", DS_H, DS_V);
         return 1;
     }
-    if ((head_half->type != GGML_TYPE_Q8_0 || head_half->ne0 != DS_H || head_half->ne1 != DS_V / 2 ||
+    if ((head_half->type != GGML_TYPE_Q8_0 || head_half->ne0 != DS_H || head_half->ne1 != DS_V / QZ_NC ||
                       head_half->vstride != (int64_t) DS_H)) {
         fprintf(stderr, "qz_ds_block: the shared head half is not the [%d x %d] Q8_0 (row stride %d) the drafter reads\n",
-                DS_H, DS_V / 2, (int) DS_H);
+                DS_H, DS_V / QZ_NC, (int) DS_H);
         return 1;
     }
 
@@ -862,7 +862,7 @@ inline int qz_ds_block_load(qz_ds_block & d, qz_ds_ctx & cx, const char * draft,
             fprintf(stderr, "qz_ds_block: dspine_write / dspine_codebook shapes differ from the drafter's\n");
             return 1;
         }
-        const int V2 = DS_V / 2;
+        const int V2 = DS_V / QZ_NC;
         DS_CHECK(qz_dmalloc((void **) &d.TG, (size_t) V2 * DS_R * 4, "tables"));
         DS_CHECK(qz_dmalloc((void **) &d.TSV, (size_t) V2 * 2 * DS_R * 4, "tables"));
         ds_tab_gemm<<<dim3(DS_R / 64, V2 / 64), 256>>>(d.hh_v, d.hh_s, DS_H, d.onorm, d.Wl[DS_FL - 1], d.TG,
@@ -933,11 +933,11 @@ inline int qz_ds_block_load(qz_ds_block & d, qz_ds_ctx & cx, const char * draft,
 // o / down partials are summed on both cards and the chain inputs end on card 0.
 inline void qz_ds_block_round2(qz_ds_block * D, qz_ds_ctx * CX, int anchor, int p0, int wbase, int nt = DS_T) {
     const int S = p0 - wbase + DS_T;
-    const int H = DS_H, FF2 = DS_FF / 2, QWl = DS_NQ / 2 * DS_HD, KVl = DS_NKV / 2 * DS_HD, V2 = DS_V / 2;
+    const int H = DS_H, FF2 = DS_FF / QZ_NC, QWl = DS_NQ / QZ_NC * DS_HD, KVl = DS_NKV / QZ_NC * DS_HD, V2 = DS_V / QZ_NC;
     const size_t lh = H;
     static int xk = 0;
     auto each = [&](auto && fn) {
-        for (int c = 0; c < 2; c++) { DS_CHECK(hipSetDevice(D[c].dev)); fn(c, D[c], CX[c], D[c].st); }
+        for (int c = 0; c < QZ_NC; c++) { DS_CHECK(hipSetDevice(D[c].dev)); fn(c, D[c], CX[c], D[c].st); }
     };
     auto exchange = [&]() {          // ship the partials in t1, then x += own + peer on both cards
         each([&](int c, qz_ds_block & d, qz_ds_ctx &, hipStream_t s) {
@@ -966,13 +966,13 @@ inline void qz_ds_block_round2(qz_ds_block * D, qz_ds_ctx * CX, int anchor, int 
                 { (const char *) d.q_v[l] + (size_t) c * QWl * lh, (const __half *) d.q_s[l] + (size_t) c * QWl * (H / 32), QWl, d.xa, 0 },
                 { (const char *) cx.k_v[l] + (size_t) c * KVl * lh, (const __half *) cx.k_s[l] + (size_t) c * KVl * (H / 32), KVl, d.kb, 0 },
                 { (const char *) cx.v_v[l] + (size_t) c * KVl * lh, (const __half *) cx.v_s[l] + (size_t) c * KVl * (H / 32), KVl, d.vb, 0 } });
-            ds_norm_rope<<<DS_T * DS_NQ / 2, 128, 0, s>>>(d.xa, d.qnw[l], cx.inv, DS_NQ / 2, DS_T, p0);
-            ds_norm_rope<<<DS_T * DS_NKV / 2, 128, 0, s>>>(d.kb, cx.knw[l], cx.inv, DS_NKV / 2, DS_T, p0);
-            const int aps = ds_a3_ps(S, DS_NKV / 2);
+            ds_norm_rope<<<DS_T * DS_NQ / QZ_NC, 128, 0, s>>>(d.xa, d.qnw[l], cx.inv, DS_NQ / QZ_NC, DS_T, p0);
+            ds_norm_rope<<<DS_T * DS_NKV / QZ_NC, 128, 0, s>>>(d.kb, cx.knw[l], cx.inv, DS_NKV / QZ_NC, DS_T, p0);
+            const int aps = ds_a3_ps(S, DS_NKV / QZ_NC);
             const int nsp = (S + aps - 1) / aps;
-            ds_attn_split3<<<dim3(nsp, DS_NKV / 2, (nt + 7) / 8), 256, 0, s>>>(d.xa, cx.ring_k[l], cx.ring_v[l], p0, d.kb, d.vb,
-                                                                 S, wbase, aps, d.at_o, d.at_ml, DS_NQ / 2, c * DS_NKV / 2);
-            ds_attn_comb3<<<DS_T * DS_NQ / 2, 128, 0, s>>>(d.at_o, d.at_ml, d.att, nsp, DS_NQ / 2);
+            ds_attn_split3<<<dim3(nsp, DS_NKV / QZ_NC, (nt + 7) / 8), 256, 0, s>>>(d.xa, cx.ring_k[l], cx.ring_v[l], p0, d.kb, d.vb,
+                                                                 S, wbase, aps, d.at_o, d.at_ml, DS_NQ / QZ_NC, c * DS_NKV / QZ_NC);
+            ds_attn_comb3<<<DS_T * DS_NQ / QZ_NC, 128, 0, s>>>(d.at_o, d.at_ml, d.att, nsp, DS_NQ / QZ_NC);
             ds_qrows<<<(DS_T * QWl / 32 + 7) / 8, 256, 0, s>>>(d.att, d.qq2, d.qs2, DS_T, QWl);
             ds_gemvR_launch(nt, s, d.qq2, d.qs2, QWl, DS_NQ * DS_HD, {
                 { (const char *) d.o_v[l] + (size_t) c * QWl, (const __half *) d.o_s[l] + (size_t) c * QWl / 32, H, d.t1, 0 } });
@@ -1016,7 +1016,7 @@ inline void qz_ds_block_round2(qz_ds_block * D, qz_ds_ctx * CX, int anchor, int 
     each([&](int c, qz_ds_block & d, qz_ds_ctx &, hipStream_t s) {
         ds_gemvR_launch(nt, s, d.q1, d.s1, H, H, { { (const char *) d.hh_v, (const __half *) d.hh_s, V2, d.logits, 0 } });
         ds_top16_a<<<dim3(nch, DS_T - 1), 256, 0, s>>>(d.logits + V2, d.tk_v, d.tk_i, V2, nch, c * V2);
-        ds_top16_b<(((DS_V / 2 + DS_TK_CH - 1) / DS_TK_CH) * DS_TOPK + 255) / 256><<<DS_T - 1, 256, 0, s>>>(
+        ds_top16_b<(((DS_V / QZ_NC + DS_TK_CH - 1) / DS_TK_CH) * DS_TOPK + 255) / 256><<<DS_T - 1, 256, 0, s>>>(
             d.tk_v, d.tk_i, d.tki, nch, d.tkv);
         ds_chain_bas_l<<<((DS_T - 1) * DS_TOPK + 3) / 4, 256, 0, s>>>(d.stash_raw, d.onorm, d.tki, c * V2,
                                                                       d.hh_v, d.hh_s, d.bas_l);

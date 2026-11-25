@@ -643,7 +643,7 @@ inline float * mv_feat_cap1() {
 inline void mv_round(mv_ctx * c, int pos, int cycle, int n_rep, int verify,
                      const int32_t * toks_h, unsigned int & xtok) {
     const int par = cycle & 1;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < QZ_NC; i++) {
         mv_ctx & m = c[i];
         CHECK(hipSetDevice(m.dev));
         m.Ah.pos = pos;
@@ -657,7 +657,7 @@ inline void mv_round(mv_ctx * c, int pos, int cycle, int n_rep, int verify,
     unsigned int htok = ++xtok;
     for (int il = 0; il < (int) c[0].wh.size(); il++) {
         const bool recr = c[0].wh[il].recr != 0;
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < QZ_NC; i++) {
             mv_ctx & m = c[i];
             CHECK(hipSetDevice(m.dev));
             mv_phase_a<<<dim3(10, MV_T), dim3(512), lds_a, m.st>>>(m.Ah, m.toks_d, il);
@@ -683,65 +683,65 @@ inline void mv_round(mv_ctx * c, int pos, int cycle, int n_rep, int verify,
             }
         }
         if (recr) {
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < QZ_NC; i++) {
                 mv_ctx & m = c[i];
                 CHECK(hipSetDevice(m.dev));
                 mv_b_recr_g8(m, il, par, n_rep);
             MV_LCHK();
             }
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < QZ_NC; i++) {
                 mv_ctx & m = c[i];
                 CHECK(hipSetDevice(m.dev));
                 mv_phase_dn<<<dim3(qz_geo<MV_T>::HV), dim3(512), lds_dn, m.st>>>(m.Ah, il, par, n_rep);
             MV_LCHK();
             }
             ++xtok;
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < QZ_NC; i++) {
                 mv_ctx & m = c[i];
                 CHECK(hipSetDevice(m.dev));
                 mv_xrow_g8(m, il, 0, xtok);
             MV_LCHK();
             }
         } else {
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < QZ_NC; i++) {
                 mv_ctx & m = c[i];
                 CHECK(hipSetDevice(m.dev));
                 mv_b_attn_g8(m, il);
             MV_LCHK();
             }
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < QZ_NC; i++) {
                 mv_ctx & m = c[i];
                 CHECK(hipSetDevice(m.dev));
                 mv_phase_rope<<<dim3(60), dim3(512), 640, m.st>>>(m.Ah, il, pos);
             MV_LCHK();
             }
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < QZ_NC; i++) {
                 mv_ctx & m = c[i];
                 CHECK(hipSetDevice(m.dev));
                 mv_fl9_flash(m.Ah, m.wh[il], pos, m.st);
             MV_LCHK();
             }
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < QZ_NC; i++) {
                 mv_ctx & m = c[i];
                 CHECK(hipSetDevice(m.dev));
                 mv_fl9_reduce(m.Ah, m.st);
             MV_LCHK();
             }
             ++xtok;
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < QZ_NC; i++) {
                 mv_ctx & m = c[i];
                 CHECK(hipSetDevice(m.dev));
                 mv_xrow_g8(m, il, 0, xtok);
             MV_LCHK();
             }
         }
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < QZ_NC; i++) {
             mv_ctx & m = c[i];
             CHECK(hipSetDevice(m.dev));
             mv_phase_g<<<dim3(10, MV_T), dim3(512), lds_a, m.st>>>(m.Ah, il);
             MV_LCHK();
         }
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < QZ_NC; i++) {
             mv_ctx & m = c[i];
             CHECK(hipSetDevice(m.dev));
             const qz_trunk_w & Wl = m.wh[il];
@@ -752,33 +752,33 @@ inline void mv_round(mv_ctx * c, int pos, int cycle, int n_rep, int verify,
             MV_LCHK();
         }
         ++xtok;
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < QZ_NC; i++) {
             mv_ctx & m = c[i];
             CHECK(hipSetDevice(m.dev));
             mv_xrow_g8(m, il, 1, xtok);
             MV_LCHK();
         }
     }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < QZ_NC; i++) {
         mv_ctx & m = c[i];
         CHECK(hipSetDevice(m.dev));
         mv_head_norm<<<dim3(MV_T), dim3(512), lds_a, m.st>>>(m.Ah);
             MV_LCHK();
     }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < QZ_NC; i++) {
         mv_ctx & m = c[i];
         CHECK(hipSetDevice(m.dev));
         mv_gemv8_launch(m.st, m.Ah.nq_vals, m.Ah.nq_scal, QZ_D, m.Ah.hd_vals, m.Ah.hd_scal, m.Ah.hrows, m.Ah.y_head);
             MV_LCHK();
     }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < QZ_NC; i++) {
         mv_ctx & m = c[i];
         CHECK(hipSetDevice(m.dev));
         mv_argmax<<<dim3(MV_T), dim3(512), lds_am, m.st>>>(m.Ah, htok);
             MV_LCHK();
     }
     const unsigned int vtok = ++xtok;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < QZ_NC; i++) {
         mv_ctx & m = c[i];
         CHECK(hipSetDevice(m.dev));
         mv_verify<<<dim3(1), dim3(64), 0, m.st>>>(m.Ah, m.toks_d, htok, vtok, verify);
