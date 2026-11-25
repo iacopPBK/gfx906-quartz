@@ -64,12 +64,12 @@ struct ink2_card {
 struct ink2_engine {
     hparams hp;
     int ctx = 0;
-    ink2_card C[2];
+    ink2_card C[QZ_NC];
     int nx = 0;                               // exchanges issued (partial double-buffer parity)
-    std::vector<float2> tkh[2];
-    float2 * tkp[2] = {nullptr, nullptr};     // pinned: the top-K, then the exchange error words (8 ints)
-    std::vector<float2> vtkh[2];
-    float2 * vtkp[2] = {nullptr, nullptr};    // pinned: the verify rows' top-K, then the error words
+    std::vector<float2> tkh[QZ_NC];
+    float2 * tkp[QZ_NC] = {};     // pinned: the top-K, then the exchange error words (8 ints)
+    std::vector<float2> vtkh[QZ_NC];
+    float2 * vtkp[QZ_NC] = {};    // pinned: the verify rows' top-K, then the error words
 
     // ---- setup
     static qw Qw(const qz_loader & ld, const char * n) {
@@ -143,9 +143,9 @@ struct ink2_engine {
             ICHECK(hipDeviceSynchronize());
             ICHECK(hipFree(tv)); ICHECK(hipFree(ts));
         }
-        const int half = VOCAB / 2;
-        K.id0 = half * c;
-        K.nvalid = std::min(half, VOCAB_REAL - K.id0);
+        const int share = VOCAB / QZ_NC;
+        K.id0 = share * c;
+        K.nvalid = std::min(share, VOCAB_REAL - K.id0);
     }
     bool alloc(int c) {
         ink2_card & K = C[c];
@@ -161,7 +161,7 @@ struct ink2_engine {
         add(f32(NCTRL * GRANK));                                                          // G
         add(f32(QL)); add(f32(QL)); add(f32(HQL * DREL)); add(f32(64)); add(f32(KVL)); add(f32(KVL));
         add(f32(64)); add(f32(64)); add(f32(QL / 2)); add(f32(HQL * TBW)); add(f32(nD)); add(f32(nD));
-        add(f32(NE_USED * FFE)); add(f32(NE_USED)); add(f32(VOCAB / 2)); add(f32(NE_USED));
+        add(f32(NE_USED * FFE)); add(f32(NE_USED)); add(f32(VOCAB / QZ_NC)); add(f32(NE_USED));
         for (int i = 0; i < 4; i++) { add(f32(nD / 4)); add(f32(nD / 32)); }              // planes (int8 = n/4 floats)
         add(f32(QL / 4)); add(f32(QL / 32));
         add(f32(NE_USED * FFL / 4)); add(f32(NE_USED * FFL / 32));
@@ -242,7 +242,7 @@ struct ink2_engine {
         return true;
     }
     void reset() {   // a fresh sequence: zero conv history (KV rows are written before they are read)
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             ICHECK(hipSetDevice(qz_dev_of(c)));
             ICHECK(hipMemsetAsync(C[c].hist, 0, (size_t) NAPP * 3 * CHL * 4, C[c].st));
         }
@@ -270,7 +270,7 @@ struct ink2_engine {
     // Ordering only: no pointer crosses, so host mode needs nothing here (the partials go
     // through the xin mailbox, which qz_xbufs allocates per mode).
     void exchange() {
-        for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipEventRecord(C[c].ev, C[c].st)); }
+        for (int c = 0; c < QZ_NC; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipEventRecord(C[c].ev, C[c].st)); }
         for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamWaitEvent(C[c].st, C[1 - c].ev, 0)); }
     }
 
@@ -282,9 +282,9 @@ struct ink2_engine {
         int bank = -1;                // pass > 0: BLK index of the previous pass's layer-12 input; OUT parity
         int bank_out = -1;
     };
-    std::vector<appk> tab[2];
-    sptrs head_mix[2];
-    appk * tab_d[2] = {nullptr, nullptr};
+    std::vector<appk> tab[QZ_NC];
+    sptrs head_mix[QZ_NC];
+    appk * tab_d[QZ_NC] = {};
 
     static sptrs sp(const std::vector<const float *> & st, const float * cur) {
         sptrs S{};
@@ -402,7 +402,7 @@ struct ink2_engine {
     void plan_all() {
         if (planned) return;
         for (int c = 0; c < 2; c++) { C[c].ca.xin_peer = C[1 - c].x.xin; C[c].ca.xflag_peer = C[1 - c].x.xflag; }
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             plan(c);
             ICHECK(hipSetDevice(qz_dev_of(c)));
             {
@@ -426,7 +426,7 @@ struct ink2_engine {
     // the persistent path: embed and all applications in one launch per card
     long long n_cyc = 0;
     void run_cycle(int32_t tok, int pos, bool head) {
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             ink2_card & K = C[c];
             ICHECK(hipSetDevice(qz_dev_of(c)));
             ICHECK(hipMemsetAsync(K.bst, 0, CYC_NBS * sizeof(unsigned int), K.st));
@@ -439,8 +439,8 @@ struct ink2_engine {
     // ---- verify (ink2_verify.h): the speculative round's VR rows in one launch per card.
     // The per-row tables are built once from the decode table: every per-token activation
     // pointer plus r * rs, and the attention partials and counters on their own strides.
-    std::vector<appk> vtab[2];
-    appk * vtab_d[2] = {nullptr, nullptr};
+    std::vector<appk> vtab[QZ_NC];
+    appk * vtab_d[QZ_NC] = {};
     float * vtap = nullptr;                        // card 0: the rows' [4][D] drafter features
     bool vplanned = false;
     template <class T> static T * shp(T * p, size_t o) { return p ? (T *) ((char *) p + o) : nullptr; }
@@ -478,7 +478,7 @@ struct ink2_engine {
         if (vplanned) return;
         plan_all();
         vplanned = true;
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             const int napp = C[c].ca.napp;                 // the table rows follow the (possibly truncated) count
             const size_t o = C[c].rs;
             vtab[c].resize((size_t) VR * napp);
@@ -515,7 +515,7 @@ struct ink2_engine {
         nr = nr < 2 ? 2 : nr > VR ? VR : nr;
         vtok tv;
         for (int r = 0; r < VR; r++) { tv.t[r] = r < nr ? toks[r] : 0; tv.tau[r] = tau_at(pos + r); }
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             ink2_card & K = C[c];
             ICHECK(hipSetDevice(qz_dev_of(c)));
             ICHECK(hipMemsetAsync(K.vbst, 0, VBS_N * sizeof(unsigned int), K.st));
@@ -526,8 +526,8 @@ struct ink2_engine {
             ICHECK(hipMemcpyAsync(vtkp[c], K.vtk, n2 * sizeof(float2), hipMemcpyDeviceToHost, K.st));
             ICHECK(hipMemcpyAsync(vtkp[c] + n2, K.x.xerr, 8 * sizeof(int), hipMemcpyDeviceToHost, K.st));
         }
-        for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(C[c].st)); }
-        for (int c = 0; c < 2; c++)
+        for (int c = 0; c < QZ_NC; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(C[c].st)); }
+        for (int c = 0; c < QZ_NC; c++)
             qz_xerr_check_h(c, (const int *) (vtkp[c] + (size_t) VR * QZ_TOPK_NB * QZ_TOPK), n_ver);
         n_ver++;
     }
@@ -535,7 +535,7 @@ struct ink2_engine {
     int greedy_row(int r) const {
         float bv = -INFINITY;
         int bi = -1;
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             const float2 * b = vtkp[c] + (size_t) r * QZ_TOPK_NB * QZ_TOPK;
             for (int i = 0; i < QZ_TOPK_NB * QZ_TOPK; i++) {
                 int id;
@@ -547,7 +547,7 @@ struct ink2_engine {
     }
     // the conv histories of the m committed rows (both cards)
     void commit(int m) {
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             ink2_card & K = C[c];
             ICHECK(hipSetDevice(qz_dev_of(c)));
             k_vcommit<<<(NAPP * CHL + 255) / 256, 256, 0, K.st>>>(K.hist, K.uh, m);
@@ -558,24 +558,24 @@ struct ink2_engine {
     void step(int32_t tok, int pos, bool logits) {
         plan_all();
         run_cycle(tok, pos, logits);
-        if (logits) for (int c = 0; c < 2; c++) {
+        if (logits) for (int c = 0; c < QZ_NC; c++) {
             ink2_card & K = C[c];
             ICHECK(hipSetDevice(qz_dev_of(c)));
             qz_topk_rows<<<dim3(QZ_TOPK_NB, 1), 256, 0, K.st>>>(K.LOG, K.nvalid, K.id0, K.tk);
             ICHECK(hipMemcpyAsync(tkp[c], K.tk, tkh[c].size() * sizeof(float2), hipMemcpyDeviceToHost, K.st));
         }
-        for (int c = 0; c < 2; c++) {          // the error words ride the same stream: no extra sync
+        for (int c = 0; c < QZ_NC; c++) {          // the error words ride the same stream: no extra sync
             ICHECK(hipSetDevice(qz_dev_of(c)));
             ICHECK(hipMemcpyAsync(tkp[c] + QZ_TOPK_NB * QZ_TOPK, C[c].x.xerr, 8 * sizeof(int), hipMemcpyDeviceToHost, C[c].st));
         }
-        for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(C[c].st)); }
-        if (logits) for (int c = 0; c < 2; c++) memcpy(tkh[c].data(), tkp[c], tkh[c].size() * sizeof(float2));
-        for (int c = 0; c < 2; c++) qz_xerr_check_h(c, (const int *) (tkp[c] + QZ_TOPK_NB * QZ_TOPK), n_cyc);
+        for (int c = 0; c < QZ_NC; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(C[c].st)); }
+        if (logits) for (int c = 0; c < QZ_NC; c++) memcpy(tkh[c].data(), tkp[c], tkh[c].size() * sizeof(float2));
+        for (int c = 0; c < QZ_NC; c++) qz_xerr_check_h(c, (const int *) (tkp[c] + QZ_TOPK_NB * QZ_TOPK), n_cyc);
     }
     int greedy() const {
         float bv = -INFINITY;
         int bi = -1;
-        for (int c = 0; c < 2; c++)
+        for (int c = 0; c < QZ_NC; c++)
             for (const float2 & e : tkh[c]) {
                 int id;
                 memcpy(&id, &e.y, 4);

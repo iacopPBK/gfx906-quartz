@@ -21,6 +21,7 @@
 
 #include "arch.h"
 #include "core/cards.h"
+#include "core/nc.h"
 #include "core/sampler.h"
 #include "vision/inkling2v.h"
 #include "kernels/dev.h"

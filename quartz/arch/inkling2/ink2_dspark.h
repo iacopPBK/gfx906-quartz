@@ -20,7 +20,7 @@
 #include "core/link.h"           // qz_xcopy / qz_xdst: the partials and the feature planes
 
 constexpr int DS_BS = 8, DS_NL = 3, DS_R = 256, DS_FF = 9216, DS_Q = 3072, DS_KV = 1024, DS_NQ = 24, DS_NKV = 8;
-constexpr int DS_NQL = DS_NQ / 2, DS_NKVL = DS_NKV / 2, DS_QL = DS_Q / 2, DS_KVL = DS_KV / 2, DS_FFL = DS_FF / 2;   // per card
+constexpr int DS_NQL = DS_NQ / QZ_NC, DS_NKVL = DS_NKV / QZ_NC, DS_QL = DS_Q / QZ_NC, DS_KVL = DS_KV / QZ_NC, DS_FFL = DS_FF / QZ_NC;   // per card
 constexpr int DS_NT = 256;                     // the drafter GEMV's block (4 waves, 4 rows each)
 constexpr float DS_EPS = 1e-6f, DS_THETA = 1e6f;
 constexpr long long DS_SPIN = 2000000000ll;    // clock64 ticks a cross-card wait may spin
@@ -644,7 +644,7 @@ struct ink2_dspark {
         hipEvent_t ev = nullptr;
     };
     ink2_engine * E = nullptr;
-    card K[2];
+    card K[QZ_NC];
     float4 alpha[DS_NL + 1];
     const float * dsn = nullptr, * jb = nullptr;      // card 0
     const uint16_t * jw = nullptr, * w1 = nullptr;    // card 0
@@ -656,27 +656,27 @@ struct ink2_dspark {
     float * vtap = nullptr;                    // verify features [VR][4][D] (the verify kernel writes them)
     float * joint = nullptr, * state = nullptr;
     // per card: the draft rows' quantized hidden, base [8][nvalid], fold [(R+1)][nhp], lat1
-    unsigned char * hq[2] = {}; float * hs[2] = {}, * base[2] = {}, * lat1[2] = {};
-    __half * fold[2] = {};
-    int nhp[2] = {};
-    unsigned long long * best[2] = {};         // this card's fold target (local, zeroed per step)
-    unsigned long long * xbest[2] = {};        // the peer's argmax pushed here (uncached)
-    unsigned int * fl[2] = {};                 // the peer's handshake flag (uncached)
+    unsigned char * hq[QZ_NC] = {}; float * hs[QZ_NC] = {}, * base[QZ_NC] = {}, * lat1[QZ_NC] = {};
+    __half * fold[QZ_NC] = {};
+    int nhp[QZ_NC] = {};
+    unsigned long long * best[QZ_NC] = {};         // this card's fold target (local, zeroed per step)
+    unsigned long long * xbest[QZ_NC] = {};        // the peer's argmax pushed here (uncached)
+    unsigned int * fl[QZ_NC] = {};                 // the peer's handshake flag (uncached)
     int * out_d = nullptr, * out_h = nullptr;  // the 7 tokens (card 0's)
     // ds_wait's timeout word, one per card: a wait reads and CASes it, so it must be in the
     // waiting card's own memory. In p2p a single card-0 word served both cards, which host
     // mode cannot do -- card 1 would touch card 0's VRAM.
-    int * errd[2] = {};
+    int * errd[QZ_NC] = {};
     unsigned int seq = 0;                      // the chain's step counter (monotone)
     // Sampled rounds: each draft row's (max, sumexp) partials and merged logsumexp, the
     // target's candidate ids to evaluate, and their drafter logits.
-    float * lses[2] = {};                      // device: [DS_BS][DS_LSEB][2] fold block partials
-    float * lsem[2] = {};                      // device: [DS_BS][2] merged per row, per card
-    float * lseh[2] = {};                      // pinned: [DS_BS][2]
-    int * qid_d[2] = {};                       // device: [DS_BS][DS_QID] candidate ids
+    float * lses[QZ_NC] = {};                      // device: [DS_BS][DS_LSEB][2] fold block partials
+    float * lsem[QZ_NC] = {};                      // device: [DS_BS][2] merged per row, per card
+    float * lseh[QZ_NC] = {};                      // pinned: [DS_BS][2]
+    int * qid_d[QZ_NC] = {};                       // device: [DS_BS][DS_QID] candidate ids
     int * qid_h = nullptr;                     // pinned: the same
-    float * qs_d[2] = {};                      // device: [DS_BS][DS_QID] drafter logits
-    float * qs_h[2] = {};                      // pinned: the same
+    float * qs_d[QZ_NC] = {};                      // device: [DS_BS][DS_QID] drafter logits
+    float * qs_h[QZ_NC] = {};                      // pinned: the same
     unsigned int rnd = 0;                      // the request's round counter (Gumbel key)
 
     long rounds = 0, accepted = 0;
@@ -709,7 +709,7 @@ struct ink2_dspark {
             fprintf(stderr, "dspark: unsupported drafter shape\n"); return false;
         }
         char n[96];
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             card & k = K[c];
             ICHECK(hipSetDevice(qz_dev_of(c)));
             {
@@ -755,7 +755,7 @@ struct ink2_dspark {
         ICHECK(qz_dmalloc((void **) &out_d, 8 * sizeof(int), "dspark"));
         ICHECK(hipHostMalloc((void **) &out_h, 8 * sizeof(int), 0));
         ICHECK(hipMemset(out_d, 0, 8 * sizeof(int)));
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             card & k = K[c];
             ICHECK(hipSetDevice(qz_dev_of(c)));
             for (int l = 0; l < DS_NL; l++) { al(&k.ck[l], (size_t) ctx * DS_KVL); al(&k.cv[l], (size_t) ctx * DS_KVL); }
@@ -825,7 +825,7 @@ struct ink2_dspark {
     }
     // run fn(c, card, stream) on card 0, then card 1, each with its device current
     template <class F> void each(F && fn) {
-        for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); fn(c, K[c], E->C[c].st); }
+        for (int c = 0; c < QZ_NC; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); fn(c, K[c], E->C[c].st); }
     }
     // copy Y into the peer's Yp slot and return the slot. The caller sums Y and Yp.
     // qz_xdst: the consumer (the add on the peer's stream, below) is already ordered by the
@@ -972,7 +972,7 @@ struct ink2_dspark {
             ICHECK(hipSetDevice(qz_dev_of(0)));
         }
         if (sa) {   // each card's per-row (max, sum) of the halves, merged before the host
-            for (int c = 0; c < 2; c++) {
+            for (int c = 0; c < QZ_NC; c++) {
                 ICHECK(hipSetDevice(qz_dev_of(c)));
                 k_ds_lse_merge<<<DS_BS - 1, 64, 0, E->C[c].st>>>(lses[c], nb[c], lsem[c]);
             }
@@ -982,7 +982,7 @@ struct ink2_dspark {
         ICHECK(hipMemcpyAsync(out_h, out_d, 8 * sizeof(int), hipMemcpyDeviceToHost, st));
         ICHECK(hipStreamSynchronize(st));
         for (int i = 0; i < nd; i++) out[i] = out_h[i];
-        for (int c = 0; c < 2; c++) {                  // either card's wait may have given up
+        for (int c = 0; c < QZ_NC; c++) {                  // either card's wait may have given up
             ICHECK(hipSetDevice(qz_dev_of(c)));
             ICHECK(hipStreamSynchronize(E->C[c].st));
             ICHECK(hipMemcpy(&out_h[7], errd[c], sizeof(int), hipMemcpyDeviceToHost));
@@ -996,7 +996,7 @@ struct ink2_dspark {
     // the ids it owns.
     void qlog(const int * ids, float * lg, float * lse) {
         memcpy(qid_h, ids, DS_BS * DS_QID * sizeof(int));
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             const ink2_card & T = E->C[c];
             ICHECK(hipSetDevice(qz_dev_of(c)));
             hipStream_t st = E->C[c].st;
@@ -1006,7 +1006,7 @@ struct ink2_dspark {
             ICHECK(hipMemcpyAsync(qs_h[c], qs_d[c], DS_BS * DS_QID * sizeof(float), hipMemcpyDeviceToHost, st));
             ICHECK(hipMemcpyAsync(lseh[c], lsem[c], DS_BS * 2 * sizeof(float), hipMemcpyDeviceToHost, st));
         }
-        for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(E->C[c].st)); }
+        for (int c = 0; c < QZ_NC; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(E->C[c].st)); }
         ICHECK(hipSetDevice(qz_dev_of(0)));
         for (int r = 0; r < DS_BS - 1; r++)            // an id's logit sits on the card that owns it
             for (int j = 0; j < DS_QID; j++)

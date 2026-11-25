@@ -49,8 +49,8 @@ inline double ink2_ds_weight_bytes(const char * path, int c) {
 // 0 when it fits or cannot be sized here (the load reports the problem), 1 when refused
 inline int ink2_vram_check(const qz_gguf & g, int ctx, const char * dspark) {
     const bool ds = dspark != nullptr;
-    double need[2], free_b[2], total_b[2], w[2];
-    for (int c = 0; c < 2; c++) {
+    double need[QZ_NC], free_b[QZ_NC], total_b[QZ_NC], w[QZ_NC];
+    for (int c = 0; c < QZ_NC; c++) {
         qz_loader L;
         L.slice = ink2_tp2_spec;
         if (!L.plan(g, c)) return 0;
@@ -67,14 +67,14 @@ inline int ink2_vram_check(const qz_gguf & g, int ctx, const char * dspark) {
             (INK_PF_FIXED + INK_PF_HEADROOM + ink2_partp_bytes()) / 1e9,
             need[0] / 1e9, need[1] / 1e9, free_b[0] / 1e9, free_b[1] / 1e9);
     int bad = -1;
-    for (int c = 0; c < 2; c++)
+    for (int c = 0; c < QZ_NC; c++)
         if (need[c] > free_b[c] && (bad < 0 || need[c] - free_b[c] > need[bad] - free_b[bad])) bad = c;
     if (bad < 0) return 0;
     int fit = 0;                                   // the largest context that fits on both cards
     for (int lo = 1024, hi = ctx; lo <= hi; ) {
         const int mid = lo + (hi - lo) / 2;
         bool ok = true;
-        for (int c = 0; c < 2; c++) ok = ok && need[c] - ink2_ctx_bytes(ctx, c, ds) + ink2_ctx_bytes(mid, c, ds) <= free_b[c];
+        for (int c = 0; c < QZ_NC; c++) ok = ok && need[c] - ink2_ctx_bytes(ctx, c, ds) + ink2_ctx_bytes(mid, c, ds) <= free_b[c];
         if (ok) { fit = mid; lo = mid + 1; } else hi = mid - 1;
     }
     fit = fit / 1024 * 1024;

@@ -899,7 +899,7 @@ static __global__ __launch_bounds__(256) void k_pf_rmsw(const float * x, const f
 struct ink2_pf {
     ink2_engine * E = nullptr;
     std::atomic<bool> * abort = nullptr;
-    pf_card B[2];
+    pf_card B[QZ_NC];
     int bnx = 0;                       // exchange parity, the partials are double-buffered
     // The DSpark drafter's target features per prompt row, [row][4][D]: the residual
     // entering applications 5, 23 and 41, and the head input output_norm(mix(blocks, x;
@@ -910,8 +910,8 @@ struct ink2_pf {
     // The prompt's image rows. irow[pos] on the host, one entry per prompt position, is
     // -1 for a token and otherwise indexes img[c], each card's [rows][D] copy; null is text only.
     const int * irow = nullptr;
-    const float * img[2] = {};
-    int * irw[2] = {};                 // the chunk's irow, one per card
+    const float * img[QZ_NC] = {};
+    int * irw[QZ_NC] = {};                 // the chunk's irow, one per card
     bool tapping() const { return dtaps != nullptr; }
     void tap(int k, int p0, int m) {
         if (!tapping()) return;
@@ -1087,7 +1087,7 @@ struct ink2_pf {
         const bool full = is_full(ip), msg = S.bank >= 0;
         const int buf = bnx & 1;
         const int push = ip % ARB == 0 ? S.nblk : -1;
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             ICHECK(hipSetDevice(qz_dev_of(c)));
             ink2_card & K = E.C[c];
             pf_card & b = B[c];
@@ -1171,7 +1171,7 @@ struct ink2_pf {
         push_part(buf, m);
         E.exchange();
         bnx++;
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             ICHECK(hipSetDevice(qz_dev_of(c)));
             ink2_card & K = E.C[c];
             pf_card & b = B[c];
@@ -1187,7 +1187,7 @@ struct ink2_pf {
         if (push >= 0) { S.blocks.push_back(push); S.nblk++; }
         const int buf2 = bnx & 1;
         const int np = m * NE_USED, bn = moe_bn(np), yt = np / bn + NE;   // expert tiles
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             ICHECK(hipSetDevice(qz_dev_of(c)));
             ink2_card & K = E.C[c];
             pf_card & b = B[c];
@@ -1231,7 +1231,7 @@ struct ink2_pf {
         push_part(buf2, m);
         E.exchange();
         bnx++;
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             ICHECK(hipSetDevice(qz_dev_of(c)));
             ink2_card & K = E.C[c];
             pf_card & b = B[c];
@@ -1250,7 +1250,7 @@ struct ink2_pf {
     void head_last(const ink2_engine::seq & S, int m) {
         ink2_engine & E = *this->E;
         const size_t off = (size_t)(m - 1) * D;
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             ICHECK(hipSetDevice(qz_dev_of(c)));
             ink2_card & K = E.C[c];
             pf_card & b = B[c];
@@ -1265,7 +1265,7 @@ struct ink2_pf {
             qz_topk_rows<<<dim3(QZ_TOPK_NB, 1), 256, 0, K.st>>>(K.LOG, K.nvalid, K.id0, K.tk);
             ICHECK(hipMemcpyAsync(E.tkh[c].data(), K.tk, E.tkh[c].size() * sizeof(float2), hipMemcpyDeviceToHost, K.st));
         }
-        for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(E.C[c].st)); }
+        for (int c = 0; c < QZ_NC; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(E.C[c].st)); }
     }
 
     // ---- the batched prefill of prompt rows a .. n-1. Rows below a are already in
@@ -1275,7 +1275,7 @@ struct ink2_pf {
         for (int p0 = a; p0 < n; p0 += PF_M) {
             if (abort && abort->load()) return false;
             const int m = std::min(PF_M, n - p0);
-            for (int c = 0; c < 2; c++) {
+            for (int c = 0; c < QZ_NC; c++) {
                 ICHECK(hipSetDevice(qz_dev_of(c)));
                 ink2_card & K = E.C[c];
                 pf_card & b = B[c];
@@ -1290,7 +1290,7 @@ struct ink2_pf {
             ink2_engine::seq S;
             for (int il = 0; il < LOOP0; il++) { if (il == 5) tap(0, p0, m); layer(il, il, p0, m, S); }
             const ink2_engine::seq pre = S;
-            for (int c = 0; c < 2; c++) {
+            for (int c = 0; c < QZ_NC; c++) {
                 ICHECK(hipSetDevice(qz_dev_of(c)));
                 ICHECK(hipMemcpyAsync(B[c].P, B[c].X, (size_t) m * D * 4, hipMemcpyDeviceToDevice, E.C[c].st));
             }
@@ -1298,7 +1298,7 @@ struct ink2_pf {
                 if (pass > 0) {
                     const int bank = S.blocks[pre.blocks.size() + 1];
                     const int ob = (pass - 1) & 1;
-                    for (int c = 0; c < 2; c++) {
+                    for (int c = 0; c < QZ_NC; c++) {
                         ICHECK(hipSetDevice(qz_dev_of(c)));
                         ICHECK(hipMemcpyAsync(B[c].OUT[ob], B[c].X, (size_t) m * D * 4, hipMemcpyDeviceToDevice, E.C[c].st));
                         ICHECK(hipMemcpyAsync(B[c].X, B[c].P, (size_t) m * D * 4, hipMemcpyDeviceToDevice, E.C[c].st));

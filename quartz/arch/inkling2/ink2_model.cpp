@@ -29,7 +29,7 @@ struct ink2_ctx : qz_ctx {
     // arena. hi is the highest position written since the last reset, so the snapshot
     // at s is restorable while hi < s - WIN + 1 + PF_RING (its SWA window is intact).
     qz_pcache pc;
-    float * shist[2] = {};
+    float * shist[QZ_NC] = {};
     int hi = -1;
     // DSpark drafter (QZ_DSPINE=<drafter gguf>) for speculative rounds. The anchor and
     // the 7 drafts are the 8 rows of the verify kernel (ink2_verify.h).
@@ -43,7 +43,7 @@ struct ink2_ctx : qz_ctx {
     std::vector<img> imgs;
     unsigned long img_clock = 0;
     int img_next = 0;
-    float * img_dev[2] = {};
+    float * img_dev[QZ_NC] = {};
     size_t img_cap = 0;
 
     ~ink2_ctx() override { if (vis) inkling2v::qz_vision_free(vis); }   // device memory is freed at exit
@@ -123,7 +123,7 @@ struct ink2_ctx : qz_ctx {
             k++;
         }
         if (k != n_images) { fprintf(stderr, "inkling2: %d images for %d image runs\n", n_images, k); return false; }
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             ICHECK(hipSetDevice(qz_dev_of(c)));
             if (R > img_cap) {
                 if (img_dev[c]) (void) qz_dfree(img_dev[c]);
@@ -156,7 +156,7 @@ struct ink2_ctx : qz_ctx {
     int max_ctx() const override { return E.ctx; }
     void abort() override { abort_flag = true; }
     void sync2() {
-        for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(E.C[c].st)); }
+        for (int c = 0; c < QZ_NC; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(E.C[c].st)); }
         ICHECK(hipSetDevice(qz_dev_of(0)));
     }
 
@@ -198,7 +198,7 @@ struct ink2_ctx : qz_ctx {
             hi = std::max(hi, b - 1);
             if (mid < 0) return EPF.prefill(prompt, a, b, false) ? 0 : -1;
             if (!EPF.prefill(prompt, a, a + mid, false)) return -1;
-            for (int c = 0; c < 2; c++) {
+            for (int c = 0; c < QZ_NC; c++) {
                 ICHECK(hipSetDevice(qz_dev_of(c)));
                 ICHECK(hipMemcpyAsync(shist[c], E.C[c].hist, pc.blobs[0].bytes, hipMemcpyDeviceToDevice, E.C[c].st));
             }
@@ -210,7 +210,7 @@ struct ink2_ctx : qz_ctx {
         std::vector<int> irow;
         if (n_images || std::find(prompt, prompt + n_prompt, IMG_PAD) != prompt + n_prompt) {
             if (!image_rows(prompt, n_prompt, images, n_images, irow, keys)) { st.stop = -1; return fin(-1); }
-            EPF.irow = irow.data(); EPF.img[0] = img_dev[0]; EPF.img[1] = img_dev[1];
+            EPF.irow = irow.data(); for (int c = 0; c < QZ_NC; c++) EPF.img[c] = img_dev[c];
         }
         struct unset { ink2_pf & f; ~unset() { f.irow = nullptr; } } un{EPF};
         const int start = pc.prefill(prompt, n_prompt, keys, END_MESSAGE, PF_M, tail, h);
@@ -369,7 +369,7 @@ struct ink2_ctx : qz_ctx {
                 while (n < nd && dr[n] == g[n]) n++;
             } else {                                  // sampled: speculative sampling
                 const size_t rb = (size_t) QZ_TOPK_NB * QZ_TOPK;
-                for (int c = 0; c < 2; c++) sam.tk[c].assign(E.vtkp[c], E.vtkp[c] + VR * rb);
+                for (int c = 0; c < QZ_NC; c++) sam.tk[c].assign(E.vtkp[c], E.vtkp[c] + VR * rb);
                 // Each row's p is the sampler's own chain, q comes from the drafter: the
                 // round's rows' candidate ids (plus each row's draft, when p does not list
                 // it) go to the cards in one launch, then row r accepts dr[r] or the

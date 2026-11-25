@@ -11,9 +11,9 @@
 // kernels and the persistent kernel rounding identically, and is restored at the end.
 #pragma clang fp contract(on)
 
-constexpr int HQL = HQ / 2, HKVL = HKV / 2;            // local heads per card
-constexpr int QL = HQL * HD, KVL = HKVL * HD;          // 1536, 512
-constexpr int FFL = FFE / 2;                           // local expert FF: 576
+constexpr int HQL = HQ / QZ_NC, HKVL = HKV / QZ_NC;    // local heads per card
+constexpr int QL = HQL * HD, KVL = HKVL * HD;          // 1536, 512 at 2 cards
+constexpr int FFL = FFE / QZ_NC;                       // local expert FF: 576 at 2 cards
 // Prefill chunk rows, and the SWA ring, indexed pos % PF_RING everywhere. The ring holds
 // at least a window of WIN plus the in-flight chunk, and the slack keeps a prefix-cache
 // snapshot at s restorable while writes stay below s - WIN + 1 + PF_RING.
