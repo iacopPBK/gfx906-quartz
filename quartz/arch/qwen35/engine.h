@@ -94,7 +94,7 @@ typedef bool (*qz_emit_fn)(void * user, const int32_t * toks, int n);
 
 class qz_engine {
 public:
-    qz_card C[2];
+    qz_card C[QZ_NC];
     qz_trunk_args H = {};      // per-call fields; everything else is per card
     bool H_mtp = false;
     long long n_launch = 0;
@@ -165,7 +165,7 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
     }
     n_vocab = hp.n_vocab;
     n_layer = hp.n_layer;
-    hrows = n_vocab / 2;
+    hrows = n_vocab / QZ_NC;
     eps = -1.f;
     {
         const int64_t id = g.key("qwen35.attention.layer_norm_rms_epsilon");
@@ -179,7 +179,7 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
 
     const int n_pages = qz_kv_pages(steps);
     const int n_pages_m = qz_kv_pages_mtp(steps);
-    for (int c = 0; c < 2; c++) {
+    for (int c = 0; c < QZ_NC; c++) {
         qz_card & K = C[c];
         K.dev = qz_dev_of(c);
         qz_mem_scope mem_target("target");
@@ -371,7 +371,7 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
             if (!qz_resident(qz_dev_of(c), ks, (int) (sizeof(ks) / sizeof(ks[0])), 60, 512)) return 1;
         }
     }
-    for (int c = 0; c < 2; c++) {
+    for (int c = 0; c < QZ_NC; c++) {
         C[c].A.xin_peer = C[1 - c].x.xin;
         C[c].A.xhm_peer = C[1 - c].x.xhm;
         C[c].A.xflag_peer = C[1 - c].x.xflag;
@@ -401,7 +401,7 @@ inline void qz_engine::put(qz_card & K) {
 }
 
 inline void qz_engine::launch_cyc(int T) {
-    for (int c = 0; c < 2; c++) {
+    for (int c = 0; c < QZ_NC; c++) {
         qz_card & K = C[c];
         CHECK(hipSetDevice(qz_dev_of(c)));
         put(K);
@@ -419,7 +419,7 @@ inline void qz_engine::launch_cyc(int T) {
 }
 
 inline void qz_engine::launch_mtp(int T) {
-    for (int c = 0; c < 2; c++) {
+    for (int c = 0; c < QZ_NC; c++) {
         qz_card & K = C[c];
         CHECK(hipSetDevice(qz_dev_of(c)));
         put(K);
@@ -433,13 +433,13 @@ inline void qz_engine::launch_mtp(int T) {
 }
 
 inline void qz_engine::sync2() {
-    for (int c = 0; c < 2; c++) { CHECK(hipSetDevice(qz_dev_of(c))); CHECK(hipStreamSynchronize(C[c].st)); }
+    for (int c = 0; c < QZ_NC; c++) { CHECK(hipSetDevice(qz_dev_of(c))); CHECK(hipStreamSynchronize(C[c].st)); }
     CHECK(hipSetDevice(qz_dev_of(0)));
-    for (int c = 0; c < 2; c++) qz_xerr_check(c, C[c].x.xerr, n_launch);
+    for (int c = 0; c < QZ_NC; c++) qz_xerr_check(c, C[c].x.xerr, n_launch);
 }
 
 inline void qz_engine::reset_state() {
-    for (int c = 0; c < 2; c++) {
+    for (int c = 0; c < QZ_NC; c++) {
         qz_card & K = C[c];
         CHECK(hipSetDevice(qz_dev_of(c)));
         CHECK(hipMemset(K.dn_all, 0, (size_t) hp.n_recr * g2_HV * S * S * 4));
@@ -488,7 +488,7 @@ inline int qz_engine::generate(const std::vector<int32_t> & prompt_in, int max_n
         launch_cyc(r);
         if (last && sam.smp) sampled_verify(r, false, pos);   // the first decode token, sampled
         if (!last)
-            for (int c = 0; c < 2; c++) {
+            for (int c = 0; c < QZ_NC; c++) {
                 CHECK(hipSetDevice(qz_dev_of(c)));
                 CHECK(hipMemsetD32Async((hipDeviceptr_t)(C[c].ctl_d + 1), prompt[pos + r], 1, C[c].st));
             }
@@ -565,13 +565,13 @@ inline int qz_engine::generate(const std::vector<int32_t> & prompt_in, int max_n
 
 inline int qz_engine::sampled_verify(int T, bool verify, int pos) {
     // candidates of rows 0 .. T - 1 on both cards, from y_head, in stream order
-    for (int c = 0; c < 2; c++) {
+    for (int c = 0; c < QZ_NC; c++) {
         qz_card & K = C[c];
         CHECK(hipSetDevice(qz_dev_of(c)));
         hipLaunchKernelGGL(qz_topk_rows, dim3(QZ_TOPK_NB, T), dim3(256), 0, K.st, K.A.y_head, hrows, c * hrows, K.topk_d);
         CHECK(hipGetLastError());
     }
-    for (int c = 0; c < 2; c++) {
+    for (int c = 0; c < QZ_NC; c++) {
         CHECK(hipSetDevice(qz_dev_of(c)));
         CHECK(hipStreamSynchronize(C[c].st));
         sam.tk[c].resize((size_t) QZ_TMAX * QZ_TOPK_NB * QZ_TOPK);
@@ -589,7 +589,7 @@ inline int qz_engine::sampled_verify(int T, bool verify, int pos) {
         x = sam.sample_row(m);
     }
     const int c3[3] = { m + 1, x, pos + m + 1 };   // as the greedy verify writes them
-    for (int c = 0; c < 2; c++) {
+    for (int c = 0; c < QZ_NC; c++) {
         CHECK(hipSetDevice(qz_dev_of(c)));
         CHECK(hipMemcpy(C[c].ctl_d, c3, sizeof(c3), hipMemcpyHostToDevice));
     }

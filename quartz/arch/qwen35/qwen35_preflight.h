@@ -29,8 +29,8 @@ inline double qz_file_bytes(const char * p) {
 inline int qz_vram_check(const char * model, int max_ctx, int steps, size_t scratch, const char * dspine, const char * mmproj) {
     qz_gguf g;
     if (!g.open(model)) return 0;
-    double weights[2] = {}, free_b[2] = {}, total_b[2] = {};
-    for (int c = 0; c < 2; c++) {
+    double weights[QZ_NC] = {}, free_b[QZ_NC] = {}, total_b[QZ_NC] = {};
+    for (int c = 0; c < QZ_NC; c++) {
         qz_loader L;
         L.slice = qz_tp2_spec;
         if (!L.plan(g, c)) return 0;
@@ -43,15 +43,15 @@ inline int qz_vram_check(const char * model, int max_ctx, int steps, size_t scra
     const double kv = (double) qz_kv_bytes(steps), ds = dspine ? QZ_PF_DSPINE : 0.0;
     const double mm = mmproj ? qz_file_bytes(mmproj) + QZ_PF_MMPROJ_EXTRA : 0.0;
     const double buf = (double) scratch + QZ_PF_FIXED + QZ_PF_HEADROOM;
-    double need[2];
-    for (int c = 0; c < 2; c++) need[c] = weights[c] + kv + ds + mm + buf;
+    double need[QZ_NC];
+    for (int c = 0; c < QZ_NC; c++) need[c] = weights[c] + kv + ds + mm + buf;
     char extra[64] = "";
     if (ds > 0) snprintf(extra, sizeof extra, " + DSpine %.1f", ds / 1e9);
     if (mm > 0) snprintf(extra + strlen(extra), sizeof extra - strlen(extra), " + vision %.1f", mm / 1e9);
     fprintf(stderr, "quartz: memory per card: weights %.1f + KV %.1f (ctx %d)%s + buffers %.1f = %.1f GB; free %.1f and %.1f GB\n",
             weights[0] / 1e9, kv / 1e9, max_ctx, extra, buf / 1e9, need[0] / 1e9, free_b[0] / 1e9, free_b[1] / 1e9);
     int bad = -1;
-    for (int c = 0; c < 2; c++)
+    for (int c = 0; c < QZ_NC; c++)
         if (need[c] > free_b[c] && (bad < 0 || need[c] - free_b[c] > need[bad] - free_b[bad])) bad = c;
     if (bad < 0) return 0;
 
@@ -61,7 +61,7 @@ inline int qz_vram_check(const char * model, int max_ctx, int steps, size_t scra
         const int mid = lo + (hi - lo) / 2;
         const double kv_m = (double) qz_kv_bytes(mid + 2 * QZ_TMAX);
         bool ok = true;
-        for (int c = 0; c < 2; c++) ok = ok && need[c] - kv + kv_m <= free_b[c];
+        for (int c = 0; c < QZ_NC; c++) ok = ok && need[c] - kv + kv_m <= free_b[c];
         if (ok) { fit = mid; lo = mid + 1; } else hi = mid - 1;
     }
     fit = fit / 1024 * 1024;

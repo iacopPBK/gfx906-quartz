@@ -130,7 +130,7 @@ struct qz_trunk_args {
     float * mtp_yhead;            // MTP head rows [QZ_TMAX][n_vocab]
     // TP2: this card's exchange state, see qwen35_cycle.hip
     int tp_card;                  // 0 or 1
-    int hrows;                    // local lm_head rows (n_vocab / 2)
+    int hrows;                    // local lm_head rows (n_vocab / QZ_NC)
     float * y_part;               // [QZ_TMAX][QZ_D] own row-parallel partial
     float * xin_mine;             // uncached inbox, rows [2][QZ_TMAX][QZ_D] + checksums
     float * xin_peer;             // the peer's inbox (P2P)

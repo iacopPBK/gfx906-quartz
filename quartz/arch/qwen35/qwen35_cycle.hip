@@ -5,8 +5,8 @@
 
 // Per-card geometry (tp2.h). TR is the row capacity of the replay ring.
 template <int TR = QZ_TMAX> struct qz_geo {
-    static constexpr int HV = QZ_HV / 2, HK = QZ_HK / 2, CCH = QZ_CCH / 2, G = QZ_G / 2, AQ = QZ_AQ / 2,
-                         AKV = QZ_AKV / 2, HQ = QZ_HQ / 2, HKV = QZ_HKV / 2, FF = QZ_FF / 2;
+    static constexpr int HV = QZ_HV / QZ_NC, HK = QZ_HK / QZ_NC, CCH = QZ_CCH / QZ_NC, G = QZ_G / QZ_NC, AQ = QZ_AQ / QZ_NC,
+                         AKV = QZ_AKV / QZ_NC, HQ = QZ_HQ / QZ_NC, HKV = QZ_HKV / QZ_NC, FF = QZ_FF / QZ_NC;
     static constexpr int RING_CONV = 0, RING_QKV = TR * CCH, RING_BETA = 2 * TR * CCH,
                          RING_ALPH = 2 * TR * CCH + TR * HV, RING_PAR = 2 * TR * CCH + 2 * TR * HV;
 };
@@ -362,8 +362,8 @@ static_assert(qz_cycle_fslot_aligned<1>() && qz_cycle_fslot_aligned<2>() &&
               qz_cycle_fslot_aligned<3>() && qz_cycle_fslot_aligned<4>(), "cycle LDS: fslot not 16 B aligned");
 // The exchange GEMVs stage their activation slice in region 0.
 template <int T> constexpr bool qz_cycle_r0_holds_xrow() {
-    return qz_cycle_r0<T>() >= (size_t) T * (QZ_FF / 2) * (1 + 4 / 32.0) &&
-           qz_cycle_r0<T>() >= (size_t) T * (QZ_G / 2) * (1 + 4 / 32.0);
+    return qz_cycle_r0<T>() >= (size_t) T * (QZ_FF / QZ_NC) * (1 + 4 / 32.0) &&
+           qz_cycle_r0<T>() >= (size_t) T * (QZ_G / QZ_NC) * (1 + 4 / 32.0);
 }
 static_assert(qz_cycle_r0_holds_xrow<1>() && qz_cycle_r0_holds_xrow<2>() &&
               qz_cycle_r0_holds_xrow<3>() && qz_cycle_r0_holds_xrow<4>(), "cycle LDS: region 0 < xrow slice");

@@ -56,14 +56,14 @@ struct q35_ctx : qz_ctx {
     static constexpr int pf_min = 16;   // prompts shorter than this decode on the cycle's forced rows
     static constexpr int tail = 64;
     qz_pcache pc;                 // blobs: the GDN state dn, the conv state cs
-    float * sdn[2] = {}, * scs[2] = {};   // mid-chunk staging of dn and cs
+    float * sdn[QZ_NC] = {}, * scs[QZ_NC] = {};   // mid-chunk staging of dn and cs
     int last_cached = 0;
     struct img { uint64_t hash = 0; int id = 0, nx = 0, ny = 0; unsigned long use = 0; std::vector<float> rows; };
     qwen3vl::qz_vision * vis = nullptr;
     std::vector<img> imgs;
     unsigned long img_clock = 0;
     int img_next = 0;
-    float * img_dev[2] = {};
+    float * img_dev[QZ_NC] = {};
     size_t img_cap = 0;
 
     qz_dsrun ds;
@@ -73,7 +73,7 @@ struct q35_ctx : qz_ctx {
         float lo = 3.8f, hi = 3.4f;       // leave DSpine below lo tok/round, MTP at hi and above
         int win = 128, flush = 512;       // window tokens, and MTP feature rows per DSpine ring fill
         int cap = 1024;                   // staged MTP entries per flush
-        float * hn[2] = {};               // staged entry inputs [cap + 12][QZ_D] per card
+        float * hn[QZ_NC] = {};               // staged entry inputs [cap + 12][QZ_D] per card
         std::vector<int32_t> tok;         // staged entry j: position p0 + j
         int p0 = 0;
     } sw;
@@ -97,7 +97,7 @@ static void qz_cache_drop(q35_ctx * c) { c->pc.drop(); }   // the engine state h
 static void qz_pf_setup(q35_ctx * c) {
     // plus headroom; the buffers come from the engine's scratch when it holds them
     const size_t need = (c->eng.C[0].scr_bytes >= qz_prefill::bytes(2048) ? 0 : qz_prefill::bytes(2048)) + ((size_t) 256 << 20);
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < QZ_NC; i++) {
         size_t fr = 0, tot = 0;
         CHECK(hipSetDevice(qz_dev_of(i)));
         CHECK(hipMemGetInfo(&fr, &tot));
@@ -115,7 +115,7 @@ static void qz_pf_setup(q35_ctx * c) {
     if (c->pf_ok) {
         qz_blob dn, cs;
         dn.bytes = qz_dn_bytes(c->eng); cs.bytes = qz_cs_bytes(c->eng);
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < QZ_NC; i++) {
             CHECK(hipSetDevice(qz_dev_of(i)));
             CHECK(qz_dmalloc(&c->sdn[i], dn.bytes)); CHECK(qz_dmalloc(&c->scs[i], cs.bytes));
             dn.live[i] = c->eng.C[i].dn_all; dn.stage[i] = c->sdn[i];
@@ -178,7 +178,7 @@ static int qz_switch_run(q35_ctx * c, int pos, int32_t anchor, int max_new, cons
     };
     ds.sw_hook = [&](int p, int n, int W, const int32_t * toks, const int * out) {
         if (w.tok.empty()) w.p0 = p + 1;
-        for (int i = 0; i < 2; i++) {   // entries p+1 .. p+n: the token there and row j's normed hidden
+        for (int i = 0; i < QZ_NC; i++) {   // entries p+1 .. p+n: the token there and row j's normed hidden
             CHECK(hipSetDevice(qz_dev_of(i)));
             const float * h = W > 8 ? ds.mw[i].Ah.h_nextn : ds.mv[i].Ah.h_nextn;
             CHECK(hipMemcpy(w.hn[i] + w.tok.size() * QZ_D, h, (size_t) n * QZ_D * 4, hipMemcpyDeviceToDevice));
@@ -204,7 +204,7 @@ static int qz_switch_run(q35_ctx * c, int pos, int32_t anchor, int max_new, cons
         if (on_ds) {
             r = ds.generate(e, pc, anchor, left, s, (qz_emit_fn) cb, user, &g);
         } else {
-            for (int i = 0; i < 2; i++) { CHECK(hipSetDevice(qz_dev_of(i))); CHECK(hipMemset(e.C[i].ctl_d, 0, 8 * sizeof(int))); }
+            for (int i = 0; i < QZ_NC; i++) { CHECK(hipSetDevice(qz_dev_of(i))); CHECK(hipMemset(e.C[i].ctl_d, 0, 8 * sizeof(int))); }
             CHECK(hipSetDevice(qz_dev_of(0)));
             r = e.generate(pend, left, s, (qz_emit_fn) cb, user, &g, pc);   // <= 3 rows: one forced chunk, like a request's first
         }
@@ -259,7 +259,7 @@ static int qz_run(q35_ctx * c, const std::vector<int32_t> & p, int max_new, cons
     qz_pcache::hooks h;
     h.reset = [&] { c->eng.reset_state(); };
     h.restored = [&] {   // the decode rings and control words start clean
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < QZ_NC; i++) {
             qz_card & K = c->eng.C[i];
             CHECK(hipSetDevice(qz_dev_of(i)));
             CHECK(hipMemsetAsync(K.ring_all, 0, (size_t) c->eng.hp.n_recr * 2 * g2_RING_PAR * 4, K.st));
@@ -268,8 +268,9 @@ static int qz_run(q35_ctx * c, const std::vector<int32_t> & p, int max_new, cons
         c->eng.sync2();
     };
     h.chunk = [&](int a, int b, int mid) {
-        float * md[2] = { mid >= 0 ? c->sdn[0] : nullptr, mid >= 0 ? c->sdn[1] : nullptr };
-        float * mc[2] = { mid >= 0 ? c->scs[0] : nullptr, mid >= 0 ? c->scs[1] : nullptr };
+        float * md[QZ_NC] = {}, * mc[QZ_NC] = {};
+        if (mid >= 0)
+            for (int i = 0; i < QZ_NC; i++) { md[i] = c->sdn[i]; mc[i] = c->scs[i]; }
         if (c->pf.run(c->eng, p.data() + a, a, b - a, p[b], mid, md, mc, mm)) return -1;
         if (ds_on) { c->eng.sync2(); c->ds.fill_prefill(c->pf.feat, c->pf.Mmax, a, b - a); }
         return 0;
@@ -413,7 +414,7 @@ int q35_ctx::generate(const int32_t * prompt, int n_prompt, const int * images, 
         }
         if (k != n_images) { fprintf(stderr, "quartz: %d images for %d image runs\n", n_images, k); return -1; }
         if (R > c->img_cap) {
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < QZ_NC; i++) {
                 CHECK(hipSetDevice(qz_dev_of(i)));
                 if (c->img_dev[i]) (void) qz_dfree(c->img_dev[i]);
                 c->img_dev[i] = nullptr;
@@ -422,7 +423,7 @@ int q35_ctx::generate(const int32_t * prompt, int n_prompt, const int * images, 
             }
             c->img_cap = R;
         }
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < QZ_NC; i++) {
             CHECK(hipSetDevice(qz_dev_of(i)));
             size_t off = 0;
             for (int j = 0; j < n_images; j++) {
@@ -495,7 +496,7 @@ static qz_ctx * create(const char * model, const qz_create_opts & o) {
         if (const char * v = getenv("QZ_SW_HI")) w.hi = (float) atof(v);
         if (const char * v = getenv("QZ_SW_WIN")) w.win = atoi(v);
         qz_mem_scope mem("drafter switch");
-        for (int i = 0; i < 2; i++) { CHECK(hipSetDevice(qz_dev_of(i))); CHECK(qz_dmalloc(&w.hn[i], (size_t) (w.cap + 12) * QZ_D * 4)); }
+        for (int i = 0; i < QZ_NC; i++) { CHECK(hipSetDevice(qz_dev_of(i))); CHECK(qz_dmalloc(&w.hn[i], (size_t) (w.cap + 12) * QZ_D * 4)); }
         CHECK(hipSetDevice(qz_dev_of(0)));
         w.on = true;
         fprintf(stderr, "quartz: drafter switch on: leave DSpine < %.2f, MTP >= %.2f tok/round, window %d\n", w.lo, w.hi, w.win);
