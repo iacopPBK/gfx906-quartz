@@ -18,12 +18,9 @@ inline double ink2_ctx_bytes(int ctx, int card, bool ds) {
 // 256 MB of headroom on top. Measured at ctx 262144: 20.6 GB per card, this estimate 20.9.
 constexpr double INK_PF_FIXED = 1.5e9, INK_PF_DS0 = 0.25e9, INK_PF_DS1 = 0.2e9, INK_PF_HEADROOM = 0.25e9;
 
-// host mode only: each card's copy of the peer's two prefill partial slots (ink2_pf.h
-// PARTP), 2 x PF_M x D floats. Under p2p the conv reads the peer's VRAM and these do not
-// exist, so the estimate is unchanged there.
-inline double ink2_partp_bytes() {
-    return qz_link == QZ_LINK_HOST ? 2.0 * PF_M * D * 4 : 0.0;
-}
+// each card's copy of the peer's two prefill partial slots (ink2_pf.h PARTP), 2 x PF_M x D
+// floats, under either link
+inline double ink2_partp_bytes() { return 2.0 * PF_M * D * 4; }
 
 // the vision encoder (QZ_MMPROJ, set by the server's --mmproj) on card 0. Covers the weight
 // file and its activations at the 4096-token image limit.

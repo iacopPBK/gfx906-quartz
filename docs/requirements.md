@@ -9,7 +9,7 @@ commands are in the [README](../README.md), flags and environment variables in
 | | Item | Needed for |
 |---|---|---|
 | GPU | exactly 2× AMD MI50/MI60 (gfx906) 32 GB; PCIe peer access recommended | all |
-| Toolchain | ROCm (`hipcc`, HIP runtime, rocBLAS), a C++17 compiler | build, run |
+| Toolchain | ROCm (`hipcc`, HIP runtime, rocBLAS), a C++17 compiler. Tested on TheRock HIP 7.14 | build, run |
 | Model (`--model`) | Qwen3.8-27B or a fine-tune as Q8_0 GGUF with the nextn (MTP) block, ~28 GB; or Inkling-2-Mini as Q8_0 GGUF, ~28 GB | all |
 | Drafter (`--dspine`) | Qwen: DSpine draft GGUF, ~2.1 GB. Inkling: DSpark draft GGUF, ~0.4 GB | speculative decode |
 | Projector (`--mmproj`) | Qwen: `qwen3vl_merger` GGUF, ~0.9 GB. Inkling: `inkling2v` GGUF, ~0.6 GB | images |
@@ -25,7 +25,10 @@ commands are in the [README](../README.md), flags and environment variables in
   each other's VRAM. Without it they exchange through pinned host memory, with the
   same arithmetic and the same greedy output, only slower: roughly 5-20 %. `QZ_LINK=auto` (the default)
   takes a peer pair when there is one and host memory otherwise; `p2p` and
-  `host` force a mode ([configuration](configuration.md)).
+  `host` force a mode ([configuration](configuration.md)). Peer access only has
+  to carry writes: quartz never reads the other card's memory, so boards whose
+  root ports forward peer writes but not peer reads (Intel desktop boards with
+  each card on its own CPU port) run the fast path.
 - **gfx906 only.** The kernels use gfx906 instructions and need every block of
   a 60-block grid resident at once; the load fails on a card where they do not fit.
 - **P2P setup.** The server sets `HSA_FORCE_FINE_GRAIN_PCIE=1` and
@@ -62,8 +65,9 @@ with `--mmproj` on Qwen.
 - `make` builds `build/bin/libquartz.so` with `hipcc`. rocBLAS is used by the
   vision encoders only. There is no cmake, no submodule and no llama.cpp tree.
 - `hipcc` comes from `PATH`, else `$(ROCM_PATH)/bin/hipcc` (`ROCM_PATH`
-  defaults to `/opt/rocm`). At run time `libamdhip64` and `librocblas` must
-  resolve through the system loader.
+  defaults to `/opt/rocm`). With only a versioned install and no `hipcc` on
+  `PATH`, point the build at it: `make ROCM_PATH=/opt/rocm-<version>`. At run time
+  `libamdhip64` and `librocblas` must resolve through the system loader.
 
 ## Models
 

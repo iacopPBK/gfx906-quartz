@@ -8,7 +8,7 @@
 #pragma once
 
 #include "kernels/pf_gemm.h"     // pf_norm_quant, pf_quant_unit, plane types
-#include "core/link.h"           // qz_xcopy: the peer's prefill partial under QZ_LINK=host
+#include "core/link.h"           // qz_xcopy: the prefill partial to the peer
 
 constexpr int PF_NP = 8 * PF_M;             // max (row, expert) pairs per chunk
 constexpr int GUL = 2 * FFL;                // local gate and up rows per expert
@@ -477,9 +477,9 @@ static __global__ __launch_bounds__(16 * FA_R / RPT) void k_pf_fattn(pfat a, int
 
 // The short conv along the chunk rows, folded into the x update. push moves x into a
 // fresh residual block, otherwise the conv is added to x. Row t reads rows t-1..t-3 or
-// the slot's conv history, and u = own + peer is the TP2 sum: the peer's partial in its
-// VRAM under p2p, this card's inbox (PARTP) under host mode. One thread per column walks
-// CV_R rows, so each input is read once.
+// the slot's conv history, and u = own + peer is the TP2 sum, the peer's partial read from
+// this card's inbox (PARTP). One thread per column walks CV_R rows, so each input is read
+// once.
 struct pfcv { const float * own, * peer; const float * w; float * hrg; float * x, * blk; int m, push; };
 constexpr int CV_R = 32;
 static __global__ __launch_bounds__(256) void k_pf_conv2(pfcv a) {
@@ -872,7 +872,7 @@ struct pf_card {
     float * MSG, * CT, * Z;            // [4][PF_M][D], [4][PF_M][D], [4][PF_M][2D]
     float * Gb;                        // [4][PF_M][GRANK]
     float * F, * FN, * PART[2];        // [PF_M][D]
-    float * PARTP[2];                  // host mode: the peer's PART[buf] pushed here
+    float * PARTP[2];                  // the peer's PART[buf], pushed here by the peer
     float * QR, * GR, * Q, * RR, * SK, * KR, * VR, * DK, * DV, * TB;
     pf_plane INP[3], FF, AT;           // input planes (K = D), ffn (K = D), attn output (K = QL)
     unsigned char * APQ; float * APS;  // per-pair situ planes [PF_NP][FFL], [PF_NP][FFL/32]
@@ -986,17 +986,17 @@ struct ink2_pf {
         b.FF.q = (unsigned char *) nx(); b.FF.s = (float *) nx();
         b.AT.q = (unsigned char *) nx(); b.AT.s = (float *) nx();
         b.APQ = (unsigned char *) nx();
-        // host mode: the conv cannot read the peer's PART, so each card keeps a copy of the
-        // peer's two alternated slots in its own VRAM, filled by qz_xcopy in layer(). p2p
-        // reads the peer's memory directly and allocates nothing here.
-        if (qz_link == QZ_LINK_HOST)
-            for (auto & q : b.PARTP) {
-                if (qz_dmalloc((void **) &q, (size_t) PF_M * D * 4, "state") != hipSuccess) {
-                    fprintf(stderr, "inkling2: card %d: no room for the %.2f MB prefill inbox\n", c, (double) PF_M * D * 4 / 1e6);
-                    return false;
-                }
-                ICHECK(hipMemset(q, 0, (size_t) PF_M * D * 4));
+        // Kernels never read the other card's memory: some boards (Intel client root ports)
+        // forward peer writes but not peer reads, and a peer read there takes both cards
+        // down. So each card keeps a copy of the peer's two alternated slots in its own
+        // VRAM, filled by qz_xcopy in layer().
+        for (auto & q : b.PARTP) {
+            if (qz_dmalloc((void **) &q, (size_t) PF_M * D * 4, "state") != hipSuccess) {
+                fprintf(stderr, "inkling2: card %d: no room for the %.2f MB prefill inbox\n", c, (double) PF_M * D * 4 / 1e6);
+                return false;
             }
+            ICHECK(hipMemset(q, 0, (size_t) PF_M * D * 4));
+        }
         return true;
     }
 
@@ -1019,21 +1019,19 @@ struct ink2_pf {
         hipStream_t st = E->C[c].st;
         k_pf_commit<<<(w + 255) / 256, 256, 0, st>>>(src, peer, hrg, w, m);
     }
-    // The other card's half of a partial. p2p reads its VRAM; host mode reads this card's
-    // own copy (PARTP[buf]), which push_part() filled from the peer.
-    const float * peer_part(int c, int buf) const {
-        return qz_link == QZ_LINK_HOST ? B[c].PARTP[buf] : B[1 - c].PART[buf];
-    }
-    // host mode: hand both cards' PART[buf] to their peer's inbox, after both cards' GEMMs
+    // The other card's half of a partial: this card's copy (PARTP[buf]), which push_part()
+    // filled from the peer.
+    const float * peer_part(int c, int buf) const { return B[c].PARTP[buf]; }
+    // Hand both cards' PART[buf] to their peer's inbox, after both cards' GEMMs
     // have been queued (a separate pass on purpose: the H2D goes on the peer's stream, so
     // queuing it inside the GEMM loop would park it in front of the peer's own GEMM for the
     // same layer and the two cards would take turns instead of overlapping).
-    // Ordering: this card's D2H is on its own stream, after the GEMM that wrote the rows;
-    // the H2D is on the peer's stream, where the peer's conv reads the slot below in
-    // program order and where its previous reader of the same alternated slot was queued,
-    // so the slot's WAR is the stream's own. No extra event, and p2p copies nothing.
+    // Ordering: p2p is one peer copy on this card's stream, after the GEMM that wrote the
+    // rows, and qz_xcopy orders the peer's stream behind it. Host mode's D2H is on this
+    // card's stream and its H2D on the peer's, where the peer's conv reads the slot below
+    // in program order and where its previous reader of the same alternated slot was
+    // queued, so the slot's WAR is the stream's own.
     void push_part(int buf, int m) {
-        if (qz_link != QZ_LINK_HOST) return;
         for (int c = 0; c < 2; c++) {
             ICHECK(hipSetDevice(qz_dev_of(c)));
             ICHECK(qz_xcopy(B[1 - c].PARTP[buf], 1 - c, E->C[1 - c].st, B[c].PART[buf], c, E->C[c].st, (size_t) m * D * 4));

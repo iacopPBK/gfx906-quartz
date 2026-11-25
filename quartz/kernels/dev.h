@@ -17,8 +17,10 @@ typedef const unsigned short __attribute__((address_space(1))) qz_gh;
 // struct: assert it, so loads and stores compile to global_*. flat_* counts in
 // lgkmcnt too, so every LDS wait would wait on the outstanding HBM traffic
 template <class T> __device__ __forceinline__ T * qz_gp(T * p) {
+#if defined(__HIP_DEVICE_COMPILE__)          // device-only builtins; ROCm 7.2's host pass rejects them
     __builtin_assume(!__builtin_amdgcn_is_shared((const void *) p));
     __builtin_assume(!__builtin_amdgcn_is_private((const void *) p));
+#endif
     return p;
 }
 

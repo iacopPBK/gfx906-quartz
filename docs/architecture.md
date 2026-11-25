@@ -23,6 +23,12 @@ are staged through it (`core/link.h`). Both cards reach a mailbox through the
 same pointer, so the exchange kernels run unchanged: same arithmetic, same
 greedy output, and the extra cost is the PCIe trip.
 
+Either way, a card only ever writes to the other card's memory: no kernel loads
+or read-modify-writes across the link. Some boards (Intel client root ports)
+forward peer writes but not peer reads, and a peer read there takes both cards
+down until a reboot. Partials go into the reader's own memory by a store or a
+peer copy, and every wait polls a local flag.
+
 ### A request
 
 1. **Template.** The server renders the chat with the template from the GGUF
