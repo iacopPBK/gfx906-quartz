@@ -143,7 +143,7 @@ struct ink2_engine {
             ICHECK(hipDeviceSynchronize());
             ICHECK(hipFree(tv)); ICHECK(hipFree(ts));
         }
-        const int share = VOCAB / QZ_NC;
+        const int share = ink2_head_share(VOCAB, QZ_NC);   // whole 32-row blocks per card
         K.id0 = share * c;
         K.nvalid = std::min(share, VOCAB_REAL - K.id0);
     }
@@ -161,7 +161,7 @@ struct ink2_engine {
         add(f32(NCTRL * GRANK));                                                          // G
         add(f32(QL)); add(f32(QL)); add(f32(HQL * DREL)); add(f32(64)); add(f32(KVL)); add(f32(KVL));
         add(f32(64)); add(f32(64)); add(f32(QL / 2)); add(f32(HQL * TBW)); add(f32(nD)); add(f32(nD));
-        add(f32(NE_USED * FFE)); add(f32(NE_USED)); add(f32(VOCAB / QZ_NC)); add(f32(NE_USED));
+        add(f32(NE_USED * FFE)); add(f32(NE_USED)); add(f32(ink2_head_share(VOCAB, QZ_NC))); add(f32(NE_USED));
         for (int i = 0; i < 4; i++) { add(f32(nD / 4)); add(f32(nD / 32)); }              // planes (int8 = n/4 floats)
         add(f32(QL / 4)); add(f32(QL / 32));
         add(f32(NE_USED * FFL / 4)); add(f32(NE_USED * FFL / 32));

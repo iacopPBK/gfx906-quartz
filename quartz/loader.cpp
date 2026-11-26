@@ -39,7 +39,7 @@ bool qz_loader::plan(const qz_gguf & g, int card) {
             const int64_t cu = ts[t].type == GGML_TYPE_Q8_0 ? 32 : 1;
             if (!ts[t].slice.cols.empty()) ts[t].ne0 = (int64_t) ts[t].slice.cols.size() * cu;
             if (!ts[t].slice.rows.empty()) ts[t].ne1 = (int64_t) ts[t].slice.rows.size();
-            for (int32_t r : ts[t].slice.rows) if (r < 0 || r >= ts[t].src_ne1) { fprintf(stderr, "qz_loader: bad row map %s\n", ts[t].name.c_str()); return false; }
+            for (int32_t r : ts[t].slice.rows) if ((r < 0 && r != QZ_SLICE_ZERO) || r >= ts[t].src_ne1) { fprintf(stderr, "qz_loader: bad row map %s\n", ts[t].name.c_str()); return false; }
             for (int32_t cc : ts[t].slice.cols) if (cc < 0 || cc * cu >= ts[t].src_ne0) { fprintf(stderr, "qz_loader: bad col map %s\n", ts[t].name.c_str()); return false; }
         }
         ts[t].vstride = ts[t].ne0;
@@ -144,7 +144,7 @@ bool qz_loader::load(const char * path, const qz_gguf & g, int dev, int card) {
                 const int64_t sr = d.slice.rows.empty() ? r : d.slice.rows[r];
                 for (int64_t k = 0; k < K; k++) {
                     const int64_t sc = d.slice.cols.empty() ? k : d.slice.cols[k];
-                    buf[r * K + k] = src[sr * d.src_ne0 + sc];
+                    buf[r * K + k] = sr < 0 ? 0.f : src[sr * d.src_ne0 + sc];
                 }
             }
             submit(d.vals, buf, (size_t) d.bytes());
@@ -157,7 +157,7 @@ bool qz_loader::load(const char * path, const qz_gguf & g, int dev, int card) {
             const int64_t src_raw = (d.src_ne0 / 32) * 34;
             const int64_t row_raw = (K / 32) * 34;
             const int64_t batch = std::max<int64_t>(1, std::min<int64_t>(N, (int64_t)(CHUNK / (size_t)(VS + K / 16))));
-            std::vector<uint8_t> rr((size_t) row_raw);
+            std::vector<uint8_t> rr((size_t) row_raw), zr((size_t) row_raw, 0);   // zr: a padding row
             for (int64_t r = 0; r < N && ok; r += batch) {
                 const int64_t nr = std::min(batch, N - r);
                 uint8_t * buf = take();
@@ -166,9 +166,9 @@ bool qz_loader::load(const char * path, const qz_gguf & g, int dev, int card) {
                 if (VS != K) memset(buf, 0, (size_t)(nr * VS));
                 for (int64_t i = 0; i < nr; i++) {
                     const int64_t sr = d.slice.rows.empty() ? r + i : d.slice.rows[r + i];
-                    const uint8_t * srow = map + raw_off[t] + sr * src_raw;
-                    const uint8_t * use = srow;
-                    if (!d.slice.cols.empty()) {
+                    const uint8_t * srow = sr < 0 ? nullptr : map + raw_off[t] + sr * src_raw;
+                    const uint8_t * use = sr < 0 ? zr.data() : srow;
+                    if (sr >= 0 && !d.slice.cols.empty()) {
                         for (size_t b = 0; b < d.slice.cols.size(); b++)
                             memcpy(rr.data() + b * 34, srow + (size_t) d.slice.cols[b] * 34, 34);
                         use = rr.data();

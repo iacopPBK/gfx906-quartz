@@ -9,7 +9,7 @@
 // draft's logits are the target head on hidden_i + hidden_out(latent), one 7-row head
 // GEMV plus fold . [latent; 1]. fold = head . [hidden_out | bias] is built at load, per
 // card, over its vocab half.
-// The layers split over the two cards as the target's do (ink2_ds_tp2_spec). Card c owns
+// The layers split over the two cards as the target's do (ink2_ds_tp_slice). Card c owns
 // 12 q heads, 4 kv heads with their context K / V cache, and half the FFN. The attn_output
 // and ffn_down partials are exchanged and summed on both cards, card 0's first, so the
 // residual stays replicated.
@@ -714,7 +714,7 @@ struct ink2_dspark {
             ICHECK(hipSetDevice(qz_dev_of(c)));
             {
                 qz_mem_scope mem("dspark weights");
-                k.ld.slice = ink2_ds_tp2_spec;
+                k.ld.slice = ink2_ds_tp_slice;
                 if (c == 1) k.ld.skip = chain_only;
                 if (!k.ld.load(path, g_, qz_dev_of(c), c)) { fprintf(stderr, "dspark: card %d load failed\n", c); return false; }
             }

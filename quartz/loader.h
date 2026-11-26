@@ -14,7 +14,9 @@
 #include "gguf.h"
 
 // rows lists the source rows in local order, cols the source q8 blocks (Q8_0)
-// or elements (F32). An empty list means all of them.
+// or elements (F32). An empty list means all of them. A row of QZ_SLICE_ZERO is a
+// zero row: padding, so that a split's rows come in whole blocks on every card.
+constexpr int32_t QZ_SLICE_ZERO = -1;
 struct qz_slice {
     std::vector<int32_t> rows, cols;
 };

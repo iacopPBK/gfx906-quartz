@@ -41,7 +41,7 @@ inline double ink2_ds_weight_bytes(const char * path, int c) {
     qz_gguf g;
     if (!path || !g.open(path)) return 0;
     qz_loader L;
-    L.slice = ink2_ds_tp2_spec;
+    L.slice = ink2_ds_tp_slice;
     if (c == 1) L.skip = ink2_dspark::chain_only;
     return L.plan(g, c) ? (double) L.need_bytes : 0;
 }
@@ -52,7 +52,7 @@ inline int ink2_vram_check(const qz_gguf & g, int ctx, const char * dspark) {
     double need[QZ_NC], free_b[QZ_NC], total_b[QZ_NC], w[QZ_NC];
     for (int c = 0; c < QZ_NC; c++) {
         qz_loader L;
-        L.slice = ink2_tp2_spec;
+        L.slice = ink2_tp_slice;
         if (!L.plan(g, c)) return 0;
         size_t fr = 0, tot = 0;
         if (hipSetDevice(qz_dev_of(c)) != hipSuccess || hipMemGetInfo(&fr, &tot) != hipSuccess) return 0;

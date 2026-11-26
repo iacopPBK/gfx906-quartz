@@ -12,7 +12,7 @@
 namespace ink2 {
 
 #include "ink2_hparams.h"
-#include "ink2_tp2.h"
+#include "ink2_tp.h"
 #include "ink2_kernels.h"
 #include "ink2_cycle.h"
 #include "ink2_engine.h"
@@ -461,7 +461,7 @@ static qz_ctx * create(const char * path, const qz_create_opts & o) {
         ink2_card & K = c->E.C[i];
         {
             qz_mem_scope mem("weights");
-            K.ld.slice = ink2_tp2_spec;
+            K.ld.slice = ink2_tp_slice;
             if (!K.ld.load(path, g, qz_dev_of(i), i)) { fprintf(stderr, "inkling2: card %d load failed\n", i); delete c; return nullptr; }
         }
         fprintf(stderr, "inkling2: card %d weights %.2f GB in %.1f s, %.2f GB free\n", i, K.ld.need_bytes / 1e9, K.ld.load_seconds, K.ld.free_after / 1e9);

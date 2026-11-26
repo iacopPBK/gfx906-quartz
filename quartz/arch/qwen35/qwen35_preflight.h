@@ -32,7 +32,7 @@ inline int qz_vram_check(const char * model, int max_ctx, int steps, size_t scra
     double weights[QZ_NC] = {}, free_b[QZ_NC] = {}, total_b[QZ_NC] = {};
     for (int c = 0; c < QZ_NC; c++) {
         qz_loader L;
-        L.slice = qz_tp2_spec;
+        L.slice = qz_tp_slice;
         if (!L.plan(g, c)) return 0;
         weights[c] = (double) L.need_bytes;
         size_t fr = 0, tot = 0;
