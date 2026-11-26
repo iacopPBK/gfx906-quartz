@@ -48,11 +48,25 @@ inline int qz_vram_check(const char * model, int max_ctx, int steps, size_t scra
     char extra[64] = "";
     if (ds > 0) snprintf(extra, sizeof extra, " + DSpine %.1f", ds / 1e9);
     if (mm > 0) snprintf(extra + strlen(extra), sizeof extra - strlen(extra), " + vision %.1f", mm / 1e9);
-    fprintf(stderr, "quartz: memory per card: weights %.1f + KV %.1f (ctx %d)%s + buffers %.1f = %.1f GB; free %.1f and %.1f GB\n",
-            weights[0] / 1e9, kv / 1e9, max_ctx, extra, buf / 1e9, need[0] / 1e9, free_b[0] / 1e9, free_b[1] / 1e9);
+    // GPU g carries cards g, g + nphys, ..: their needs add up against its free memory
+    const int ng = qz_nphys;
+    auto gneed = [&](int g, double kv_m) {
+        double t = 0;
+        for (int c = g; c < QZ_NC; c += ng) t += need[c] - kv + kv_m;
+        return t;
+    };
+    if (ng == 2 && QZ_NC == 2)
+        fprintf(stderr, "quartz: memory per card: weights %.1f + KV %.1f (ctx %d)%s + buffers %.1f = %.1f GB; free %.1f and %.1f GB\n",
+                weights[0] / 1e9, kv / 1e9, max_ctx, extra, buf / 1e9, need[0] / 1e9, free_b[0] / 1e9, free_b[1] / 1e9);
+    else {
+        fprintf(stderr, "quartz: memory per card: weights %.1f + KV %.1f (ctx %d)%s + buffers %.1f = %.1f GB; per GPU",
+                weights[0] / 1e9, kv / 1e9, max_ctx, extra, buf / 1e9, need[0] / 1e9);
+        for (int g = 0; g < ng; g++) fprintf(stderr, " HIP %d %.1f / %.1f free", qz_dev_of(g), gneed(g, kv) / 1e9, free_b[g] / 1e9);
+        fprintf(stderr, "\n");
+    }
     int bad = -1;
-    for (int c = 0; c < QZ_NC; c++)
-        if (need[c] > free_b[c] && (bad < 0 || need[c] - free_b[c] > need[bad] - free_b[bad])) bad = c;
+    for (int g = 0; g < ng; g++)
+        if (gneed(g, kv) > free_b[g] && (bad < 0 || gneed(g, kv) - free_b[g] > gneed(bad, kv) - free_b[bad])) bad = g;
     if (bad < 0) return 0;
 
     // the largest context whose K/V fits next to everything else on both cards
@@ -61,12 +75,16 @@ inline int qz_vram_check(const char * model, int max_ctx, int steps, size_t scra
         const int mid = lo + (hi - lo) / 2;
         const double kv_m = (double) qz_kv_bytes(mid + 2 * QZ_TMAX);
         bool ok = true;
-        for (int c = 0; c < QZ_NC; c++) ok = ok && need[c] - kv + kv_m <= free_b[c];
+        for (int g = 0; g < ng; g++) ok = ok && gneed(g, kv_m) <= free_b[g];
         if (ok) { fit = mid; lo = mid + 1; } else hi = mid - 1;
     }
     fit = fit / 1024 * 1024;
-    fprintf(stderr, "quartz: card %d (HIP %d) has %.1f of %.1f GB free and this start needs about %.1f GB\n",
-            bad, qz_dev_of(bad), free_b[bad] / 1e9, total_b[bad] / 1e9, need[bad] / 1e9);
+    if (ng == QZ_NC)
+        fprintf(stderr, "quartz: card %d (HIP %d) has %.1f of %.1f GB free and this start needs about %.1f GB\n",
+                bad, qz_dev_of(bad), free_b[bad] / 1e9, total_b[bad] / 1e9, need[bad] / 1e9);
+    else
+        fprintf(stderr, "quartz: HIP %d (cards %d..) has %.1f of %.1f GB free and this start needs about %.1f GB there\n",
+                qz_dev_of(bad), bad, free_b[bad] / 1e9, total_b[bad] / 1e9, gneed(bad, kv) / 1e9);
     if (total_b[bad] - free_b[bad] > 1.0e9)
         fprintf(stderr, "        %.1f GB of it is already in use: another process (an old server?) may hold it\n",
                 (total_b[bad] - free_b[bad]) / 1e9);

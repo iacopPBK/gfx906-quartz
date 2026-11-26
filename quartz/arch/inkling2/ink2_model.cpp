@@ -49,6 +49,7 @@ struct ink2_ctx : qz_ctx {
     ~ink2_ctx() override { if (vis) inkling2v::qz_vision_free(vis); }   // device memory is freed at exit
     int vision_attach(const char * mmproj) override {
         if (vis) return -1;
+        if (QZ_NC != 2) { fprintf(stderr, "inkling2: images are two cards only (the encoder is split in two), not QZ_TP=%d\n", QZ_NC); return -1; }
         if (!inkling2v::qz_vision_is(mmproj)) { fprintf(stderr, "inkling2: %s is not an inkling2v projector\n", mmproj); return -1; }
         vis = inkling2v::qz_vision_load(mmproj);
         ICHECK(hipSetDevice(qz_dev_of(0)));

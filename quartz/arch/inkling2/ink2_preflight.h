@@ -18,9 +18,9 @@ inline double ink2_ctx_bytes(int ctx, int card, bool ds) {
 // 256 MB of headroom on top. Measured at ctx 262144: 20.6 GB per card, this estimate 20.9.
 constexpr double INK_PF_FIXED = 1.5e9, INK_PF_DS0 = 0.25e9, INK_PF_DS1 = 0.2e9, INK_PF_HEADROOM = 0.25e9;
 
-// each card's copy of the peer's two prefill partial slots (ink2_pf.h PARTP), 2 x PF_M x D
-// floats, under either link
-inline double ink2_partp_bytes() { return 2.0 * PF_M * D * 4; }
+// each card's copies of the other cards' two prefill partial slots (ink2_pf.h PARTP),
+// 2 x PF_M x D floats per other card, under either link
+inline double ink2_partp_bytes() { return 2.0 * (QZ_NC - 1) * PF_M * D * 4; }
 
 // the vision encoder (QZ_MMPROJ, set by the server's --mmproj) on card 0. Covers the weight
 // file and its activations at the 4096-token image limit.
@@ -36,13 +36,13 @@ inline double ink2_vis_bytes() {
     return b + INK_PF_VIS;
 }
 
-// the drafter's weights on card c (TP2 slices, the Markov chain on card 0), 0 if unreadable
+// the drafter's weights on card c (its slices, the Markov chain on card 0), 0 if unreadable
 inline double ink2_ds_weight_bytes(const char * path, int c) {
     qz_gguf g;
     if (!path || !g.open(path)) return 0;
     qz_loader L;
     L.slice = ink2_ds_tp_slice;
-    if (c == 1) L.skip = ink2_dspark::chain_only;
+    if (c != 0) L.skip = ink2_dspark::chain_only;
     return L.plan(g, c) ? (double) L.need_bytes : 0;
 }
 
@@ -62,24 +62,43 @@ inline int ink2_vram_check(const qz_gguf & g, int ctx, const char * dspark) {
                   (c == 0 ? ink2_vis_bytes() : 0.0);
     }
     (void) hipSetDevice(qz_dev_of(0));
-    fprintf(stderr, "inkling2: memory per card: weights %.1f + context %.1f (ctx %d)%s + buffers %.1f = %.1f / %.1f GB; free %.1f and %.1f GB\n",
-            w[0] / 1e9, ink2_ctx_bytes(ctx, 0, ds) / 1e9, ctx, ds ? " with DSpark" : "",
-            (INK_PF_FIXED + INK_PF_HEADROOM + ink2_partp_bytes()) / 1e9,
-            need[0] / 1e9, need[1] / 1e9, free_b[0] / 1e9, free_b[1] / 1e9);
+    // GPU g carries cards g, g + nphys, ..: their needs add up against its free memory
+    const int ng = qz_nphys;
+    auto gneed = [&](int g, int cx) {
+        double t = 0;
+        for (int c = g; c < QZ_NC; c += ng) t += need[c] - ink2_ctx_bytes(ctx, c, ds) + ink2_ctx_bytes(cx, c, ds);
+        return t;
+    };
+    if (QZ_NC == 2 && ng == 2)
+        fprintf(stderr, "inkling2: memory per card: weights %.1f + context %.1f (ctx %d)%s + buffers %.1f = %.1f / %.1f GB; free %.1f and %.1f GB\n",
+                w[0] / 1e9, ink2_ctx_bytes(ctx, 0, ds) / 1e9, ctx, ds ? " with DSpark" : "",
+                (INK_PF_FIXED + INK_PF_HEADROOM + ink2_partp_bytes()) / 1e9,
+                need[0] / 1e9, need[1] / 1e9, free_b[0] / 1e9, free_b[1] / 1e9);
+    else {
+        fprintf(stderr, "inkling2: memory per card: weights %.1f + context %.1f (ctx %d)%s + buffers %.1f = %.1f GB on card 0; per GPU",
+                w[0] / 1e9, ink2_ctx_bytes(ctx, 0, ds) / 1e9, ctx, ds ? " with DSpark" : "",
+                (INK_PF_FIXED + INK_PF_HEADROOM + ink2_partp_bytes()) / 1e9, need[0] / 1e9);
+        for (int g = 0; g < ng; g++) fprintf(stderr, " HIP %d %.1f / %.1f free", qz_dev_of(g), gneed(g, ctx) / 1e9, free_b[g] / 1e9);
+        fprintf(stderr, "\n");
+    }
     int bad = -1;
-    for (int c = 0; c < QZ_NC; c++)
-        if (need[c] > free_b[c] && (bad < 0 || need[c] - free_b[c] > need[bad] - free_b[bad])) bad = c;
+    for (int g = 0; g < ng; g++)
+        if (gneed(g, ctx) > free_b[g] && (bad < 0 || gneed(g, ctx) - free_b[g] > gneed(bad, ctx) - free_b[bad])) bad = g;
     if (bad < 0) return 0;
-    int fit = 0;                                   // the largest context that fits on both cards
+    int fit = 0;                                   // the largest context that fits on every GPU
     for (int lo = 1024, hi = ctx; lo <= hi; ) {
         const int mid = lo + (hi - lo) / 2;
         bool ok = true;
-        for (int c = 0; c < QZ_NC; c++) ok = ok && need[c] - ink2_ctx_bytes(ctx, c, ds) + ink2_ctx_bytes(mid, c, ds) <= free_b[c];
+        for (int g = 0; g < ng; g++) ok = ok && gneed(g, mid) <= free_b[g];
         if (ok) { fit = mid; lo = mid + 1; } else hi = mid - 1;
     }
     fit = fit / 1024 * 1024;
-    fprintf(stderr, "inkling2: card %d (HIP %d) has %.1f of %.1f GB free and this start needs about %.1f GB\n",
-            bad, qz_dev_of(bad), free_b[bad] / 1e9, total_b[bad] / 1e9, need[bad] / 1e9);
+    if (ng == QZ_NC)
+        fprintf(stderr, "inkling2: card %d (HIP %d) has %.1f of %.1f GB free and this start needs about %.1f GB\n",
+                bad, qz_dev_of(bad), free_b[bad] / 1e9, total_b[bad] / 1e9, need[bad] / 1e9);
+    else
+        fprintf(stderr, "inkling2: HIP %d (cards %d..) has %.1f of %.1f GB free and this start needs about %.1f GB there\n",
+                qz_dev_of(bad), bad, free_b[bad] / 1e9, total_b[bad] / 1e9, gneed(bad, ctx) / 1e9);
     if (total_b[bad] - free_b[bad] > 1.0e9)
         fprintf(stderr, "        %.1f GB of it is already in use: another process (an old server?) may hold it\n",
                 (total_b[bad] - free_b[bad]) / 1e9);

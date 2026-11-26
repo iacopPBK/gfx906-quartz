@@ -507,7 +507,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/health", "/v1/health"):
-            self._json(200, {"status": "ok"})
+            self._json(200, {"status": "ok", "cards": self.args.tp})
         elif self.path == "/v1/models":
             self._json(200, {"object": "list", "data": [{"id": self.model_id, "object": "model",
                                                          "owned_by": "quartz", "max_ctx": self.eng.max_ctx}]})
@@ -782,7 +782,7 @@ def preflight(args):
         log("error: " + msg)
         sys.exit(2)
     if not os.path.isfile(args.lib):
-        die("%s not found: run `make` first (or pass --lib)" % args.lib)
+        die("%s not found: run `%s` first (or pass --lib)" % (args.lib, "make" if args.tp == 2 else "make tp4"))
     for flag, path in (("--model", args.model), ("--dspine", args.dspine), ("--mmproj", args.mmproj)):
         if not path:
             continue
@@ -803,13 +803,14 @@ def preflight(args):
         probe.close()
 
 
-def link_fallback(link, hung, tried_host):
+def link_fallback(link, hung, tried_host, cards=2):
     """Whether a start that hit a hanging peer check is redone with QZ_LINK=host.
 
     Only in the default mode: QZ_LINK=p2p asked for the peer link, so its hang stays an
     error. `tried_host` caps the fallback at one start, and the host check reports a hang
-    of its own (`link check: ... did not finish`), so a host start never asks for another."""
-    return bool(hung) and not tried_host and link in (None, "", "auto")
+    of its own (`link check: ... did not finish`), so a host start never asks for another.
+    The host link is two cards only: at four a hang stays an error."""
+    return bool(hung) and not tried_host and link in (None, "", "auto") and cards == 2
 
 
 def supervise(args):
@@ -856,7 +857,7 @@ def supervise(args):
         rc = child.wait()
         if stop:
             sys.exit(rc)                            # asked to quit: no restart
-        if rc >= 0 and link_fallback(os.environ.get("QZ_LINK"), hang, host):
+        if rc >= 0 and link_fallback(os.environ.get("QZ_LINK"), hang, host, int(os.environ.get("QZ_TP") or 2)):
             log("start: the peer check hung, so the peer link cannot be used: restarting once "
                 "with QZ_LINK=host, the exchange over pinned host memory")
             host = True
@@ -874,7 +875,9 @@ def supervise(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--model", required=True, help="target GGUF (a supported architecture: docs/adding-a-model.md)")
-    ap.add_argument("--lib", default=os.path.join(REPO, "build/bin/libquartz.so"))
+    ap.add_argument("--lib", default=None, help="libquartz.so (default build/bin, or build/tp4 with --tp 4)")
+    ap.add_argument("--tp", type=int, default=int(os.environ.get("QZ_TP") or 2), choices=(2, 4),
+                    help="cards in tensor parallel: 2, or 4 with a `make tp4` library (every GPU pair needs P2P)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--max-ctx", type=int, default=262144, help="context length, at least 1024")
@@ -893,6 +896,11 @@ def main():
     args = ap.parse_args()
     if args.max_ctx < 1024:
         ap.error("--max-ctx must be at least 1024")
+    if args.lib is None:
+        args.lib = os.path.join(REPO, "build/bin/libquartz.so" if args.tp == 2 else "build/tp4/libquartz.so")
+    if args.tp != 2 and args.mmproj:
+        ap.error("--mmproj is two cards only (the vision encoders split in two)")
+    os.environ["QZ_TP"] = str(args.tp)           # read by the engine's device selection
     if args.reasoning_effort == "template":
         args.reasoning_effort = None
     if args.dspine:                          # read by qz_create
@@ -916,7 +924,7 @@ def main():
         Handler.eng = Engine(args.lib, args.model, args.max_ctx, args.slot_t, args.slack)
     except RuntimeError as e:
         log("error: %s (the lines above say why; usual causes: the target has no MTP block, "
-            "the cards are not two gfx906 with 32 GB free, or --max-ctx is too large)" % e)
+            "the cards are not %d gfx906 with 32 GB free, or --max-ctx is too large)" % (e, args.tp))
         if start.hang:
             tell_supervisor(READY_HANG)      # the supervisor may start again over host memory
         sys.exit(1)
@@ -926,8 +934,9 @@ def main():
         Handler.eng.attach_vision(args.mmproj)
     Handler.args = args
     Handler.model_id = model_id(Handler.eng)
-    log("ready in %.1f s | ctx %d | %s%s%s | %s:%d%s" % (
+    log("ready in %.1f s | ctx %d | %s%s%s%s | %s:%d%s" % (
         time.time() - t0, Handler.eng.max_ctx, Handler.eng.drafter_name(bool(args.dspine)), " + vision" if args.mmproj else "",
+        " | %d cards" % args.tp if args.tp != 2 else "",
         " | link " + start.link if start.link else "",
         args.host, args.port, " | trace " + TRACE if TRACE else ""))
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)

@@ -164,3 +164,70 @@ int qz_link_check_host(double timeout_s, double * gbs, double * rt_us) {
     (void) qz_xfree(fp);
     return rc;
 }
+
+// The peer flag round trip (preflight.h, more than two GPUs): each side spins on a flag in
+// its own memory and answers by writing the other side's, so the link carries writes only.
+static __global__ void qz_p2p_flag(const unsigned int * rd, unsigned int * wr, int first, int n, unsigned long long * err) {
+    if (blockIdx.x || threadIdx.x) return;
+    for (int tok = 1; tok <= n; tok++) {
+        if (first) {
+            __threadfence_system();
+            __hip_atomic_store(wr, (unsigned) tok, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+        const long long t0 = clock64();
+        for (;;) {
+            const unsigned int v = __hip_atomic_load(rd, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+            if ((int) (v - (unsigned) tok) >= 0) break;
+            if (clock64() - t0 > QZ_LINK_SPIN) { *err = (unsigned long long) tok; return; }
+        }
+        if (!first) {
+            __threadfence_system();
+            __hip_atomic_store(wr, (unsigned) tok, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+    }
+}
+
+int qz_link_rt_p2p(int a, int b, double timeout_s, double * rt_us) {
+    const int nrt = 1000, dv[2] = { a, b };
+    unsigned int * f[2] = { nullptr, nullptr };
+    void * errd[2] = { nullptr, nullptr };
+    hipStream_t sf[2] = { nullptr, nullptr };
+    int rc = 0;
+    for (int c = 0; c < 2 && !rc; c++) {
+        (void) hipSetDevice(dv[c]);
+        if (hipExtMallocWithFlags((void **) &f[c], 256, hipDeviceMallocUncached) != hipSuccess || hipMemset(f[c], 0, 256) != hipSuccess ||
+            hipMalloc(&errd[c], 8) != hipSuccess || hipMemset(errd[c], 0, 8) != hipSuccess ||
+            hipStreamCreateWithFlags(&sf[c], hipStreamNonBlocking) != hipSuccess || hipDeviceSynchronize() != hipSuccess) {
+            fprintf(stderr, "quartz: peer check: cannot allocate the flags on HIP %d\n", dv[c]);
+            rc = 1;
+        }
+    }
+    if (!rc) {
+        using clk = std::chrono::steady_clock;
+        const auto t0 = clk::now();
+        for (int c = 0; c < 2; c++) {
+            (void) hipSetDevice(dv[c]);
+            hipLaunchKernelGGL(qz_p2p_flag, dim3(1), dim3(32), 0, sf[c], f[c], f[1 - c], c == 0, nrt, (unsigned long long *) errd[c]);
+        }
+        for (int c = 0; c < 2 && !rc; c++) {
+            char what[64];
+            snprintf(what, sizeof what, "the flag ping-pong HIP %d <-> HIP %d", a, b);
+            rc = qz_link_wait(sf[c], "quartz: peer check", what, "the peer link hangs", timeout_s);
+        }
+        if (rc == 2) return 2;                        // stuck: leave everything in place
+        if (!rc) *rt_us = std::chrono::duration<double, std::micro>(clk::now() - t0).count() / nrt;
+    }
+    for (int c = 0; c < 2; c++) {
+        unsigned long long ne = 0;
+        (void) hipSetDevice(dv[c]);
+        if (!rc && errd[c] && hipMemcpy(&ne, errd[c], 8, hipMemcpyDeviceToHost) == hipSuccess && ne) {
+            fprintf(stderr, "quartz: peer check: HIP %d saw no answer to its flag %llu from HIP %d within the spin limit\n",
+                    dv[c], ne, dv[1 - c]);
+            rc = 1;
+        }
+        if (sf[c]) (void) hipStreamDestroy(sf[c]);
+        if (errd[c]) (void) hipFree(errd[c]);
+        if (f[c]) (void) hipFree(f[c]);
+    }
+    return rc;
+}

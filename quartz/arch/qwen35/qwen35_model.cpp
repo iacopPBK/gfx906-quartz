@@ -313,6 +313,7 @@ static void qz_stats_out(const q35_ctx * c, const qz_gen_stats & st, qz_stats * 
 int q35_ctx::vision_attach(const char * mmproj) {
     q35_ctx * c = this;
     if (c->vis) return -1;
+    if (QZ_NC != 2) { fprintf(stderr, "quartz: images are two cards only (the encoder is split in two), not QZ_TP=%d\n", QZ_NC); return -1; }
     if (!c->pf_ok) { fprintf(stderr, "quartz: images need the batched prefill\n"); return -1; }
     // both cards, half the encoder each
     c->vis = qwen3vl::qz_vision_load(mmproj);

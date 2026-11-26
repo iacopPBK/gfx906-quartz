@@ -1,4 +1,4 @@
-# quartz: inference engine for two MI50 (gfx906) cards
+# quartz: inference engine for two (or four: make tp4) MI50 (gfx906) cards
 BIN       ?= build/bin
 ROCM_PATH ?= /opt/rocm
 HIPCC     ?= $(shell command -v hipcc 2>/dev/null || echo $(ROCM_PATH)/bin/hipcc)
@@ -11,9 +11,13 @@ ENGINE  := quartz/loader.cpp $(wildcard quartz/core/*.cpp) $(wildcard quartz/vis
 UNICODE := $(UNI)/unicode.cpp $(UNI)/unicode-data.cpp
 HEADERS := $(wildcard quartz/*.h quartz/*.hip quartz/core/*.h quartz/kernels/*.h quartz/vision/*.h quartz/arch/*/*.h quartz/arch/*/*.hip) $(UNI)/unicode.h third_party/stb/stb_image.h
 
-.PHONY: all lib clean
+.PHONY: all lib tp4 clean
 all: lib
 lib: $(BIN)/libquartz.so
+
+# the 4-card library (QZ_TP=4): the arch code built for four cards, into build/tp4
+tp4:
+	$(MAKE) BIN=build/tp4 CXXFLAGS="$(CXXFLAGS) -DQZ_NC=4" lib
 
 $(BIN):
 	mkdir -p $@
