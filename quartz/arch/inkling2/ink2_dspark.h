@@ -152,8 +152,7 @@ static __global__ __launch_bounds__(256) void k_ds_swiglu_quant(float * g, const
     }
 }
 // T-row Q8_0 GEMV, y = [T][N], 4 rows per wave. Accumulates like ink2_verify's v_core_acc
-// (units past 64 spread over the wave), then sums with the v_tsum butterfly, which handles
-// all T x 4 values at once with T padded to 8. Every value keeps the plain walk's bits.
+// (units past 64 spread over the wave), then sums with the v_tsum butterfly.
 template <int T, int NT = DS_NT>
 static __global__ __launch_bounds__(NT) void k_ds_gemv(const unsigned char * aq, const float * as, int K,
                                                        const char * wv, const __half * ws, int N, float * y) {
@@ -166,7 +165,7 @@ static __global__ __launch_bounds__(NT) void k_ds_gemv(const unsigned char * aq,
     for (int i = tid; i < T * n_u; i += NT) ls[i] = as[i];
     __syncthreads();
     const int S = 4;
-    constexpr int TP = T == 1 ? 1 : 8, NV = TP * 4;
+    constexpr int TP = T <= 1 ? 1 : (T <= 2 ? 2 : (T <= 4 ? 4 : 8)), NV = TP * 4;
     static_assert(T <= TP, "T <= 8");
     for (int g = blockIdx.x; g * (NT / 64 * S) < N; g += gridDim.x) {
         const int r0 = g * (NT / 64 * S) + wave * S;
@@ -176,10 +175,44 @@ static __global__ __launch_bounds__(NT) void k_ds_gemv(const unsigned char * aq,
         #pragma unroll
         for (int t = 0; t < TP; t++)
             #pragma unroll
-            for (int q = 0; q < 4; q++) fv[t * 4 + q] = t < T ? acc[t < T ? t : 0][q] : 0.f;   // index kept in range
+            for (int q = 0; q < 4; q++) fv[t * 4 + q] = t < T ? acc[t < T ? t : 0][q] : 0.f;
         const float val = v_tsum<NV>(fv, lane);
         const int kv = v_tsum_k<NV>(lane), vt = kv / 4, vs = kv % 4;
         if ((lane & (64 / NV - 1)) == 0 && vt < T && r0 + vs < N) y[(size_t) vt * N + r0 + vs] = val;
+    }
+}
+// Batched 2- or 3-projection GEMV sharing one activation staging in LDS (q|k|v and gate|up)
+struct ds_gjob { const char * wv; const __half * ws; float * y; int N, g1; };
+struct ds_gjobs { ds_gjob j[3]; int n; };
+template <int T, int NT = DS_NT>
+static __global__ __launch_bounds__(NT) void k_ds_gemv_batch(const unsigned char * aq, const float * as, int K,
+                                                             ds_gjobs J) {
+    extern __shared__ char lds[];
+    const int wave = threadIdx.x >> 6, lane = threadIdx.x & 63, tid = threadIdx.x;
+    const int n_u = K / 32;
+    unsigned char * la = (unsigned char *) lds;
+    float * ls = (float *) (lds + (size_t) T * K);
+    for (int i = tid; i < T * K / 16; i += NT) ((uint4 *) la)[i] = ((const uint4 *) aq)[i];
+    for (int i = tid; i < T * n_u; i += NT) ls[i] = as[i];
+    __syncthreads();
+    const int S = 4, total_g = J.j[J.n - 1].g1;
+    constexpr int TP = T <= 1 ? 1 : (T <= 2 ? 2 : (T <= 4 ? 4 : 8)), NV = TP * 4;
+    for (int b = blockIdx.x; b < total_g; b += gridDim.x) {
+        int k = 0;
+        while (k + 1 < J.n && b >= J.j[k].g1) k++;
+        const ds_gjob & j = J.j[k];
+        const int g = b - (k ? J.j[k - 1].g1 : 0);
+        const int r0 = g * (NT / 64 * S) + wave * S;
+        float acc[T][4];
+        v_core_acc<T, 4>(la, ls, K, n_u, n_u, j.wv, j.ws, K, n_u, j.N, r0, lane, acc);
+        float fv[NV];
+        #pragma unroll
+        for (int t = 0; t < TP; t++)
+            #pragma unroll
+            for (int q = 0; q < 4; q++) fv[t * 4 + q] = t < T ? acc[t < T ? t : 0][q] : 0.f;
+        const float val = v_tsum<NV>(fv, lane);
+        const int kv = v_tsum_k<NV>(lane), vt = kv / 4, vs = kv % 4;
+        if ((lane & (64 / NV - 1)) == 0 && vt < T && r0 + vs < j.N) j.y[(size_t) vt * j.N + r0 + vs] = val;
     }
 }
 // the same walk for a K too wide to stage (the FFN down projection, T = 8, K = 9216). The
@@ -273,7 +306,7 @@ static __global__ __launch_bounds__(128) void k_ds_knorm_rope_store(const float 
 // own DS_BS f32 keys. Only the split count varies with the context length.
 constexpr int DS_GQA = DS_NQL / DS_NKVL;                     // 3 q heads per KV head
 constexpr int DS_NQV = DS_BS * DS_GQA;                       // 24 query vectors of one KV head
-constexpr int DS_NSPL = 64;                                  // key splits per KV head (bounds the partials)
+constexpr int DS_NSPL = 60;                                  // key splits per KV head (4 * 60 = 240 blocks = 4/CU)
 constexpr int DS_TILE = 12;                                  // cache keys staged per tile
 constexpr int DS_ATT_T = DS_NQV * 8;                         // 192 threads: one 8-lane group per query vector
 constexpr int DS_PW = HD + 2;
@@ -310,7 +343,7 @@ __device__ __forceinline__ void ds_attn_key(const float * qq, const float * kf, 
         x2 += qq[k + 2] * kf[k + 2]; x3 += qq[k + 3] * kf[k + 3];
     }
     const float s = ds_row8((x0 + x1) + (x2 + x3));
-    const float mn = fmaxf(m, s), c = expf(m - mn), p = expf(s - mn);
+    const float mn = fmaxf(m, s), c = __builtin_amdgcn_exp2f(m - mn), p = __builtin_amdgcn_exp2f(s - mn);
     l = l * c + p;
     if (c < 1.f)
         #pragma unroll
@@ -341,7 +374,7 @@ __device__ __forceinline__ void ds_attn_tile(const float * qq, const float * sk,
     float mt = s[0];
     #pragma unroll
     for (int t = 1; t < DS_TILE; t++) mt = fmaxf(mt, s[t]);
-    const float mn = fmaxf(m, mt), c = expf(m - mn);
+    const float mn = fmaxf(m, mt), c = __builtin_amdgcn_exp2f(m - mn);
     l *= c;
     if (c < 1.f)
         #pragma unroll
@@ -349,7 +382,7 @@ __device__ __forceinline__ void ds_attn_tile(const float * qq, const float * sk,
     m = mn;
     #pragma unroll
     for (int t = 0; t < DS_TILE; t++) {
-        const float p = expf(s[t] - mn);
+        const float p = __builtin_amdgcn_exp2f(s[t] - mn);
         l += p;
         float vf[16];
         ds_ld16(sv + t * DS_TROW + li * DS_TPAD, vf);
@@ -364,7 +397,7 @@ static __global__ __launch_bounds__(DS_ATT_T) void k_ds_attn(const float * q, co
     const int kh = blockIdx.x, sp = blockIdx.y, tid = threadIdx.x;
     const int grp = tid >> 3, li = tid & 7;                  // query vector, its 16 dims
     const int r = grp % DS_BS, gq = grp / DS_BS, h = kh * DS_GQA + gq;
-    const float scale = 1.f / sqrtf((float) HD);
+    const float scale = FL_L2E / sqrtf((float) HD);
     float qq[16], o[16];
     #pragma unroll
     for (int k = 0; k < 16; k++) {
@@ -406,8 +439,8 @@ static __global__ __launch_bounds__(DS_ATT_T) void k_ds_attn(const float * q, co
     #pragma unroll
     for (int k = 0; k < 16; k++) P[2 + li * 16 + k] = o[k];
 }
-// merge the nspl partials of q head blockIdx.x, row blockIdx.y, into o [row][DS_QL]
-static __global__ __launch_bounds__(128) void k_ds_attn_merge(const float * part, float * o, int nspl) {
+// merge the nspl partials of q head blockIdx.x, row blockIdx.y, directly into int8 planes
+static __global__ __launch_bounds__(128) void k_ds_attn_merge_quant(const float * part, unsigned char * oq, float * os, int nspl) {
     const int h = blockIdx.x, r = blockIdx.y, d = threadIdx.x;
     const int kh = h / DS_GQA, grp = (h % DS_GQA) * DS_BS + r;
     const float * B = part + ((size_t) kh * DS_NSPL * DS_NQV + grp) * DS_PW;
@@ -427,11 +460,12 @@ static __global__ __launch_bounds__(128) void k_ds_attn_merge(const float * part
         #pragma unroll
         for (int k = 0; k < 16; k++) {
             if (pm[k] == -INFINITY) continue;
-            const float e = expf(pm[k] - M);
+            const float e = __builtin_amdgcn_exp2f(pm[k] - M);
             L += pl[k] * e; O += po[k] * e;
         }
     }
-    o[(size_t) r * DS_QL + h * HD + d] = O / L;
+    const float v = O / L;
+    quant32(v, oq + (size_t) r * DS_QL, os + (size_t) r * (DS_QL / 32), h * HD + d);
 }
 static __global__ __launch_bounds__(256) void k_ds_embed(const char * ev, const __half * es, int tok, const float * w, float eps,
                                                          float * x, const float * mask) {
@@ -847,6 +881,7 @@ struct ink2_dspark {
                 const int nj = std::min(8, DS_R + 1 - j0);
                 k_ds_tohalf<<<dim3((H.N + 255) / 256, nj), 256>>>(y, fold[c] + (size_t) j0 * nhp[c], H.N, nhp[c]);
             }
+            ICHECK(hipFuncSetAttribute((const void *) k_ds_gemv<8>, hipFuncAttributeMaxDynamicSharedMemorySize, 49152));
             ICHECK(hipDeviceSynchronize());
             (void) hipFree(rows); (void) hipFree(y);
         }
@@ -856,13 +891,19 @@ struct ink2_dspark {
         return true;
     }
 
-    // the T-row GEMV. Stages the planes in LDS while they fit, else takes the wide walk
+    // the T-row GEMV. Stages the planes in LDS up to 48 KB (covers ffn_down 8 x 4608 = 41.5 KB).
     void gemv(hipStream_t st, const unsigned char * q, const float * s, const qw & W, float * y, int T) {
         const int lds = T * W.K + T * (W.K / 32) * 4;
-        if (lds <= 32768) {
-            const int nb = std::min((W.N + 15) / 16, 240);
+        if (lds <= 49152) {
+            const int maxb = lds > 32768 ? 60 : 240;
+            const int nb = std::min((W.N + 15) / 16, maxb);
             if (T == 8) k_ds_gemv<8><<<nb, DS_NT, lds, st>>>(q, s, W.K, W.v, W.s, W.N, y);
             else if (T == 7) k_ds_gemv<7><<<nb, DS_NT, lds, st>>>(q, s, W.K, W.v, W.s, W.N, y);
+            else if (T == 6) k_ds_gemv<6><<<nb, DS_NT, lds, st>>>(q, s, W.K, W.v, W.s, W.N, y);
+            else if (T == 5) k_ds_gemv<5><<<nb, DS_NT, lds, st>>>(q, s, W.K, W.v, W.s, W.N, y);
+            else if (T == 4) k_ds_gemv<4><<<nb, DS_NT, lds, st>>>(q, s, W.K, W.v, W.s, W.N, y);
+            else if (T == 3) k_ds_gemv<3><<<nb, DS_NT, lds, st>>>(q, s, W.K, W.v, W.s, W.N, y);
+            else if (T == 2) k_ds_gemv<2><<<nb, DS_NT, lds, st>>>(q, s, W.K, W.v, W.s, W.N, y);
             else k_ds_gemv<1><<<nb, DS_NT, lds, st>>>(q, s, W.K, W.v, W.s, W.N, y);
         } else {
             const int nb = (W.N + 7) / 8;
@@ -870,6 +911,17 @@ struct ink2_dspark {
             else if (T == 7) k_ds_gemv_wide<7><<<nb, 256, 0, st>>>(q, s, W.K, W.v, W.s, W.N, y);
             else k_ds_gemv_wide<1><<<nb, 256, 0, st>>>(q, s, W.K, W.v, W.s, W.N, y);
         }
+    }
+    void gemv_batch8(hipStream_t st, const unsigned char * q, const float * s, int K, std::initializer_list<std::pair<const qw *, float *>> js) {
+        ds_gjobs J{};
+        int g = 0;
+        for (const auto & pr : js) {
+            g += (pr.first->N + 15) / 16;
+            J.j[J.n++] = ds_gjob{pr.first->v, pr.first->s, pr.second, pr.first->N, g};
+        }
+        const int lds = 8 * K + 8 * (K / 32) * 4;
+        const int nb = std::min(g, 240);
+        k_ds_gemv_batch<8><<<nb, DS_NT, lds, st>>>(q, s, K, J);
     }
     // run fn(c, card, stream) on card 0, then card 1, each with its device current
     template <class F> void each(F && fn) {
@@ -977,34 +1029,33 @@ struct ink2_dspark {
             const int lo = l == 1 ? 0 : std::max(0, a - WIN);      // layers 0 / 2: sliding window
             each([&](int, card & k, hipStream_t st) {
                 const layer & y = k.L[l];
-                gemv(st, k.aq, k.as, y.q, k.Q, 8); gemv(st, k.aq, k.as, y.k, k.Kb, 8); gemv(st, k.aq, k.as, y.v, k.Vb, 8);
+                gemv_batch8(st, k.aq, k.as, D, {{&y.q, k.Q}, {&y.k, k.Kb}, {&y.v, k.Vb}});
                 k_ds_hnorm_rope<<<dim3(DS_NQL + DS_NKVL, DS_BS), 128, 0, st>>>(k.Q, y.qn, DS_NQL, k.Kb, y.kn, DS_NKVL, a, DS_EPS);
                 // the cache keys split into nsp tile-aligned chunks, so the grid keeps
                 // DS_NKVL * nsp blocks busy at every context length
                 const int nc = a - lo, cks = std::max(DS_TILE, ((nc + DS_NSPL - 1) / DS_NSPL + DS_TILE - 1) / DS_TILE * DS_TILE);
                 const int nsp = std::max(1, (nc + cks - 1) / cks);
                 k_ds_attn<<<dim3(DS_NKVL, nsp), DS_ATT_T, 0, st>>>(k.Q, k.ck[l], k.cv[l], k.Kb, k.Vb, lo, a, nsp, cks, k.part);
-                k_ds_attn_merge<<<dim3(DS_NQL, DS_BS), 128, 0, st>>>(k.part, k.O, nsp);
-                k_ds_quant<<<DS_BS, 256, 0, st>>>(k.O, nullptr, DS_QL, k.aq, k.as, nullptr, DS_EPS);
+                k_ds_attn_merge_quant<<<dim3(DS_NQL, DS_BS), 128, 0, st>>>(k.part, k.aq, k.as, nsp);
                 gemv(st, k.aq, k.as, y.o, k.Y, 8);
             });
             int s = exchange();
             each([&](int c, card & k, hipStream_t st) {
                 const layer & y = k.L[l];
                 k_ds_add_quant<<<DS_BS, 256, 0, st>>>(k.X, pa(c, s), pb(c, s), y.fn, D, k.aq, k.as, DS_EPS);
-                gemv(st, k.aq, k.as, y.gate, k.G, 8); gemv(st, k.aq, k.as, y.up, k.U, 8);
+                gemv_batch8(st, k.aq, k.as, D, {{&y.gate, k.G}, {&y.up, k.U}});
                 k_ds_swiglu_quant<<<dim3(DS_FFL / 256, DS_BS), 256, 0, st>>>(k.G, k.U, DS_FFL, k.aq, k.as);
                 gemv(st, k.aq, k.as, y.down, k.Y, 8);
             });
             s = exchange();
             // the residual add of the two partials is fused into the next quantization, the
-            // next layer's attention norm. After the last layer it takes hidden rows 1 .. 7
+            // next layer's attention norm. After the last layer it takes hidden rows 1 .. nd
             // instead: f32 into hid for card 0's Markov input, int8 for the base logits.
             each([&](int c, card & k, hipStream_t st) {
                 if (l + 1 < DS_NL) k_ds_add_quant<<<DS_BS, 256, 0, st>>>(k.X, pa(c, s), pb(c, s), k.L[l + 1].an, D, k.aq, k.as, DS_EPS);
                 else {
-                    k_ds_hidden<<<DS_BS - 1, 256, 0, st>>>(k.X, pa(c, s), pb(c, s), k.onorm, D, hq[c], hs[c], k.hid, DS_EPS);
-                    gemv(st, hq[c], hs[c], E->C[c].head, base[c], 7);
+                    k_ds_hidden<<<nd, 256, 0, st>>>(k.X, pa(c, s), pb(c, s), k.onorm, D, hq[c], hs[c], k.hid, DS_EPS);
+                    gemv(st, hq[c], hs[c], E->C[c].head, base[c], nd);
                 }
             });
         }

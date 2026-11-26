@@ -92,7 +92,7 @@ template <class XA> __device__ __forceinline__ void cyc_xwait(const XA & A, unsi
 #endif
 constexpr int CYC_LDS = 6 * D * 4;           // dynamic LDS: the mix states, also the attention scratch
 static_assert(FL_LDS1 <= CYC_LDS, "the attention fits the dynamic LDS");
-extern __shared__ float cyc_lds[];
+extern __shared__ float cyc_lds[] __attribute__((aligned(16)));
 #define CYC_NI __device__ __forceinline__
 template <int MQ> CYC_NI void c_mix(CK sptrs * S, const float * q, float * o, int tid) {
     asm volatile ("" : "+v"(tid));
@@ -121,8 +121,8 @@ template <int N> CYC_NI void hsum(float (&v)[N], float * red) {
     }
 }
 // The control-down rows, one pass per block. The blocks split into NJ groups, one job
-// each, so every rms runs once. A half block takes 2 rows, with 256-thread strided sums
-// and then a 4-wave reduction.
+// each, so every rms runs once. A half block takes up to MR = 2 rows, loading only rows
+// with r < GRANK (for NJ = 1, most blocks load 1 row instead of 4).
 template <int NJ> CYC_NI void c_ctrl_down_all(CK cjob * cj, int tid) {
     asm volatile ("" : "+v"(tid));
     __shared__ float red[2 * 4 * 2];
@@ -137,10 +137,15 @@ template <int NJ> CYC_NI void c_ctrl_down_all(CK cjob * cj, int tid) {
         for (int k = 0; k < NV; k++) { x[k] = cur[t + 256 * k]; y[k] = msg[t + 256 * k]; }
         #pragma unroll
         for (int m = 0; m < MR; m++) {
-            const int r = min(r0 + bpj * (h + 2 * m), GRANK - 1);
-            const float * w = wd + (size_t) r * 2 * D;
-            #pragma unroll
-            for (int k = 0; k < NV; k++) { wa[m][k] = w[t + 256 * k]; wb[m][k] = w[D + t + 256 * k]; }
+            const int r = r0 + bpj * (h + 2 * m);
+            if (r < GRANK) {
+                const float * w = wd + (size_t) r * 2 * D;
+                #pragma unroll
+                for (int k = 0; k < NV; k++) { wa[m][k] = w[t + 256 * k]; wb[m][k] = w[D + t + 256 * k]; }
+            } else {
+                #pragma unroll
+                for (int k = 0; k < NV; k++) { wa[m][k] = 0.f; wb[m][k] = 0.f; }
+            }
         }
         float ss[2] = {0.f, 0.f};
         #pragma unroll
@@ -165,38 +170,71 @@ template <int NJ> CYC_NI void c_ctrl_down_all(CK cjob * cj, int tid) {
     }
     __syncthreads();
 }
-// The control-up rows: NJ * D rows spread over all blocks, from the transposed weights
-// (wgt / wft [GRANK][D], with lanes on consecutive rows, coalesced). Each item is a row
-// and a sum, and every sum runs in sequential k order. The forget sums go through LDS.
-template <int NJ> CYC_NI void c_ctrl_up_all(CK cjob * cj, int tid) {
+// Fused control-up + rmsnorm + quant32 over NJ jobs, partitioned on 32-element groups so
+// every block keeps its computed outputs in registers across one grid barrier (for the
+// global sum of squares) and immediately normalizes and quantizes without a separate
+// serial c_norm phase. ss_buf holds NJ * gridDim.x floats (uses A.H while dead).
+template <int NJ> CYC_NI void c_ctrl_up_norm(CK cjob * cj, CK njob * nj, float eps, float * ss_buf,
+                                             unsigned int * bst, int & kb, int tid) {
     asm volatile ("" : "+v"(tid));
-    __shared__ float g[NJ][GRANK], sf[256];
+    __shared__ float g[NJ][GRANK], sf[256], gs[8], rs[4];
+    float * sbl = cyc_lds;                                 // [NJ * 64]
     for (int i = tid; i < NJ * GRANK; i += 512) g[i / GRANK][i % GRANK] = qz_gp(cj[i / GRANK].g)[i % GRANK];
     __syncthreads();
-    constexpr int NR = NJ * D, KC = 32;
-    const int r0 = blockIdx.x * NR / gridDim.x, r1 = (blockIdx.x + 1) * NR / gridDim.x;
-    for (int c0 = r0; c0 < r1; c0 += 256) {
-        const int n = min(256, r1 - c0), which = tid >= n, q = tid - (which ? n : 0);
-        const int r = c0 + min(q, n - 1), j = r / D, i = r % D;
-        float a = 0.f;
-        if (tid < 2 * n) {
-            const float * w = qz_gp(which ? cj[j].wft : cj[j].wgt) + i;
-            #pragma unroll 1
-            for (int k0 = 0; k0 < GRANK; k0 += KC) {
-                float v[KC];
-                #pragma unroll
-                for (int k = 0; k < KC; k++) v[k] = w[(size_t) (k0 + k) * D];
-                #pragma unroll
-                for (int k = 0; k < KC; k++) a += g[j][k0 + k] * v[k];
-            }
-            if (which) sf[q] = a;
+    constexpr int NG = D / 32, NTG = NJ * NG, KC = 32;
+    const int nb = gridDim.x;
+    const int g0 = blockIdx.x * NTG / nb, g1 = (blockIdx.x + 1) * NTG / nb;
+    const int ng = g1 - g0, n = ng * 32;                   // n <= 128 for nb=60, NJ<=3
+    const int which = tid >= n, q = tid - (which ? n : 0);
+    const int grp = g0 + (min(q, max(n - 1, 0)) >> 5), j = grp / NG, i = (grp % NG) * 32 + (q & 31);
+    float a = 0.f;
+    if (tid < 2 * n) {
+        const float * w = qz_gp(which ? cj[j].wft : cj[j].wgt) + i;
+        #pragma unroll 1
+        for (int k0 = 0; k0 < GRANK; k0 += KC) {
+            float v[KC];
+            #pragma unroll
+            for (int k = 0; k < KC; k++) v[k] = w[(size_t) (k0 + k) * D];
+            #pragma unroll
+            for (int k = 0; k < KC; k++) a += g[j][k0 + k] * v[k];
         }
-        __syncthreads();
-        if (tid < n) {
-            const float x = qz_gp(cj[j].cur)[i], fo = sf[q], ga = a;
-            qz_gp(cj[j].out)[i] = (x - tanhf(fo) * x) + tanhf(ga) * qz_gp(cj[j].msg)[i];
-        }
-        __syncthreads();
+        if (which) sf[q] = a;
+    }
+    __syncthreads();
+    float val = 0.f;
+    if (tid < n) {
+        const float x = qz_gp(cj[j].cur)[i], fo = sf[q], ga = a;
+        val = (x - tanhf(fo) * x) + tanhf(ga) * qz_gp(cj[j].msg)[i];
+    }
+    // 32-lane sum of val^2 per group
+    float v2 = val * val;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v2 += __shfl_xor(v2, off, 32);
+    if (tid < n && (tid & 31) == 0) gs[tid >> 5] = v2;
+    __syncthreads();
+    if (tid < NJ) {
+        float s = 0.f;
+        for (int u = 0; u < ng; u++) if ((g0 + u) / NG == tid) s += gs[u];
+        qz_gp(ss_buf)[tid * nb + blockIdx.x] = s;
+    }
+    cyc_barrier(bst, ++kb);
+    {
+        const int wave = tid >> 6, lane = tid & 63;
+        if (wave < NJ && lane < nb) sbl[wave * 64 + lane] = qz_gp(ss_buf)[wave * nb + lane];
+    }
+    __syncthreads();
+    if (tid < NJ) {
+        float tot = 0.f;
+        const float * sb = sbl + tid * 64;
+        for (int b = 0; b < nb; b++) tot += sb[b];
+        rs[tid] = rsqrtf(tot / D + eps);
+    }
+    __syncthreads();
+    if (tid < n) {
+        CK njob * njj = nj + j;
+        const float yv = val * rs[j] * qz_gp(njj->w)[i];
+        if (njj->y) qz_gp(njj->y)[i] = yv;
+        quant32(yv, qz_gp(njj->q), qz_gp(njj->qs), i);
     }
 }
 CYC_NI void c_norm(CK njob * j, float eps, int tid) {
@@ -222,6 +260,37 @@ CYC_NI void c_gemv2(CK gjobs * J, int hb, float * yp) {
     if (lane == 0)
         #pragma unroll
         for (int s = 0; s < 2; s++) if (r0 + s < N) { y[r0 + s] = acc[0][s]; if (yp) qz_gp(yp)[r0 + s] = acc[0][s]; }
+}
+// attn_output GEMV (N = D = 2304, K = QL = 1536): stages activations in LDS, balances
+// quads (4 rows each) across all blocks, and pushes coalesced 16-byte float4 stores to
+// both local PART0 and the peer PCIe inbox yp.
+CYC_NI void c_go_gemv(CK gjob * j, float * yp, int tid) {
+    asm volatile ("" : "+v"(tid));
+    unsigned char * la = (unsigned char *) cyc_lds;
+    float * ls = (float *) (la + QL);
+    float * tile = ls + (QL / 32);
+    __syncthreads();
+    if (tid < QL / 16) ((uint4 *) la)[tid] = ((const uint4 *) qz_gp(j->av))[tid];
+    if (tid < QL / 32) ls[tid] = qz_gp(j->as)[tid];
+    __syncthreads();
+    constexpr int NQ = D / 4;
+    const int nb = gridDim.x, wave = tid >> 6, lane = tid & 63;
+    const int q0 = blockIdx.x * NQ / nb, q1 = (blockIdx.x + 1) * NQ / nb, nq = q1 - q0;
+    for (int q = wave; q < nq; q += 8) {
+        float acc[1][4];
+        qz_gemv_rows_t<1, 4>(la, ls, QL, j->wv, j->ws, D, (q0 + q) * 4, lane, acc);
+        if (lane == 0)
+            #pragma unroll
+            for (int s = 0; s < 4; s++) tile[q * 4 + s] = acc[0][s];
+    }
+    __syncthreads();
+    if (tid < nq) {
+        const float4 v = *(const float4 *) (tile + tid * 4);
+        const int r = (q0 + tid) * 4;
+        *(float4 *) (qz_gp(j->y) + r) = v;
+        *(float4 *) (qz_gp(yp) + r) = v;
+    }
+    __syncthreads();
 }
 // The vocab GEMV: 32-row units spread over the grid, as d_gemv's rows. Rows < nv are
 // stored with the softcap applied.
@@ -485,6 +554,34 @@ template <int MQ, bool NRM> CYC_NI void c_cmix(CK sptrs * S, const float * qy, f
 }
 CYC_NI void c_head_post(CK hpost * e, int pos, float tau, int v, int tid) {
     asm volatile ("" : "+v"(tid));
+    const int dmax = min(TBW, pos + 1);
+    const float eff_tau = e->dk ? tau : 1.f;
+    if (v >= HQL + 2 * HKVL) {
+        // helper blocks: split each Q head's tb[h][256..dmax) across 3 extra blocks (56 total)
+        const int u = v - (HQL + 2 * HKVL);
+        const int h = u / 3, seg = 1 + u % 3;
+        const int d0 = seg * 256, d1 = seg == 3 ? dmax : min(d0 + 256, dmax);
+        if (d0 >= d1) return;
+        __shared__ float rv[DREL];
+        if (tid < 64) {
+            float r = tid < DREL ? qz_gp(e->rr)[h * DREL + tid] * qz_gp(e->rclip)[h * DREL + tid] : 0.f;
+            float r2 = qz_wsum_dpp(r * r);
+            if (tid < DREL) rv[tid] = r * fminf(fmaxf(e->rel_clip / (sqrtf(r2) + 1e-6f), 0.f), 1.f) * eff_tau;
+        }
+        __syncthreads();
+        const float sink = qz_gp(e->sk)[h];
+        const float * relb = qz_gp(e->relb);
+        float * tb = qz_gp(e->tb) + h * TBW;
+        for (int d = d0 + tid; d < d1; d += 512) {
+            float s = 0.f;
+            if (d < REL_EXT)
+                #pragma unroll
+                for (int k = 0; k < DREL; k++) s += relb[d * DREL + k] * rv[k];
+            tb[d] = s - sink;
+        }
+        __syncthreads();
+        return;
+    }
     hpost h = *e;
     const int row = e->dk ? pos : pos % PF_RING;          // dk: full layers only
     h.qr = qz_gp(h.qr); h.rr = qz_gp(h.rr); h.sk = qz_gp(h.sk); h.kr = qz_gp(h.kr); h.vr = qz_gp(h.vr);
@@ -492,8 +589,8 @@ CYC_NI void c_head_post(CK hpost * e, int pos, float tau, int v, int tid) {
     h.qclip = qz_gp(h.qclip); h.rclip = qz_gp(h.rclip); h.relb = qz_gp(h.relb); h.kconv = qz_gp(h.kconv); h.vconv = qz_gp(h.vconv);
     h.hist = qz_gp(h.hist); h.qh = qz_gp(h.qh); h.tb = qz_gp(h.tb);
     h.kc = qz_gp(h.kc + (size_t) row * KVL); h.vc = qz_gp(h.vc + (size_t) row * KVL);
-    h.tau = e->dk ? tau : 1.f;
-    d_head_post(h, v, tid, tid < 128, min(TBW, pos + 1));     // attention at pos reads d <= pos only
+    h.tau = eff_tau;
+    d_head_post(h, v, tid, tid < 128, min(256, dmax));     // helper blocks cover 256..dmax
 }
 CYC_NI void c_attn(CK attn_args * e, int pos, int v, int tid) {
     asm volatile ("" : "+v"(tid));
@@ -534,25 +631,63 @@ CYC_NI void c_pick_rank(const float * ps, float scale, int * sids, float * swts,
     }
     __syncthreads();
 }
-// The experts' gate | up GEMV, SITU and quant. A task is 2 activations: their 2 gate rows
-// and the 2 up rows 32 later (gu_row), in one 4-row GEMV with qz_gemv_rows_t's value per
-// row. Tasks go round-robin over all the grid's waves. The SITU values land in sv as f32,
-// and the wave that finishes a 32-activation group (gcnt) quantizes it and resets the
-// count.
+// The experts' gate | up GEMV, SITU and quant. Stages the int8 activations in LDS once
+// per block. The first 2 * gridDim.x quant groups (120 of 144 on 60 CUs) run completely
+// in-block (4 waves per half-block = 1 quant group, combined in LDS with zero global
+// atomics or fences). The remaining 24 groups (384 tasks) spread across all 480 waves.
 constexpr int UP_A = 2, UP_TG = 32 / UP_A;       // activations per task, tasks per quant group
 CYC_NI void c_up_situ_w(const char * wv, const __half * ws, const int * sids, const unsigned char * av, const float * as,
                         float beta, float lb, float * sv, int * gcnt, unsigned char * hq, float * hs, int tid) {
     asm volatile ("" : "+v"(tid));
-    constexpr int NT = NE_USED * FFL / UP_A;
-    av = qz_gp(av); as = qz_gp(as); sv = qz_gp(sv); gcnt = qz_gp(gcnt); hq = qz_gp(hq); hs = qz_gp(hs);
-    const int wave = tid >> 6, lane = tid & 63, nw = gridDim.x * 8;
+    constexpr int NG = NE_USED * (FFL / 32);     // 144 quant groups
+    unsigned char * la = (unsigned char *) cyc_lds;
+    float * ls = (float *) (la + D);
+    float * lq = ls + (D / 32);                  // [2][32] SITU values for the 2 in-block groups
+    __syncthreads();
+    if (tid < D / 16) ((uint4 *) la)[tid] = ((const uint4 *) qz_gp(av))[tid];
+    if (tid < D / 32) ls[tid] = qz_gp(as)[tid];
+    __syncthreads();
+    sv = qz_gp(sv); gcnt = qz_gp(gcnt); hq = qz_gp(hq); hs = qz_gp(hs);
+    const int wave = tid >> 6, lane = tid & 63, nb = gridDim.x, nw = nb * 8;
+    const int nloc = min(2 * nb, NG);            // 120 groups done purely in LDS
+    // Phase 1: 2 quant groups per block (half-block h = wave >> 2 owns group blockIdx.x * 2 + h)
+    {
+        const int h = wave >> 2, w4 = wave & 3;
+        const int g = blockIdx.x * 2 + h;
+        if (g < nloc) {
+            const int k = (g * 32) / FFL, jg = (g * 32) % FFL;
+            const int e = __builtin_amdgcn_readfirstlane(sids[k]);
+            const size_t base = (size_t) e * FFE;
+            #pragma unroll 1
+            for (int u = 0; u < 4; u++) {
+                const int j0 = jg + w4 * 8 + u * 2;
+                float acc[1][4];
+                qz_gemv_rows_t<1, 4, 32>(la, ls, D, wv + base * D, ws + base * (D / 32), FFE, gu_row(j0), lane, acc);
+                if (lane == 0) {
+                    lq[h * 32 + w4 * 8 + u * 2]     = situ_v(acc[0][0], acc[0][2], beta, lb);
+                    lq[h * 32 + w4 * 8 + u * 2 + 1] = situ_v(acc[0][1], acc[0][3], beta, lb);
+                }
+            }
+        }
+        __syncthreads();
+        if (wave < 2 && lane < 32) {
+            const int g = blockIdx.x * 2 + wave;
+            if (g < nloc) {
+                const int ai = g * 32 + lane, kk = ai / FFL, j = ai % FFL;
+                quant32(lq[wave * 32 + lane], hq + kk * FFL, hs + kk * (FFL / 32), j);
+            }
+        }
+        __syncthreads();
+    }
+    // Phase 2: remaining NG - nloc groups (24 groups = 384 tasks across 480 waves)
+    const int t0 = nloc * UP_TG, nt = NG * UP_TG;
     #pragma unroll 1
-    for (int task = blockIdx.x * 8 + wave; task < NT; task += nw) {
+    for (int task = t0 + blockIdx.x * 8 + wave; task < nt; task += nw) {
         const int a0 = task * UP_A, k = a0 / FFL, j0 = a0 % FFL;
         const int e = __builtin_amdgcn_readfirstlane(sids[k]);
         const size_t base = (size_t) e * FFE;
         float acc[1][2 * UP_A];
-        qz_gemv_rows_t<1, 2 * UP_A, 32>(av, as, D, wv + base * D, ws + base * (D / 32), FFE, gu_row(j0), lane, acc);
+        qz_gemv_rows_t<1, 2 * UP_A, 32>(la, ls, D, wv + base * D, ws + base * (D / 32), FFE, gu_row(j0), lane, acc);
         if (lane == 0) {
             #pragma unroll
             for (int s = 0; s < UP_A; s++) sv[a0 + s] = situ_v(acc[0][s], acc[0][UP_A + s], beta, lb);
@@ -584,7 +719,7 @@ CYC_NI void c_moe_down_q(const char * wv, const __half * ws, const int * sids, c
     static_assert(FFL / 32 <= 32, "one unit per lane");
     asm volatile ("" : "+v"(tid));
     constexpr int NU = FFL / 32, NQ = D / 4;
-    y = qz_gp(y); yp = yp ? qz_gp(yp) : nullptr;          // aq / as are LDS pointers
+    y = qz_gp(y); yp = yp ? qz_gp(yp) : nullptr;
     const int wave = tid >> 6, lane = tid & 63, h = lane >> 5, l = lane & 31;
     const int q0 = blockIdx.x * NQ / gridDim.x, q1 = (blockIdx.x + 1) * NQ / gridDim.x;
     for (int c0 = q0; c0 < q1; c0 += MD_Q) {
@@ -698,20 +833,18 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
         if (msg) {
             c_ctrl_down_all<3>(e->ca.j, tid);
             BAR();
-            c_ctrl_up_all<3>(e->ca.j, tid);
-            BAR();
-            for (int v = blockIdx.x; v < e->nna; v += nb) c_norm(&e->na.j[v], A.eps, tid);
+            c_ctrl_up_norm<3>(e->ca.j, e->na.j, A.eps, A.H, bst, kb, tid);
             BAR();
         }
         // ---- attention
         for (int v = blockIdx.x; v < 2 * e->nga; v += nb) c_gemv2(&e->ga, v, nullptr);
         BAR();
-        for (int v = blockIdx.x; v < HQL + 2 * HKVL; v += nb) c_head_post(&e->hp, pos, tau, v, tid);
+        for (int v = blockIdx.x; v < HQL * 4 + 2 * HKVL; v += nb) c_head_post(&e->hp, pos, tau, v, tid);
         BAR();
         for (int v = blockIdx.x; v < HKVL * ATT_SPL; v += nb) c_attn(&e->at, pos, v, tid);
         BAR();
         ++xs;
-        for (int v = blockIdx.x; v < 2 * e->ngo; v += nb) c_gemv2(&e->go, v, A.xin_peer + (size_t) (xs & 1) * D);
+        c_go_gemv(&e->go.j[0], A.xin_peer + (size_t) (xs & 1) * D, tid);
         __threadfence_system();
         BAR();
         // ---- P1, chain group 1: the attention sum + conv, the ffn mix (and norm)
@@ -725,9 +858,7 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
         if (msg) {
             c_ctrl_down_all<1>(e->cb.j, tid);
             BAR();
-            c_ctrl_up_all<1>(e->cb.j, tid);
-            BAR();
-            if (b0) c_norm(&e->nb.j[0], A.eps, tid);
+            c_ctrl_up_norm<1>(e->cb.j, e->nb.j, A.eps, A.H, bst, kb, tid);
             BAR();
         }
         // ---- experts

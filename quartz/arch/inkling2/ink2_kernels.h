@@ -303,14 +303,13 @@ __device__ __forceinline__ void d_head_post(const hpost & a, int b, int t, bool 
         if (t < DREL) rv[t] = r * fminf(fmaxf(a.rel_clip / rn, 0.f), 1.f) * a.tau;
         __syncthreads();
         const float sink = a.sk[h];
-        if (act)
-            for (int d = t; d < dmax; d += 128) {
-                float s = 0.f;
-                if (d < REL_EXT)
-                    #pragma unroll
-                    for (int k = 0; k < DREL; k++) s += a.relb[d * DREL + k] * rv[k];
-                a.tb[h * TBW + d] = s - sink;
-            }
+        for (int d = t; d < dmax; d += (int) blockDim.x) {
+            float s = 0.f;
+            if (d < REL_EXT)
+                #pragma unroll
+                for (int k = 0; k < DREL; k++) s += a.relb[d * DREL + k] * rv[k];
+            a.tb[h * TBW + d] = s - sink;
+        }
         __syncthreads();
         return;
     }
