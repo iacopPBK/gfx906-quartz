@@ -48,6 +48,29 @@ template <class XA> __device__ __forceinline__ void qz_xwait_b(const XA & A, uns
     for (int k = 0; k < XA::NC - 1; k++) qz_xwait_slot(A, tok, k * QZ_XFS + b);
 }
 
+// Two hops at NC = 4. On some hosts one GPU writing to several peers at once collapses
+// P2P (0.3 GB/s), while one peer per GPU stays at full speed with all four busy. So the
+// row exchange never fans out: hop 1 swaps the partials with the pair partner me ^ 1
+// (peer k = 1 for an even card, 3 for an odd one), hop 2 swaps the pair sums with the
+// cross partner me ^ 2 (k = 2). Every card ends with (p0 + p1) + (p2 + p3), the same
+// bits as the one-hop card-order sum. At NC = 2 hop 1 is the whole exchange.
+template <class XA> __device__ __forceinline__ int qz_xkpair(const XA & A) {
+    if constexpr (XA::NC == 2) return 1;
+    else return (A.tp_card & 1) ? 3 : 1;
+}
+// the inbox slot me writes in hop 1; a select, not an index, keeps the pointers in SGPRs
+template <class XA> __device__ __forceinline__ float * qz_xhop1_px(const XA & A) {
+    if constexpr (XA::NC == 2) return A.xin_px[0];
+    else return (A.tp_card & 1) ? A.xin_px[2] : A.xin_px[0];
+}
+// flag b in peer k only
+template <class XA> __device__ __forceinline__ void qz_xflag_k(const XA & A, unsigned int tok, int k, int b) {
+    static_assert(XA::NC == 4, "one-peer flags are for the two-hop exchange");
+    __threadfence_system();
+    unsigned int * f = k == 1 ? A.xflag_px[0] : k == 2 ? A.xflag_px[1] : A.xflag_px[2];
+    __hip_atomic_store(f + b, tok, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
 // block 0's flag, the whole-card exchange: set it, or wait in one thread for the
 // peers' flags to reach tok. Past the spin limit, or once any wait gave up, a wait
 // sets the abort word and returns so the launch drains.
@@ -95,8 +118,7 @@ template <int T, int CX, bool LX = T <= 4, class XA> __device__ __forceinline__ 
         const float4 v = *(const float4 *)(stage + (k * T + t) * 32 + q * 4);
         const size_t o = (size_t) t * XA::DM + g * 32 + q * 4;
         *(float4 *)(A.y_part + o) = v;
-        #pragma unroll
-        for (int k = 0; k < XA::NC - 1; k++) *(float4 *)(A.xin_px[k] + (size_t) par * CX * XA::DM + o) = v;
+        *(float4 *)(qz_xhop1_px(A) + (size_t) par * CX * XA::DM + o) = v;
     }
     __threadfence_system();
 }
@@ -125,15 +147,51 @@ template <int T, int CX, bool BX = true, class XA> __device__ __forceinline__ vo
     const int tid = threadIdx.x;
     const int par = tok & 1;
     __syncthreads();                 // every thread's remote stores are fenced by the push
-    if (tid == 0) { qz_xflag_b(A, tok, blockIdx.x); qz_xwait_b(A, tok, blockIdx.x); }
-    __syncthreads();
-    const float * src = A.xin_mine + (size_t) par * CX * XA::DM;
-    for (int g = blockIdx.x; g * 32 < XA::DM; g += gridDim.x) {
-        if (tid < 32 * T) {
-            const int t = tid >> 5, i = tid & 31;
-            const size_t o = (size_t) t * XA::DM + g * 32 + i;
-            const float own = __builtin_nontemporal_load(A.y_part + o);
-            y[o] = qz_xsum<CX>(A, own, src, o);
+    if constexpr (XA::NC == 2) {
+        if (tid == 0) { qz_xflag_b(A, tok, blockIdx.x); qz_xwait_b(A, tok, blockIdx.x); }
+        __syncthreads();
+        const float * src = A.xin_mine + (size_t) par * CX * XA::DM;
+        for (int g = blockIdx.x; g * 32 < XA::DM; g += gridDim.x) {
+            if (tid < 32 * T) {
+                const int t = tid >> 5, i = tid & 31;
+                const size_t o = (size_t) t * XA::DM + g * 32 + i;
+                const float own = __builtin_nontemporal_load(A.y_part + o);
+                y[o] = qz_xsum<CX>(A, own, src, o);
+            }
+        }
+    } else {
+        constexpr size_t XS = qz_xin_slot<CX, XA::DM>();
+        const int b = blockIdx.x, kp = qz_xkpair(A);
+        const bool odd = A.tp_card & 1, hi = A.tp_card >= 2;
+        const float * src = A.xin_mine + (size_t) par * CX * XA::DM;
+        float * dst = A.xin_px[1] + (size_t) par * CX * XA::DM;     // the cross partner's slot
+        // hop 1: the pair sum, lower card first, kept in y and pushed to the cross partner
+        if (tid == 0) { qz_xflag_k(A, tok, kp, b); qz_xwait_slot(A, tok, (kp - 1) * QZ_XFS + b); }
+        __syncthreads();
+        for (int g = b; g * 32 < XA::DM; g += gridDim.x) {
+            if (tid < 32 * T) {
+                const int t = tid >> 5, i = tid & 31;
+                const size_t o = (size_t) t * XA::DM + g * 32 + i;
+                const float own = __builtin_nontemporal_load(A.y_part + o);
+                const float pv = __builtin_nontemporal_load(src + (size_t) (kp - 1) * XS + o);
+                const float sp = odd ? __fadd_rn(pv, own) : __fadd_rn(own, pv);
+                y[o] = sp;
+                dst[o] = sp;
+            }
+        }
+        __threadfence_system();
+        __syncthreads();
+        // hop 2: lower pair's sum first
+        if (tid == 0) { qz_xflag_k(A, tok, 2, b); qz_xwait_slot(A, tok, QZ_XFS + b); }
+        __syncthreads();
+        for (int g = b; g * 32 < XA::DM; g += gridDim.x) {
+            if (tid < 32 * T) {
+                const int t = tid >> 5, i = tid & 31;
+                const size_t o = (size_t) t * XA::DM + g * 32 + i;
+                const float sp = y[o];
+                const float pc = __builtin_nontemporal_load(src + XS + o);
+                y[o] = hi ? __fadd_rn(pc, sp) : __fadd_rn(sp, pc);
+            }
         }
     }
     if constexpr (BX) qz_grid_barrier(bst, ++kb);

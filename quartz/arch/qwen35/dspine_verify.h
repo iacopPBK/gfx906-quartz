@@ -310,8 +310,7 @@ __global__ void __launch_bounds__(512) mv_xfin(qz_trunk_args A, unsigned int tok
                     }
                     *(float4 *)(A.y_part + o) = v;
                 }
-                #pragma unroll
-                for (int k = 0; k < QZ_NC - 1; k++) *(float4 *)(A.xin_px[k] + (size_t) par * MV_T * QZ_D + o) = v;
+                *(float4 *)(qz_xhop1_px(A) + (size_t) par * MV_T * QZ_D + o) = v;
             }
         __threadfence_system();
     }
