@@ -11,7 +11,6 @@
 #include "core/link.h"           // qz_xcopy: the prefill partial to the peer
 
 constexpr int PF_NP = 8 * PF_M;             // max (row, expert) pairs per chunk
-constexpr int GUL = 2 * FFL;                // local gate and up rows per expert
 constexpr int NGRP_FF = (FFL + 127) / 128;  // 128-wide groups of the down contraction, 5, the last one half
 constexpr int FFL_PAD = NGRP_FF * 128;
 constexpr int NSC_FF = NGRP_FF * 4;         // scale slots per row of the down input planes

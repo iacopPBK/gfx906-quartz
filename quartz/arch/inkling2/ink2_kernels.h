@@ -16,6 +16,7 @@
 constexpr int HQL = HQ / QZ_NC, HKVL = HKV / QZ_NC;    // local heads per card
 constexpr int QL = HQL * HD, KVL = HKVL * HD;          // 1536, 512 at 2 cards
 constexpr int FFL = FFE / QZ_NC;                       // local expert FF: 576 at 2 cards
+constexpr int GUL = 2 * FFL;                            // local gate + up rows per expert: 1152 at 2 cards
 // Prefill chunk rows, and the SWA ring, indexed pos % PF_RING everywhere. The ring holds
 // at least a window of WIN plus the in-flight chunk, and the slack keeps a prefix-cache
 // snapshot at s restorable while writes stay below s - WIN + 1 + PF_RING.
@@ -424,7 +425,7 @@ __device__ __host__ __forceinline__ int gu_row(int j) { return (j / 32) * 64 + j
 static __global__ __launch_bounds__(256) void k_gu_interleave(const char * sv, const __half * ss, char * dv, __half * ds) {
     const int p = blockIdx.x, e = blockIdx.y, r = p % 64;
     const int src = r < 32 ? (p / 64) * 32 + r : FFL + (p / 64) * 32 + r - 32;
-    const size_t so = (size_t) e * FFE + src, dof = (size_t) e * FFE + p;
+    const size_t so = (size_t) e * GUL + src, dof = (size_t) e * GUL + p;
     const uint4 * a = (const uint4 *) (sv + so * D);
     uint4 * b = (uint4 *) (dv + dof * D);
     for (int i = threadIdx.x; i < D / 16; i += 256) b[i] = a[i];

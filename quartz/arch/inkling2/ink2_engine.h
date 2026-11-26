@@ -131,14 +131,14 @@ struct ink2_engine {
             }
         }
         {   // gate_up rows interleaved per 32 (gu_row), so the prefill GEMM's 64-row tiles pair for SITU
-            const size_t nv = (size_t) NE * FFE * D, ns = (size_t) NE * FFE * (D / 32);
+            const size_t nv = (size_t) NE * GUL * D, ns = (size_t) NE * GUL * (D / 32);
             char * tv; __half * ts;
             ICHECK(hipMalloc(&tv, nv)); ICHECK(hipMalloc(&ts, ns * 2));
             for (int il = 0; il < NL; il++) {
                 qw & W = K.L[il].gu;
                 ICHECK(hipMemcpy(tv, W.v, nv, hipMemcpyDeviceToDevice));
                 ICHECK(hipMemcpy(ts, W.s, ns * 2, hipMemcpyDeviceToDevice));
-                k_gu_interleave<<<dim3(FFE, NE), 256>>>(tv, ts, (char *) W.v, (__half *) W.s);
+                k_gu_interleave<<<dim3(GUL, NE), 256>>>(tv, ts, (char *) W.v, (__half *) W.s);
             }
             ICHECK(hipDeviceSynchronize());
             ICHECK(hipFree(tv)); ICHECK(hipFree(ts));

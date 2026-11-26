@@ -186,7 +186,10 @@ VR_NI void d_head_post_v(const hpost & a, int b, int t, bool act, int dmax, int 
     }
 }
 // c_head_post with the verify window
-VR_NI void v_head_post(CK hpost * e, int pos, float tau, int v, int tid, int r, float * uh, int rsf, const float * hb) {
+// act false: a padding group (TP4's 6 q / 2 k / 2 v units per card fill blocks of 4 groups
+// of one kind), which runs the block's syncs and writes nothing.
+template <bool PAD = false>
+VR_NI void v_head_post(CK hpost * e, int pos, float tau, int v, int tid, int r, float * uh, int rsf, const float * hb, bool act = true) {
     asm volatile ("" : "+v"(tid));
     hpost h = *e;
     const int row = e->dk ? pos : pos % PF_RING;          // dk: full layers only
@@ -196,7 +199,7 @@ VR_NI void v_head_post(CK hpost * e, int pos, float tau, int v, int tid, int r, 
     h.hist = qz_gp(h.hist); h.qh = qz_gp(h.qh); h.tb = qz_gp(h.tb);
     h.kc = qz_gp(h.kc + (size_t) row * KVL); h.vc = qz_gp(h.vc + (size_t) row * KVL);
     h.tau = e->dk ? tau : 1.f;
-    d_head_post_v(h, v, tid & 127, true, min(TBW, pos + 1), r, uh, rsf, hb, tid >> 7);
+    d_head_post_v(h, v, tid & 127, PAD ? act : true, min(TBW, pos + 1), r, uh, rsf, hb, tid >> 7);
 }
 
 
@@ -511,7 +514,7 @@ template <int T = VR> VR_NI void v_up_dd(const char * wv, const __half * ws, con
         const int u = gw / NG, g = gw % NG;
         const int e = __builtin_amdgcn_readfirstlane(dd.dex[u]);
         const unsigned mk = __builtin_amdgcn_readfirstlane(dd.dmk[u]);
-        const size_t base = (size_t) e * FFE;
+        const size_t base = (size_t) e * GUL;
         const size_t r0 = base + (size_t) g * 64;                           // gate rows r0 .. r0 + 31, up + 32
         constexpr int LV = 64 / (2 * T);                                   // lanes per value
         const int kv = v_tsum_k<2 * T>(lane), vr = kv >> 1, vs = kv & 1;
@@ -552,8 +555,9 @@ template <int T = VR> VR_NI void v_up_dd(const char * wv, const __half * ws, con
 // Each expert's 4 weight rows load once for the rows that picked it, from its own row list,
 // the rows' SITU activations staged in LDS. Then per row the same k-order fold of wk *
 // acc. LDS: lacc [VR][MD_Q][NE_USED][4], then the activations (VER_LDS).
-constexpr int VER_LDS = (VR * MD_Q * NE_USED * 4) * 4 + VR * NE_USED * FFL + VR * NE_USED * (FFL / 32) * 4;
-static_assert(VER_LDS >= CYC_LDS, "verify's dynamic LDS covers the decode's");
+constexpr int VER_LDS0 = (VR * MD_Q * NE_USED * 4) * 4 + VR * NE_USED * FFL + VR * NE_USED * (FFL / 32) * 4;
+// at TP4 the expert slices halve and the decode's (or the attention's) LDS is the larger
+constexpr int VER_LDS = VER_LDS0 > CYC_LDS ? VER_LDS0 : CYC_LDS;
 VR_NI void v_down_dd(const char * wv, const __half * ws, const int * sids, const float * swts, const vdist & dd,
                      const unsigned char * aq0, const float * as0, float * y0, const qz_xpush<QZ_NC> & yp0, int tid, int rs, int rsf, float * lacc,
                      int nr) {
@@ -589,18 +593,22 @@ VR_NI void v_down_dd(const char * wv, const __half * ws, const int * sids, const
             const int e = live ? dd.dex[ui] : dd.dex[0];
             const unsigned mk = live ? dd.dmk[ui] : 0u;
             const int r0 = (c0 + qd) * 4;
-            const int st = (l >> 1) & 3, ut = 16 + (l & 1);
+            // NU > 16 (TP2's 18): lanes hold units 0..15 plus the tail. NU <= 16 (TP4's 9):
+            // lane l holds unit l, zero from NU up, as c_moe_down_q's l < NU
+            constexpr bool TAIL = NU > 16;
+            const int lu = TAIL ? l : min(l, NU - 1);
+            const int st = (l >> 1) & 3, ut = TAIL ? 16 + (l & 1) : 0;
             const char * w = wv + ((size_t) e * D + r0) * FFL;
             const __half * sw = ws + ((size_t) e * D + r0) * NU;
             qz_v4u w0[4], w1[4], t0, t1;
             float wsc[4], tsc;
             #pragma unroll
             for (int s = 0; s < 4; s++) {
-                const qz_gu4 * wr = (const qz_gu4 *) (w + (size_t) s * FFL + l * 32);
+                const qz_gu4 * wr = (const qz_gu4 *) (w + (size_t) s * FFL + lu * 32);
                 w0[s] = wr[0]; w1[s] = wr[1];
-                wsc[s] = __half2float(__ushort_as_half(((const qz_gh *) sw)[(size_t) s * NU + l]));
+                wsc[s] = __half2float(__ushort_as_half(((const qz_gh *) sw)[(size_t) s * NU + lu]));
             }
-            {
+            if constexpr (TAIL) {
                 const qz_gu4 * wr = (const qz_gu4 *) (w + (size_t) st * FFL + ut * 32);
                 t0 = wr[0]; t1 = wr[1];
                 tsc = __half2float(__ushort_as_half(((const qz_gh *) sw)[(size_t) st * NU + ut]));
@@ -617,17 +625,19 @@ VR_NI void v_down_dd(const char * wv, const __half * ws, const int * sids, const
                 const int k = v_slot(sids, r, e);
                 const unsigned char * aq = la + (r * NE_USED + k) * FFL;
                 const float * as = ls + (r * NE_USED + k) * NU;
-                const uint4 a0 = *(const uint4 *) (aq + l * 32), a1 = *(const uint4 *) (aq + l * 32 + 16);
-                const uint4 b0 = *(const uint4 *) (aq + ut * 32), b1 = *(const uint4 *) (aq + ut * 32 + 16);
-                const float sa = as[l], sb = as[ut];
+                const uint4 a0 = *(const uint4 *) (aq + lu * 32), a1 = *(const uint4 *) (aq + lu * 32 + 16);
+                const float sa = as[lu];
                 float acc[4];
                 #pragma unroll
                 for (int s = 0; s < 4; s++) {
                     int d = 0;
                     DOT4(d, w0[s].x, a0.x); DOT4(d, w0[s].y, a0.y); DOT4(d, w0[s].z, a0.z); DOT4(d, w0[s].w, a0.w);
                     DOT4(d, w1[s].x, a1.x); DOT4(d, w1[s].y, a1.y); DOT4(d, w1[s].z, a1.z); DOT4(d, w1[s].w, a1.w);
-                    acc[s] = (float) d * wsc[s] * sa;
+                    acc[s] = TAIL || l < NU ? (float) d * wsc[s] * sa : 0.f;
                 }
+                if constexpr (TAIL) {
+                const uint4 b0 = *(const uint4 *) (aq + ut * 32), b1 = *(const uint4 *) (aq + ut * 32 + 16);
+                const float sb = as[ut];
                 int dt = 0;
                 DOT4(dt, t0.x, b0.x); DOT4(dt, t0.y, b0.y); DOT4(dt, t0.z, b0.z); DOT4(dt, t0.w, b0.w);
                 DOT4(dt, t1.x, b1.x); DOT4(dt, t1.y, b1.y); DOT4(dt, t1.z, b1.z); DOT4(dt, t1.w, b1.w);
@@ -636,6 +646,7 @@ VR_NI void v_down_dd(const char * wv, const __half * ws, const int * sids, const
                 for (int s = 0; s < 4; s++) {
                     const float tv = __shfl(q, (lane & ~15) + 2 * s + (l & 1), 64);
                     acc[s] += l < 2 ? tv : 0.f;
+                }
                 }
                 const float val = v_tsum<4, 16>(acc, l);                    // value s in lanes 4 s ..
                 if ((l & 3) == 0 && on) lacc[r * LR + (qd * NE_USED + k) * 4 + (l >> 2)] = val;
@@ -920,10 +931,21 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
             for (int v = blockIdx.x; v < 4 / VG_S * e0->nga; v += nb) v_gemv<VG_S, decltype(t)::value>(&e0->ga, v, rs, rsf, qz_xpush<QZ_NC>{});
         });
         cyc_barrier(vbst, ++kb);
-        static_assert(HQL % 4 == 0 && HKVL % 4 == 0, "a block's 4 units of one kind (q / k / v)");
-        for (int v = blockIdx.x; v < nr * (HQL + 2 * HKVL) / 4; v += nb) {
-            const int nu = (HQL + 2 * HKVL) / 4, r = v / nu, u = (v % nu) * 4 + (tid >> 7);   // 4 units, 128 threads each
-            v_head_post(&VROW(Av.tab, r, ai)->hp, pos + r, tv.tau[r], u, tid, r, Vq->uh, rsf, Vq->hist);
+        // a block's 4 units (128 threads each) are of one kind (q / k / v): their sync counts differ
+        if constexpr (HQL % 4 == 0 && HKVL % 4 == 0) {
+            for (int v = blockIdx.x; v < nr * (HQL + 2 * HKVL) / 4; v += nb) {
+                const int nu = (HQL + 2 * HKVL) / 4, r = v / nu, u = (v % nu) * 4 + (tid >> 7);
+                v_head_post(&VROW(Av.tab, r, ai)->hp, pos + r, tv.tau[r], u, tid, r, Vq->uh, rsf, Vq->hist);
+            }
+        } else {   // each kind rounded up to whole blocks, the spare groups padding
+            constexpr int QB = (HQL + 3) / 4, KB = (HKVL + 3) / 4, nu = QB + 2 * KB;
+            for (int v = blockIdx.x; v < nr * nu; v += nb) {
+                const int r = v / nu, j = v % nu, g = tid >> 7;
+                const int base = j < QB ? 0 : j < QB + KB ? HQL : HQL + HKVL;
+                const int lim = j < QB ? HQL : HKVL, k = (j < QB ? j : j < QB + KB ? j - QB : j - QB - KB) * 4 + g;
+                v_head_post<true>(&VROW(Av.tab, r, ai)->hp, pos + r, tv.tau[r], base + min(k, lim - 1), tid, r, Vq->uh, rsf,
+                                  Vq->hist, k < lim);
+            }
         }
         cyc_barrier(vbst, ++kb);
         for (int v = blockIdx.x; v < HKVL * FL_NS; v += nb) v_attn_a((CK appk *) Av.tab, napp, ai, pos, v, Vq->ws, tid, nr);

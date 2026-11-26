@@ -558,9 +558,9 @@ CYC_NI void c_up_situ_w(const char * wv, const __half * ws, const int * sids, co
     for (int task = blockIdx.x * 8 + wave; task < NT; task += nw) {
         const int a0 = task * UP_A, k = a0 / FFL, j0 = a0 % FFL;
         const int e = __builtin_amdgcn_readfirstlane(sids[k]);
-        const size_t base = (size_t) e * FFE;
+        const size_t base = (size_t) e * GUL;
         float acc[1][2 * UP_A];
-        qz_gemv_rows_t<1, 2 * UP_A, 32>(av, as, D, wv + base * D, ws + base * (D / 32), FFE, gu_row(j0), lane, acc);
+        qz_gemv_rows_t<1, 2 * UP_A, 32>(av, as, D, wv + base * D, ws + base * (D / 32), GUL, gu_row(j0), lane, acc);
         if (lane == 0) {
             #pragma unroll
             for (int s = 0; s < UP_A; s++) sv[a0 + s] = situ_v(acc[0][s], acc[0][UP_A + s], beta, lb);
