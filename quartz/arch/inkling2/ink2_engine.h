@@ -523,7 +523,8 @@ struct ink2_engine {
             ICHECK(hipGetLastError());
             qz_topk_rows<<<dim3(QZ_TOPK_NB, nr), 256, 0, K.st>>>(K.LOGV, K.nvalid, K.id0, K.vtk);
             const size_t n2 = (size_t) VR * QZ_TOPK_NB * QZ_TOPK;
-            ICHECK(hipMemcpyAsync(vtkp[c], K.vtk, n2 * sizeof(float2), hipMemcpyDeviceToHost, K.st));
+            const size_t ncopy = (size_t) nr * QZ_TOPK_NB * QZ_TOPK;
+            ICHECK(hipMemcpyAsync(vtkp[c], K.vtk, ncopy * sizeof(float2), hipMemcpyDeviceToHost, K.st));
             ICHECK(hipMemcpyAsync(vtkp[c] + n2, K.x.xerr, 8 * sizeof(int), hipMemcpyDeviceToHost, K.st));
         }
         for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(C[c].st)); }

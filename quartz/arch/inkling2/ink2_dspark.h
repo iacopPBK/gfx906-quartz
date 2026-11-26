@@ -674,6 +674,7 @@ static __global__ __launch_bounds__(64) void k_ds_last(const unsigned long long 
     const unsigned long long b0 = ((volatile const unsigned long long *) best)[0];
     const unsigned long long b1 = ((volatile const unsigned long long *) xbest)[0];
     out[slot] = (int) ~(unsigned int) ((b0 > b1 ? b0 : b1) & 0xffffffffu);
+    out[7] = *err;
 }
 static __global__ void k_ds_tohalf(const float * y, __half * o, int n, int stride) {
     const int r = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -834,7 +835,7 @@ struct ink2_dspark {
         qz_mem_scope mem("dspark state");
         al(&g, D); al(&tap, 4 * D); al(&vtap, (size_t) VR * 4 * D); al(&joint, 3 * DS_R); al(&state, DS_R);
         ICHECK(qz_dmalloc((void **) &out_d, 8 * sizeof(int), "dspark"));
-        ICHECK(hipHostMalloc((void **) &out_h, 8 * sizeof(int), 0));
+        ICHECK(hipHostMalloc((void **) &out_h, 10 * sizeof(int), 0));
         ICHECK(hipMemset(out_d, 0, 8 * sizeof(int)));
         for (int c = 0; c < 2; c++) {
             card & k = K[c];
@@ -1003,8 +1004,8 @@ struct ink2_dspark {
                     for (int l = 0; l < DS_NL; l++) {
                         const unsigned char * q = k.fq + ((size_t) l * m + r0) * D;
                         const float * s = k.fs + ((size_t) l * m + r0) * (D / 32);
-                        gemv(st, q, s, k.L[l].kc, k.ckf, n == 1 ? 1 : 8);
-                        gemv(st, q, s, k.L[l].vc, k.cvf, n == 1 ? 1 : 8);
+                        gemv(st, q, s, k.L[l].kc, k.ckf, n);
+                        gemv(st, q, s, k.L[l].vc, k.cvf, n);
                         k_ds_hnorm_rope<<<dim3(DS_NKVL, n), 128, 0, st>>>(k.ckf, k.L[l].kcn, DS_NKVL, k.ckf, k.L[l].kcn, 0, p0 + r0, DS_EPS);
                         k_ds_store<<<(n * DS_KVL + 255) / 256, 256, 0, st>>>(k.ckf, k.cvf, k.ck[l], k.cv[l], p0 + r0, n);
                     }
@@ -1100,47 +1101,51 @@ struct ink2_dspark {
             k_ds_best_push<<<1, 64, 0, s1s>>>(best[1], xbest[0], fl[0], sq);
             ICHECK(hipSetDevice(qz_dev_of(0)));
         }
-        if (sa) {   // each card's per-row (max, sum) of the halves, merged before the host
-            for (int c = 0; c < 2; c++) {
-                ICHECK(hipSetDevice(qz_dev_of(c)));
-                k_ds_lse_merge<<<DS_BS - 1, 64, 0, E->C[c].st>>>(lses[c], nb[c], lsem[c]);
-            }
-            ICHECK(hipSetDevice(qz_dev_of(0)));
-        }
         k_ds_last<<<1, 64, 0, st>>>(best[0], xbest[0], fl[0], seq, errd[0], out_d, nd - 1);
         ICHECK(hipMemcpyAsync(out_h, out_d, 8 * sizeof(int), hipMemcpyDeviceToHost, st));
-        ICHECK(hipStreamSynchronize(st));
-        for (int i = 0; i < nd; i++) out[i] = out_h[i];
-        for (int c = 0; c < 2; c++) {                  // either card's wait may have given up
-            ICHECK(hipSetDevice(qz_dev_of(c)));
-            ICHECK(hipStreamSynchronize(E->C[c].st));
-            ICHECK(hipMemcpy(&out_h[7], errd[c], sizeof(int), hipMemcpyDeviceToHost));
-            if (out_h[7]) { fprintf(stderr, "dspark: the Markov chain's cross-card wait timed out (step %u, card %d)\n", seq, c), exit(1); }
+        if (sa) {   // each card's per-row (max, sum) of the halves, copied async before the single sync
+            k_ds_lse_merge<<<nd, 64, 0, st>>>(lses[0], nb[0], lsem[0]);
+            ICHECK(hipMemcpyAsync(lseh[0], lsem[0], (size_t) nd * 2 * sizeof(float), hipMemcpyDeviceToHost, st));
         }
+        ICHECK(hipSetDevice(qz_dev_of(1)));
+        hipStream_t s1s = E->C[1].st;
+        if (sa) {
+            k_ds_lse_merge<<<nd, 64, 0, s1s>>>(lses[1], nb[1], lsem[1]);
+            ICHECK(hipMemcpyAsync(lseh[1], lsem[1], (size_t) nd * 2 * sizeof(float), hipMemcpyDeviceToHost, s1s));
+        }
+        ICHECK(hipMemcpyAsync(&out_h[8], errd[1], sizeof(int), hipMemcpyDeviceToHost, s1s));
+        ICHECK(hipSetDevice(qz_dev_of(0)));
+        ICHECK(hipStreamSynchronize(st));
+        ICHECK(hipSetDevice(qz_dev_of(1)));
+        ICHECK(hipStreamSynchronize(s1s));
+        ICHECK(hipSetDevice(qz_dev_of(0)));
+        if (out_h[7]) { fprintf(stderr, "dspark: the Markov chain's cross-card wait timed out (step %u, card 0)\n", seq); exit(1); }
+        if (out_h[8]) { fprintf(stderr, "dspark: the Markov chain's cross-card wait timed out (step %u, card 1)\n", seq); exit(1); }
+        for (int i = 0; i < nd; i++) out[i] = out_h[i];
     }
     // ---- sampled rounds, after the verify
     // The drafter's logit of the target's candidate ids: ids is the host's [DS_BS][DS_QID]
     // list (-1 padded, row r's own candidates in its slots), lg the host's logits in the
     // same layout and lse the per-row logsumexp of the whole vocab. Each card evaluates
     // the ids it owns.
-    void qlog(const int * ids, float * lg, float * lse) {
-        memcpy(qid_h, ids, DS_BS * DS_QID * sizeof(int));
+    void qlog(const int * ids, float * lg, float * lse, int nd = DS_BS - 1) {
+        const size_t nq = (size_t) nd * DS_QID;
+        memcpy(qid_h, ids, nq * sizeof(int));
         for (int c = 0; c < 2; c++) {
             const ink2_card & T = E->C[c];
             ICHECK(hipSetDevice(qz_dev_of(c)));
             hipStream_t st = E->C[c].st;
-            ICHECK(hipMemcpyAsync(qid_d[c], qid_h, DS_BS * DS_QID * sizeof(int), hipMemcpyHostToDevice, st));
-            k_ds_qids<<<dim3(DS_QID, DS_BS - 1), 64, 0, st>>>(base[c], T.head.N, fold[c], nhp[c], T.nvalid, T.id0, qid_d[c],
-                                                             lat1[c], qs_d[c]);
-            ICHECK(hipMemcpyAsync(qs_h[c], qs_d[c], DS_BS * DS_QID * sizeof(float), hipMemcpyDeviceToHost, st));
-            ICHECK(hipMemcpyAsync(lseh[c], lsem[c], DS_BS * 2 * sizeof(float), hipMemcpyDeviceToHost, st));
+            ICHECK(hipMemcpyAsync(qid_d[c], qid_h, nq * sizeof(int), hipMemcpyHostToDevice, st));
+            k_ds_qids<<<dim3(DS_QID, nd), 64, 0, st>>>(base[c], T.head.N, fold[c], nhp[c], T.nvalid, T.id0, qid_d[c],
+                                                       lat1[c], qs_d[c]);
+            ICHECK(hipMemcpyAsync(qs_h[c], qs_d[c], nq * sizeof(float), hipMemcpyDeviceToHost, st));
         }
         for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(E->C[c].st)); }
         ICHECK(hipSetDevice(qz_dev_of(0)));
-        for (int r = 0; r < DS_BS - 1; r++)            // an id's logit sits on the card that owns it
+        for (int r = 0; r < nd; r++)                   // an id's logit sits on the card that owns it
             for (int j = 0; j < DS_QID; j++)
                 lg[r * DS_QID + j] = qs_h[ids[r * DS_QID + j] < E->C[1].id0 ? 0 : 1][r * DS_QID + j];
-        for (int r = 0; r < DS_BS - 1; r++) {          // logaddexp of the two cards' halves
+        for (int r = 0; r < nd; r++) {                 // logaddexp of the two cards' halves
             const float m = fmaxf(lseh[0][2 * r], lseh[1][2 * r]);
             lse[r] = m + logf(lseh[0][2 * r + 1] * expf(lseh[0][2 * r] - m) + lseh[1][2 * r + 1] * expf(lseh[1][2 * r] - m));
         }

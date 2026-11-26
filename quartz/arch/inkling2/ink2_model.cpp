@@ -408,7 +408,7 @@ struct ink2_ctx : qz_ctx {
                 while (n < nd && dr[n] == g[n]) n++;
             } else {                                  // sampled: speculative sampling
                 const size_t rb = (size_t) QZ_TOPK_NB * QZ_TOPK;
-                for (int c = 0; c < 2; c++) sam.tk[c].assign(E.vtkp[c], E.vtkp[c] + VR * rb);
+                for (int c = 0; c < 2; c++) sam.tk[c].assign(E.vtkp[c], E.vtkp[c] + (size_t) nr * rb);
                 // Each row's p is the sampler's own chain, q comes from the drafter: the
                 // round's rows' candidate ids (plus each row's draft, when p does not list
                 // it) go to the cards in one launch, then row r accepts dr[r] or the
@@ -434,7 +434,7 @@ struct ink2_ctx : qz_ctx {
                     if (dslot[r] < 0) { rid[r][m] = dr[r]; dslot[r] = m; m++; }   // p(d) = 0
                     rn[r] = m;
                 }
-                DS.qlog(&rid[0][0], &lgt[0], lse);
+                DS.qlog(&rid[0][0], &lgt[0], lse, nd);
                 for (int r = 0; r < nd; r++)                     // q of every candidate of every row
                     for (int i = 0; i < rn[r]; i++) {
                         double x = lgt[r * DS_QID + i];
