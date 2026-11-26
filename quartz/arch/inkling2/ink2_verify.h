@@ -381,30 +381,46 @@ template <int T = VR> VR_NI float v_wdot(const v_wbuf & b, const unsigned char *
     float (&fv)[NV] = *(float (*)[NV]) &acc[0][0];
     return v_tsum<NV>(fv, lane);
 }
-VR_NI float v_wdot_r1(const v_wbuf & b, const unsigned char * la, const float * ls, int r, int lane) {
+VR_NI float v_wdot_r4(const v_wbuf & b, const unsigned char * la, const float * ls,
+                      int r0, int r1, int r2, int r3, int lane, float (&acc)[4][2]) {
     constexpr int NU = D / 32;
-    float acc[2];
-    const uint4 a0 = *(const uint4 *) (la + r * D + lane * 32), a1 = *(const uint4 *) (la + r * D + lane * 32 + 16);
-    const float sa = ls[r * NU + lane];
+    #pragma unroll
+    for (int t = 0; t < 4; t++) {
+        const int r = t == 0 ? r0 : t == 1 ? r1 : t == 2 ? r2 : r3;
+        const uint4 a0 = *(const uint4 *) (la + r * D + lane * 32), a1 = *(const uint4 *) (la + r * D + lane * 32 + 16);
+        const float sa = ls[r * NU + lane];
+        #pragma unroll
+        for (int s = 0; s < 2; s++) {
+            int d = 0;
+            DOT4(d, b.w0[s].x, a0.x); DOT4(d, b.w0[s].y, a0.y); DOT4(d, b.w0[s].z, a0.z); DOT4(d, b.w0[s].w, a0.w);
+            DOT4(d, b.w1[s].x, a1.x); DOT4(d, b.w1[s].y, a1.y); DOT4(d, b.w1[s].z, a1.z); DOT4(d, b.w1[s].w, a1.w);
+            acc[t][s] = 0.f;
+            acc[t][s] += (float) d * b.sw[s] * sa;
+        }
+    }
+    const int tt = min(lane >> 3, 3), ut = 64 + (lane & 7);
+    const int tr = tt == 0 ? r0 : tt == 1 ? r1 : tt == 2 ? r2 : r3;
+    const uint4 a0 = *(const uint4 *) (la + tr * D + ut * 32), a1 = *(const uint4 *) (la + tr * D + ut * 32 + 16);
+    const float sat = ls[tr * NU + ut];
+    float q[2];
     #pragma unroll
     for (int s = 0; s < 2; s++) {
         int d = 0;
-        DOT4(d, b.w0[s].x, a0.x); DOT4(d, b.w0[s].y, a0.y); DOT4(d, b.w0[s].z, a0.z); DOT4(d, b.w0[s].w, a0.w);
-        DOT4(d, b.w1[s].x, a1.x); DOT4(d, b.w1[s].y, a1.y); DOT4(d, b.w1[s].z, a1.z); DOT4(d, b.w1[s].w, a1.w);
-        acc[s] = (float) d * b.sw[s] * sa;
+        DOT4(d, b.t0[s].x, a0.x); DOT4(d, b.t0[s].y, a0.y); DOT4(d, b.t0[s].z, a0.z); DOT4(d, b.t0[s].w, a0.w);
+        DOT4(d, b.t1[s].x, a1.x); DOT4(d, b.t1[s].y, a1.y); DOT4(d, b.t1[s].z, a1.z); DOT4(d, b.t1[s].w, a1.w);
+        q[s] = (float) d * b.tw[s];
     }
-    const int ut = 64 + (lane & 7);
-    const uint4 ta0 = *(const uint4 *) (la + r * D + ut * 32), ta1 = *(const uint4 *) (la + r * D + ut * 32 + 16);
-    const float sat = ls[r * NU + ut];
     #pragma unroll
-    for (int s = 0; s < 2; s++) {
-        int d = 0;
-        DOT4(d, b.t0[s].x, ta0.x); DOT4(d, b.t0[s].y, ta0.y); DOT4(d, b.t0[s].z, ta0.z); DOT4(d, b.t0[s].w, ta0.w);
-        DOT4(d, b.t1[s].x, ta1.x); DOT4(d, b.t1[s].y, ta1.y); DOT4(d, b.t1[s].z, ta1.z); DOT4(d, b.t1[s].w, ta1.w);
-        const float v = (float) d * b.tw[s];
-        if (lane < 8) acc[s] += v * sat;
+    for (int t = 0; t < 4; t++) {
+        const float st = __shfl(sat, t * 8 + (lane & 7), 64);
+        #pragma unroll
+        for (int s = 0; s < 2; s++) {
+            const float v = __shfl(q[s], t * 8 + (lane & 7), 64);
+            if (lane < 8) acc[t][s] += v * st;
+        }
     }
-    return v_tsum<2>(acc, lane);
+    float (&fv)[8] = *(float (*)[8]) &acc[0][0];
+    return v_tsum<8>(fv, lane);
 }
 
 
@@ -586,6 +602,82 @@ template <int T = VR> VR_NI void v_up_dd(const char * wv, const __half * ws, con
             }
         }
         __builtin_amdgcn_wave_barrier();                                    // the tile is rewritten by the next group
+    }
+}
+// For nr > 4, pack each expert's picking rows in groups of up to 4 and run v_wdot_r4
+// instead of computing all 8 rows: >95% of experts have <= 4 picking rows, so they stay
+// memory-bandwidth-bound at T=4 cost while the rare >4-row expert runs a second pass.
+VR_NI void v_up_dd_r4(const char * wv, const __half * ws, const int * sids, const vdist & dd,
+                      const unsigned char * av0, const float * as0, float beta, float lb,
+                      unsigned char * hq0, float * hs0, int tid, int rs, int rsf, int nr) {
+    asm volatile ("" : "+v"(tid));
+    av0 = qz_gp(av0); as0 = qz_gp(as0); hq0 = qz_gp(hq0); hs0 = qz_gp(hs0);
+    const int wave = tid >> 6, lane = tid & 63, nw = gridDim.x * 8;
+    unsigned char * la = (unsigned char *) cyc_lds;                       // [VR][D]
+    float * ls = cyc_lds + VR * D / 4;                                     // [VR][D / 32]
+    __syncthreads();
+    for (int i = tid; i < nr * D / 16; i += 512) {
+        const int r = i / (D / 16), c = i % (D / 16);
+        ((uint4 *) la)[i] = *(const uint4 *) (av0 + (size_t) r * rs + c * 16);
+    }
+    for (int i = tid; i < nr * D / 32; i += 512) {
+        const int r = i / (D / 32), c = i % (D / 32);
+        ls[i] = as0[(size_t) r * rsf + c];
+    }
+    __syncthreads();
+    float * lq = ls + VR * D / 32 + wave * VR * 32;                        // [VR][32] per wave
+    constexpr int NG = FFL / 32, LV = 64 / 8;
+    const int kv = v_tsum_k<8>(lane), vr = kv >> 1, vs = kv & 1;
+    const bool wl_base = (lane & (LV - 1)) == 0 && vs == 0;
+    const int tot = dd.nd * NG;
+    #pragma unroll 1
+    for (int gw = blockIdx.x * 8 + wave; gw < tot; gw += nw) {
+        // Shift task order when tot > nw so multi-pass (pc > 4) experts at u = 0.. land
+        // on single-task waves [tot - nw, nw) instead of two-task waves [0, tot - nw).
+        const int idx = tot > nw ? (gw + nw) % tot : gw;
+        const int u = idx / NG, g = idx % NG;
+        const int e = __builtin_amdgcn_readfirstlane(dd.dex[u]);
+        const unsigned mk = __builtin_amdgcn_readfirstlane(dd.dmk[u]);
+        const size_t r0 = (size_t) e * FFE + (size_t) g * 64;
+        unsigned rem_mk = mk;
+        #pragma unroll 1
+        do {
+            int p0 = 0, p1 = 0, p2 = 0, p3 = 0, n1 = 0;
+            if (rem_mk) { p0 = __builtin_amdgcn_readfirstlane(__ffs(rem_mk) - 1); rem_mk &= rem_mk - 1; n1 = 1; }
+            if (rem_mk) { p1 = __builtin_amdgcn_readfirstlane(__ffs(rem_mk) - 1); rem_mk &= rem_mk - 1; n1 = 2; }
+            if (rem_mk) { p2 = __builtin_amdgcn_readfirstlane(__ffs(rem_mk) - 1); rem_mk &= rem_mk - 1; n1 = 3; }
+            if (rem_mk) { p3 = __builtin_amdgcn_readfirstlane(__ffs(rem_mk) - 1); rem_mk &= rem_mk - 1; n1 = 4; }
+            const bool wl1 = wl_base && vr < n1;
+            const int wr1 = vr == 0 ? p0 : vr == 1 ? p1 : vr == 2 ? p2 : p3;
+            v_wbuf A, B;
+            float acc[4][2];
+            v_wload(A, wv, ws, r0, r0 + 32, lane);
+            #pragma unroll 1
+            for (int a = 0; a < 32; a += 2) {
+                v_wload(B, wv, ws, r0 + a + 1, r0 + a + 33, lane);
+                float val = v_wdot_r4(A, la, ls, p0, p1, p2, p3, lane, acc), upv = __shfl_down(val, LV, 64);
+                if (wl1) lq[wr1 * 32 + a] = situ_v(val, upv, beta, lb);
+                v_wload(A, wv, ws, r0 + min(a + 2, 31), r0 + min(a + 2, 31) + 32, lane);
+                val = v_wdot_r4(B, la, ls, p0, p1, p2, p3, lane, acc); upv = __shfl_down(val, LV, 64);
+                if (wl1) lq[wr1 * 32 + a + 1] = situ_v(val, upv, beta, lb);
+            }
+        } while (rem_mk);
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+        unsigned rem = mk;
+        while (rem) {
+            const int ra = __ffs(rem) - 1;
+            rem &= rem - 1;
+            const int rb = rem ? __ffs(rem) - 1 : -1;
+            if (rb >= 0) rem &= rem - 1;
+            const int r = (lane >> 5) ? rb : ra;
+            if (r >= 0) {
+                const int k = v_slot(sids, r, e);
+                quant32(lq[r * 32 + (lane & 31)], hq0 + (size_t) r * rs + k * FFL, hs0 + (size_t) r * rsf + k * (FFL / 32), g * 32 + (lane & 31));
+            }
+        }
+        __builtin_amdgcn_wave_barrier();
     }
 }
 // the down rows over the distinct experts, c_moe_down_q's quads and per-(row, slot) values.
@@ -1133,7 +1225,8 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
             ((float *) ((char *) Av.WTS + (size_t) r * rs))[k] = swts[tid];
         }
         v_distinct(sids, dd, tid, nr);
-        v_by_rows(nr, [&](auto t) { v_up_dd<decltype(t)::value>(e0->guv, e0->gus, sids, dd, Av.aq3, Av.as3, Av.beta, Av.lb, Av.hq, Av.hs, tid, rs, rsf, nr); });
+        if (nr <= 2) v_up_dd<2>(e0->guv, e0->gus, sids, dd, Av.aq3, Av.as3, Av.beta, Av.lb, Av.hq, Av.hs, tid, rs, rsf, nr);
+        else v_up_dd_r4(e0->guv, e0->gus, sids, dd, Av.aq3, Av.as3, Av.beta, Av.lb, Av.hq, Av.hs, tid, rs, rsf, nr);
         cyc_barrier(vbst, ++kb);
         ++xs;
         v_down_dd(e0->dnv, e0->dns, sids, swts, dd, Av.hq, Av.hs, Av.PART1, Av.xin_peer + 2 * D + (size_t) (xs & 1) * VR * D,
@@ -1174,13 +1267,24 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         v_by_rows(nr, [&](auto tc) {   // the T-row head GEMV, c_head_gemv's rows and values, softcap on rows < nvalid
             constexpr int T = decltype(tc)::value;
             const int N = Vp->A.hg.N, NV = Vp->A.nvalid;
-            const int rsf_ = rsf;
+            unsigned char * la = (unsigned char *) cyc_lds;
+            float * ls = (float *) (la + T * D);
+            __syncthreads();
+            for (int i = tid_k; i < T * D / 16; i += 512) {
+                const int r = i / (D / 16), c = i % (D / 16);
+                ((uint4 *) la)[i] = *(const uint4 *) (qz_gp(Vp->A.hg.av) + (size_t) r * rs + c * 16);
+            }
+            for (int i = tid_k; i < T * (D / 32); i += 512) {
+                const int r = i / (D / 32), c = i % (D / 32);
+                ls[i] = qz_gp(Vp->A.hg.as)[(size_t) r * rsf + c];
+            }
+            __syncthreads();
             constexpr int S_ = 4;
             for (int gg = blockIdx.x; gg * (8 * S_) < N; gg += nb) {
                 const int r0 = gg * (8 * S_) + wave * S_;
                 float acc[T][S_];
-                v_core_acc<T, S_>(Vp->A.hg.av, Vp->A.hg.as, (int) rs, rsf_, Vp->A.hg.K / 32,
-                                  Vp->A.hg.wv, Vp->A.hg.ws, Vp->A.hg.K, Vp->A.hg.K / 32, N, r0, lane, acc);
+                v_core_acc<T, S_>(la, ls, D, D / 32, D / 32,
+                                  Vp->A.hg.wv, Vp->A.hg.ws, D, D / 32, N, r0, lane, acc);
                 constexpr int NVv = T * S_;
                 float (&fv)[NVv] = *(float (*)[NVv]) &acc[0][0];
                 const float val = v_tsum<NVv>(fv, lane);

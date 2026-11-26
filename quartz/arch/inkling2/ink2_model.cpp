@@ -282,7 +282,7 @@ struct ink2_ctx : qz_ctx {
         // adjacent verify tier to refresh its estimate. QZ_DS_ROWS=2..8 fixes n (read per call).
         const char * e_rows = getenv("QZ_DS_ROWS");
         const int rows_fixed = e_rows && *e_rows ? atoi(e_rows) : 0;
-        static constexpr double RT_SEED[VR + 1] = { 0.0, 0.0, 0.50, 0.58, 0.63, 0.82, 0.89, 0.95, 1.00 };
+        static constexpr double RT_SEED[VR + 1] = { 0.0, 0.0, 0.51, 0.61, 0.66, 0.84, 0.90, 0.95, 1.00 };
         static double rt_ms[VR + 1] = {0};               // per n round time (ms), across requests
         static int rt_n[VR + 1] = {0};                   // its samples
         static int rt_pos = -(1 << 30);                  // position of the current rt_ms table
