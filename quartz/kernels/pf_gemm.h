@@ -279,6 +279,46 @@ __global__ void __launch_bounds__(256) pf_addnorm_quant(
     }
 }
 
+// pf_addnorm_quant for four cards: x += (p0 + p1) + (p2 + p3), the partials in card order
+template <int DM>
+__global__ void __launch_bounds__(256) pf_addnorm_quant4(
+        float * __restrict__ x, const unsigned short * __restrict__ p0, const unsigned short * __restrict__ p1,
+        const unsigned short * __restrict__ p2, const unsigned short * __restrict__ p3, int n,
+        const float * __restrict__ w, float eps, int8_t * Ag, float * sag, int Mp, float * outf, int m0 = 0) {
+    __shared__ float red[8];
+    const int m = m0 + blockIdx.x, t = threadIdx.x;
+    float * xr = x + (size_t) m * DM;
+    constexpr int NE = DM / 256;
+    float xv[NE];
+    float ss = 0.f;
+    if (m < n) {
+        const size_t r = (size_t) m * DM;
+#pragma unroll
+        for (int j = 0; j < NE; j++) {
+            const int k = t + 256 * j;
+            const float v = xr[k] + ((pf_ld_part(p0 + r, k) + pf_ld_part(p1 + r, k)) + (pf_ld_part(p2 + r, k) + pf_ld_part(p3 + r, k)));
+            xr[k] = v;
+            xv[j] = v;
+            ss = __builtin_fmaf(v, v, ss);
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < NE; j++) { xv[j] = xr[t + 256 * j]; ss = __builtin_fmaf(xv[j], xv[j], ss); }
+    }
+#pragma unroll
+    for (int off = 32; off > 0; off >>= 1) ss += __shfl_down(ss, off, 64);
+    if ((t & 63) == 0) red[t >> 6] = ss;
+    __syncthreads();
+    const float r = 1.f / sqrtf((red[0] + red[1] + red[2] + red[3]) / DM + eps);
+#pragma unroll
+    for (int j = 0; j < NE; j++) {
+        const int k = t + 256 * j;
+        const float y = xv[j] * r * w[k];
+        if (outf) outf[(size_t) m * DM + k] = y;
+        if (Ag) pf_quant_unit(y, k, m, Mp, Ag, sag, t & 31);
+    }
+}
+
 // quantizes rows of y, which has row stride ldy
 static __global__ void __launch_bounds__(256) pf_quant(const float * __restrict__ y, int ldy, int K, int8_t * Ag, float * sag, int Mp, int m0 = 0) {
     const int m = m0 + blockIdx.x;

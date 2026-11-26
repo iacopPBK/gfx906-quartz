@@ -486,7 +486,8 @@ struct qz_prefill {
               * hn = nullptr, * cat = nullptr,
               * edge = nullptr;   // [recurrent layer][3][PF_CCH]: half 0's last three qkv rows, half 1's conv window
         int8_t * aq = nullptr, * aq2 = nullptr; float * as = nullptr, * as2 = nullptr;   // grouped int8 GEMM input and scales, two sets for ffn in and out
-        void * pl[2] = {}, * pr[2] = {};                 // partials, bf16 or f32: this card's own, the peer's written by its GEMM
+        void * pl[2] = {}, * pr[2][QZ_NC - 1] = {};      // partials, bf16 or f32: this card's own, and slot k - 1 from card
+                                                         // (card + k) % NC (at two cards written by the peer's GEMM)
         __half * q16 = nullptr;
         int32_t * tok = nullptr;
         int * irow = nullptr, * rpos = nullptr;          // a chunk's image rows and rope positions (qz_mm_view)
@@ -507,8 +508,9 @@ struct qz_prefill {
                  { (void **) &k.aq2, M * 2 * PF_D }, { (void **) &k.as2, M * 2 * PF_D / 32 * 4 },
                  { (void **) &k.hn, M * PF_D * 4 }, { (void **) &k.cat, M * 2 * PF_D * 4 },
                  { (void **) &k.q16, M * PF_HQ * PF_HD * 2 }, { (void **) &k.tok, M * 4 }, { (void **) &k.edge, (size_t) 64 * 3 * PF_CCH * 4 },
-                 { &k.pl[0], pb }, { &k.pr[0], pb }, { &k.pl[1], pb }, { &k.pr[1], pb },
+                 { &k.pl[0], pb }, { &k.pr[0][0], pb }, { &k.pl[1], pb }, { &k.pr[1][0], pb },
                  { (void **) &k.irow, M * 4 }, { (void **) &k.rpos, M * 3 * 4 } };
+        for (int j = 1; j < QZ_NC - 1; j++) { v.push_back({ &k.pr[0][j], pb }); v.push_back({ &k.pr[1][j], pb }); }
         return v;
     }
     static size_t rows(int max_rows) { return (size_t) ((max_rows + PF_MT - 1) / PF_MT * PF_MT + PF_MT); }
@@ -567,8 +569,9 @@ struct qz_prefill {
         hipLaunchKernelGGL(pf_gemm<0>, dim3((N + 63) / 64, H.nty), dim3(256), 0, hs(e, i, h), A ? A : c[i].aq, As ? As : c[i].as, Mp,
                            W, sw, K, K, C, ldc, N, H.ty0, 0);
     }
-    // Row-parallel projection. Each card writes its bf16 partial locally and to the peer.
-    // The next norm() applies x += p0 + p1. Two partial sets alternate.
+    // Row-parallel projection. Each card writes its bf16 partial locally and to the peers.
+    // The next norm() applies x += the partials in card order. Two partial sets alternate.
+    // At more than two cards every partial goes by copy (below), one per peer.
     // Reaching the peer: under p2p the GEMM's C2 epilogue stores straight into its VRAM.
     // In host mode it cannot, so the GEMM writes only the local pl and one staged copy per
     // card moves the tile-aligned rows into the peer's pr, which its owner then reads
@@ -579,23 +582,27 @@ struct qz_prefill {
         const half & H = hv[h];
         hset[h] ^= 1;
         const int s_ = hset[h];
-        const bool xc = qz_link == QZ_LINK_HOST;   // partial by copy, no peer store
-        for (int i = 0; i < 2; i++) {
+        const bool xc = qz_link == QZ_LINK_HOST || QZ_NC > 2;   // partials by copy, no peer store
+        for (int i = 0; i < QZ_NC; i++) {
             CHECK(hipSetDevice(qz_dev_of(i)));
             hipLaunchKernelGGL(pf_gemm<0>, dim3(PF_D / 64, H.nty), dim3(256), 0, hs(e, i, h), ffn ? c[i].aq2 : c[i].aq, ffn ? c[i].as2 : c[i].as, Mp, W[i], sw[i],
                                K, K, (float *) c[i].pl[s_], PF_D, PF_D, H.ty0, 1,
-                               xc ? (unsigned short *) nullptr : (unsigned short *) c[1 - i].pr[s_]);
+                               xc ? (unsigned short *) nullptr : (unsigned short *) c[(i + 1) % QZ_NC].pr[s_][0]);
             CHECK(hipEventRecord(evx[i][h], hs(e, i, h)));
         }
         if (xc) {
-            // the rows this half's GEMM wrote, straight into the peer's pr: the source is
-            // this card's stream, the destination the peer's, and evc says it has landed
+            // the rows this half's GEMM wrote, into each peer's pr slot: the source is this
+            // card's stream, the destination the peer's, and evc says they have landed
             const size_t off = (size_t) H.r0 * PF_D * 2, nb = (size_t) (H.rp - H.r0) * PF_D * 2;
-            for (int i = 0; i < 2; i++) {
-                CHECK(qz_xcopy((char *) c[1 - i].pr[s_] + off, 1 - i, hs(e, 1 - i, h),
-                               (const char *) c[i].pl[s_] + off, i, hs(e, i, h), nb));
-                CHECK(hipSetDevice(qz_dev_of(1 - i)));
-                CHECK(hipEventRecord(evc[1 - i][h], hs(e, 1 - i, h)));
+            for (int i = 0; i < QZ_NC; i++)
+                for (int k = 1; k < QZ_NC; k++) {
+                    const int p = (i + k) % QZ_NC;
+                    CHECK(qz_xcopy((char *) c[p].pr[s_][QZ_NC - 1 - k] + off, p, hs(e, p, h),
+                                   (const char *) c[i].pl[s_] + off, i, hs(e, i, h), nb));
+                }
+            for (int p = 0; p < QZ_NC; p++) {
+                CHECK(hipSetDevice(qz_dev_of(p)));
+                CHECK(hipEventRecord(evc[p][h], hs(e, p, h)));
             }
         }
         hpn[h] = 1;
@@ -608,13 +615,21 @@ struct qz_prefill {
         hipStream_t st = st_ ? st_ : hs(e, i, h);
         const int r1 = rows_end >= 0 ? rows_end : H.rp;
         if (hpn[h]) {
-            CHECK(hipStreamWaitEvent(st, evx[1 - i][h], 0));
-            if (qz_link == QZ_LINK_HOST)   // the peer's partial arrived by copy
+            for (int j = 1; j < QZ_NC; j++) CHECK(hipStreamWaitEvent(st, evx[(i + j) % QZ_NC][h], 0));
+            if (qz_link == QZ_LINK_HOST || QZ_NC > 2)   // the peers' partials arrived by copy
                 CHECK(hipStreamWaitEvent(st, evc[i][h], 0));
             const int s_ = hset[h];
-            const void * p0 = i == 0 ? k.pl[s_] : k.pr[s_], * p1 = i == 0 ? k.pr[s_] : k.pl[s_];
-            hipLaunchKernelGGL(pf_addnorm_quant<PF_D>, dim3(r1 - H.r0), dim3(256), 0, st, k.x, (const unsigned short *) p0,
-                               (const unsigned short *) p1, H.r1, w, e.eps, Ag, k.as, Mp, outf, H.r0);
+            const unsigned short * pp[QZ_NC];            // the partials in card order
+            for (int j = 0; j < QZ_NC; j++) {
+                const int kk = (j - i + QZ_NC) % QZ_NC;
+                pp[j] = (const unsigned short *) (kk ? k.pr[s_][kk - 1] : k.pl[s_]);
+            }
+            if constexpr (QZ_NC == 2)
+                hipLaunchKernelGGL(pf_addnorm_quant<PF_D>, dim3(r1 - H.r0), dim3(256), 0, st, k.x, pp[0],
+                                   pp[1], H.r1, w, e.eps, Ag, k.as, Mp, outf, H.r0);
+            else
+                hipLaunchKernelGGL(pf_addnorm_quant4<PF_D>, dim3(r1 - H.r0), dim3(256), 0, st, k.x, pp[0], pp[1], pp[QZ_NC > 2 ? 2 : 0],
+                                   pp[QZ_NC > 3 ? 3 : 0], H.r1, w, e.eps, Ag, k.as, Mp, outf, H.r0);
         } else {
             hipLaunchKernelGGL(pf_norm_quant, dim3(r1 - H.r0), dim3(256), 0, st, k.x, PF_D, w, e.eps, PF_D, Ag, k.as, Mp, outf, H.r0);
         }
@@ -623,11 +638,11 @@ struct qz_prefill {
     void wait(qz_engine & e, int i, int h, int kind) { CHECK(hipStreamWaitEvent(hs(e, i, h), evh[i][kind], 0)); }
 
     // Stage the image rows and rope positions of positions first .. first + R - 1 into
-    // the given card's irow and rpos, on its main stream; card -1 means both cards.
+    // the given card's irow and rpos, on its main stream; card -1 means every card.
     void mm_stage(qz_engine & e, const qz_mm_view * mm, int first, int R, int card = -1) {
         mm_irow.resize(R); mm_rpos.resize((size_t) R * 3);
         for (int r = 0; r < R; r++) { mm_irow[r] = mm->img(first + r); mm->rope(first + r, &mm_rpos[(size_t) r * 3]); }
-        for (int i = card < 0 ? 0 : card; i < (card < 0 ? 2 : card + 1); i++) {
+        for (int i = card < 0 ? 0 : card; i < (card < 0 ? QZ_NC : card + 1); i++) {
             CHECK(hipSetDevice(qz_dev_of(i)));
             CHECK(hipMemcpyAsync(c[i].irow, mm_irow.data(), (size_t) R * 4, hipMemcpyHostToDevice, e.C[i].st));
             CHECK(hipMemcpyAsync(c[i].rpos, mm_rpos.data(), (size_t) R * 12, hipMemcpyHostToDevice, e.C[i].st));

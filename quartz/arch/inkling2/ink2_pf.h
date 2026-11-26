@@ -477,18 +477,33 @@ static __global__ __launch_bounds__(16 * FA_R / RPT) void k_pf_fattn(pfat a, int
 
 // The short conv along the chunk rows, folded into the x update. push moves x into a
 // fresh residual block, otherwise the conv is added to x. Row t reads rows t-1..t-3 or
-// the slot's conv history, and u = own + peer is the TP2 sum, the peer's partial read from
-// this card's inbox (PARTP). One thread per column walks CV_R rows, so each input is read
-// once.
-struct pfcv { const float * own, * peer; const float * w; float * hrg; float * x, * blk; int m, push; };
+// the slot's conv history, and u is the sum of every card's partial in card order (p[j]:
+// card j's, this card's own PART or its inbox copy PARTP of the others'). One thread per
+// column walks CV_R rows, so each input is read once.
+struct pfparts { const float * p[QZ_NC]; };
+// Card-order sum of the partials at o (TP2: p0 + p1; TP4: (p0 + p1) + (p2 + p3)). p[1]
+// null: a single source (K and V commits).
+static __device__ __forceinline__ float pf_psum(const pfparts & P, size_t o) {
+    if (!P.p[1]) return P.p[0][o];
+#if QZ_NC == 4
+    return (P.p[0][o] + P.p[1][o]) + (P.p[2][o] + P.p[3][o]);
+#else
+    return P.p[0][o] + P.p[1][o];
+#endif
+}
+struct pfcv { pfparts P; const float * w; float * hrg; float * x, * blk; int m, push; };
 constexpr int CV_R = 32;
 static __global__ __launch_bounds__(256) void k_pf_conv2(pfcv a) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x, r0 = blockIdx.y * CV_R;
     if (i >= D) return;
-    const float * p0 = a.own, * p1 = a.peer;
     auto in = [&](int r) {   // input at chunk row r (r < 0: history row 3 + r)
         if (r < 0) return a.hrg[(size_t)(r + 3) * CHL + i];
-        return p0[(size_t) r * D + i] + p1[(size_t) r * D + i];
+#if QZ_NC == 4
+        const size_t o = (size_t) r * D + i;
+        return (a.P.p[0][o] + a.P.p[1][o]) + (a.P.p[2][o] + a.P.p[3][o]);
+#else
+        return a.P.p[0][(size_t) r * D + i] + a.P.p[1][(size_t) r * D + i];
+#endif
     };
     float v3 = in(r0 - 3), v2 = in(r0 - 2), v1 = in(r0 - 1);
     const float * wi = a.w + (size_t) i * NCONV;
@@ -505,8 +520,8 @@ static __global__ __launch_bounds__(256) void k_pf_conv2(pfcv a) {
 }
 
 // Roll the conv history forward: its 3 rows become the chunk's last inputs, and rows
-// below the chunk start come from the old history. peer is null for K and V.
-static __global__ __launch_bounds__(256) void k_pf_commit(const float * src, const float * peer, float * hrg, int w, int m) {
+// below the chunk start come from the old history. K and V have one source (P.p[1] null).
+static __global__ __launch_bounds__(256) void k_pf_commit(pfparts P, float * hrg, int w, int m) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= w) return;
     float v[3];
@@ -514,7 +529,7 @@ static __global__ __launch_bounds__(256) void k_pf_commit(const float * src, con
     for (int r = 0; r < 3; r++) {
         const int idx = m - 3 + r;
         v[r] = idx < 0 ? hrg[(size_t)(idx + 3) * CHL + c]
-             : src[(size_t) idx * w + c] + (peer ? peer[(size_t) idx * w + c] : 0.f);
+             : pf_psum(P, (size_t) idx * w + c);
     }
     #pragma unroll
     for (int r = 0; r < 3; r++) hrg[(size_t) r * CHL + c] = v[r];
@@ -872,7 +887,7 @@ struct pf_card {
     float * MSG, * CT, * Z;            // [4][PF_M][D], [4][PF_M][D], [4][PF_M][2D]
     float * Gb;                        // [4][PF_M][GRANK]
     float * F, * FN, * PART[2];        // [PF_M][D]
-    float * PARTP[2];                  // the peer's PART[buf], pushed here by the peer
+    float * PARTP[2][QZ_NC - 1];       // the other cards' PART[buf], pushed here: slot k-1 holds peer (me+k)%NC's
     float * QR, * GR, * Q, * RR, * SK, * KR, * VR, * DK, * DV, * TB;
     pf_plane INP[3], FF, AT;           // input planes (K = D), ffn (K = D), attn output (K = QL)
     unsigned char * APQ; float * APS;  // per-pair situ planes [PF_NP][FFL], [PF_NP][FFL/32]
@@ -990,7 +1005,7 @@ struct ink2_pf {
         // forward peer writes but not peer reads, and a peer read there takes both cards
         // down. So each card keeps a copy of the peer's two alternated slots in its own
         // VRAM, filled by qz_xcopy in layer().
-        for (auto & q : b.PARTP) {
+        for (auto & sl : b.PARTP) for (auto & q : sl) {
             if (qz_dmalloc((void **) &q, (size_t) PF_M * D * 4, "state") != hipSuccess) {
                 fprintf(stderr, "inkling2: card %d: no room for the %.2f MB prefill inbox\n", c, (double) PF_M * D * 4 / 1e6);
                 return false;
@@ -1015,13 +1030,22 @@ struct ink2_pf {
     void normq(int c, const float * x, const float * w, pf_plane & pl, int m) {
         pf_norm_quant<<<m, 256, 0, E->C[c].st>>>(x, D, w, E->hp.eps, D, (int8_t *) pl.q, pl.s, PF_M, nullptr, 0);
     }
-    void commit(int c, const float * src, const float * peer, float * hrg, int w, int m) {
+    void commit(int c, const pfparts & P, float * hrg, int w, int m) {
         hipStream_t st = E->C[c].st;
-        k_pf_commit<<<(w + 255) / 256, 256, 0, st>>>(src, peer, hrg, w, m);
+        k_pf_commit<<<(w + 255) / 256, 256, 0, st>>>(P, hrg, w, m);
     }
-    // The other card's half of a partial: this card's copy (PARTP[buf]), which push_part()
-    // filled from the peer.
-    const float * peer_part(int c, int buf) const { return B[c].PARTP[buf]; }
+    void commit(int c, const float * src, float * hrg, int w, int m) {
+        pfparts P{}; P.p[0] = src;
+        commit(c, P, hrg, w, m);
+    }
+    // Every card's partial PART[buf] in card order, as card c sees it: its own, and its
+    // inbox copies (PARTP[buf]) of the others', which push_part() filled.
+    pfparts parts(int c, int buf) const {
+        pfparts P{};
+        P.p[c] = B[c].PART[buf];
+        for (int k = 1; k < QZ_NC; k++) P.p[(c + k) % QZ_NC] = B[c].PARTP[buf][k - 1];
+        return P;
+    }
     // Hand both cards' PART[buf] to their peer's inbox, after both cards' GEMMs
     // have been queued (a separate pass on purpose: the H2D goes on the peer's stream, so
     // queuing it inside the GEMM loop would park it in front of the peer's own GEMM for the
@@ -1032,9 +1056,12 @@ struct ink2_pf {
     // in program order and where its previous reader of the same alternated slot was
     // queued, so the slot's WAR is the stream's own.
     void push_part(int buf, int m) {
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < QZ_NC; c++) {
             ICHECK(hipSetDevice(qz_dev_of(c)));
-            ICHECK(qz_xcopy(B[1 - c].PARTP[buf], 1 - c, E->C[1 - c].st, B[c].PART[buf], c, E->C[c].st, (size_t) m * D * 4));
+            for (int k = 1; k < QZ_NC; k++) {   // card (c+k)%NC sees c as its peer NC-k: slot NC-k-1
+                const int d = (c + k) % QZ_NC;
+                ICHECK(qz_xcopy(B[d].PARTP[buf][QZ_NC - 1 - k], d, E->C[d].st, B[c].PART[buf], c, E->C[c].st, (size_t) m * D * 4));
+            }
         }
     }
 
@@ -1158,8 +1185,8 @@ struct ink2_pf {
             h.tau_a = E.hp.tau_alpha; h.tau_f = E.hp.tau_floor;
             h.qk_clip = E.hp.qk_clip; h.rel_clip = E.hp.rel_clip; h.eps = E.hp.eps;
             k_pf_head_post<<<dim3(HQL + 2 * HKVL, m), 128, 0, st>>>(h);
-            commit(c, b.KR, nullptr, h.hist + H_K, KVL, m);
-            commit(c, b.VR, nullptr, h.hist + H_V, KVL, m);
+            commit(c, b.KR, h.hist + H_K, KVL, m);
+            commit(c, b.VR, h.hist + H_V, KVL, m);
             // attention, then attn_output; rows are split, so each card keeps a partial
             pfat t{};
             t.q = b.Q; t.gate = b.GR; t.kc = K.kc[slot]; t.vc = K.vc[slot];
@@ -1178,11 +1205,11 @@ struct ink2_pf {
             const lw & L = K.L[ip];
             hipStream_t st = K.st;
             pfcv ca{};
-            ca.own = b.PART[buf]; ca.peer = peer_part(c, buf); ca.w = L.pconv;
+            ca.P = parts(c, buf); ca.w = L.pconv;
             ca.hrg = K.hist + (size_t) slot * 3 * CHL + H_A;
             ca.x = b.X; ca.blk = push >= 0 ? b.BLK[push] : nullptr; ca.m = m; ca.push = push >= 0;
             k_pf_conv2<<<dim3((D + 255) / 256, (m + CV_R - 1) / CV_R), 256, 0, st>>>(ca);
-            commit(c, b.PART[buf], ca.peer, ca.hrg, D, m);
+            commit(c, ca.P, ca.hrg, D, m);
         }
         if (push >= 0) { S.blocks.push_back(push); S.nblk++; }
         const int buf2 = bnx & 1;
@@ -1238,11 +1265,11 @@ struct ink2_pf {
             const lw & L = K.L[ip];
             hipStream_t st = K.st;
             pfcv cf{};
-            cf.own = b.PART[buf2]; cf.peer = peer_part(c, buf2); cf.w = L.fconv;
+            cf.P = parts(c, buf2); cf.w = L.fconv;
             cf.hrg = K.hist + (size_t) slot * 3 * CHL + H_F;
             cf.x = b.X; cf.blk = nullptr; cf.m = m; cf.push = 0;
             k_pf_conv2<<<dim3((D + 255) / 256, (m + CV_R - 1) / CV_R), 256, 0, st>>>(cf);
-            commit(c, b.PART[buf2], cf.peer, cf.hrg, D, m);
+            commit(c, cf.P, cf.hrg, D, m);
         }
     }
 
