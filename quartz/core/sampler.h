@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "capi.h"
+#include "core/devices.h"   // QZ_NC_MAX
 #include "kernels/topk.h"
 
 // Sampled decode: llama.cpp's sampler chain, with order codes 2 top-k, 3 top-p, 4 min-p
@@ -32,7 +33,7 @@ struct qz_sampler {
     const qz_sampling * smp = nullptr;   // null: greedy
     std::mt19937 rng;
     int ncard = 2;                       // cards whose candidates tk[c] holds
-    std::vector<float2> tk[2];           // per card [rows][QZ_TOPK_NB][QZ_TOPK] (logit, id bits)
+    std::vector<float2> tk[QZ_NC_MAX];           // per card [rows][QZ_TOPK_NB][QZ_TOPK] (logit, id bits)
     std::vector<std::pair<float, int>> cand;
     void set(const qz_sampling * s) { smp = s; if (s) rng.seed(s->seed); }
     int sample_row(int t);

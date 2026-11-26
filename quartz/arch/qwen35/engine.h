@@ -157,6 +157,7 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
     qz_gguf g;
     if (!g.open(path)) { fprintf(stderr, "cannot open %s\n", path); return 1; }
     if (!hp.load(g)) { fprintf(stderr, "not a qwen35 model\n"); return 1; }
+    sam.ncard = QZ_NC;
     if (hp.d_model != D || hp.n_head != HQ || hp.n_kv != HKV || hp.head_dim != HD ||
         hp.q_dim != AQ || hp.n_ff != FF || hp.n_layer != 64 || hp.n_attn != 16 || hp.n_recr != 48 ||
         hp.n_vocab % 64 != 0) {

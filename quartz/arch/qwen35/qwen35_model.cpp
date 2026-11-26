@@ -122,7 +122,9 @@ static void qz_pf_setup(q35_ctx * c) {
             cs.live[i] = c->eng.C[i].cs_all; cs.stage[i] = c->scs[i];
         }
         CHECK(hipSetDevice(qz_dev_of(0)));
-        c->pc.init({ dn, cs }, 8, c->eng.C[0].st, c->eng.C[1].st);
+        hipStream_t ps[QZ_NC];
+        for (int i = 0; i < QZ_NC; i++) ps[i] = c->eng.C[i].st;
+        c->pc.init({ dn, cs }, 8, ps, QZ_NC);
     }
     CHECK(hipSetDevice(qz_dev_of(0)));
 }

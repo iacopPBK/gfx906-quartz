@@ -6,6 +6,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include "core/devices.h"   // QZ_NC_MAX
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -17,8 +19,8 @@
 #include "mem.h"
 
 struct qz_blob {
-    void * live[2] = {};    // per card: the state the engine runs on
-    void * stage[2] = {};   // per card: the prefill's mid-chunk copy (null: none)
+    void * live[QZ_NC_MAX] = {};    // per card: the state the engine runs on
+    void * stage[QZ_NC_MAX] = {};   // per card: the prefill's mid-chunk copy (null: none)
     size_t bytes = 0;       // per card
 };
 
@@ -27,7 +29,7 @@ public:
     struct slot {
         int pos = -1;                  // state after prompt row pos - 1 (-1: empty)
         unsigned long use = 0;
-        std::vector<void *> host[2];   // per card, one buffer per blob
+        std::vector<void *> host[QZ_NC_MAX];   // per card, one buffer per blob
     };
     std::vector<qz_blob> blobs;
     std::vector<slot> slots;
@@ -35,11 +37,13 @@ public:
     unsigned long clock = 0;
     int head = -1;                     // the first message's end: kept while prompts match it
     int ncard = 2;
-    hipStream_t st[2] = {};
+    hipStream_t st[QZ_NC_MAX] = {};
 
     // n slots, every blob's host buffers allocated up front
-    void init(const std::vector<qz_blob> & b, int n, hipStream_t s0, hipStream_t s1) {
-        blobs = b; st[0] = s0; st[1] = s1;
+    // nc cards, s[c] the stream of card c
+    void init(const std::vector<qz_blob> & b, int n, const hipStream_t * s, int nc) {
+        blobs = b; ncard = nc;
+        for (int c = 0; c < nc; c++) st[c] = s[c];
         slots.resize(n);
         for (auto & sn : slots) alloc(sn);
     }

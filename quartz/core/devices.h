@@ -18,7 +18,8 @@
 #include <vector>
 
 inline constexpr int qz_dev_max = 8;     // the ledger's table size (QZ_MEM_CARDS)
-inline int qz_dev[2] = { 0, 1 };          // card index -> HIP ordinal
+inline constexpr int QZ_NC_MAX = 4;      // the most cards a tensor-parallel group has (shared arrays' size)
+inline int qz_dev[QZ_NC_MAX] = { 0, 1 }; // card index -> HIP ordinal
 inline bool qz_dev_chosen = false;
 
 enum qz_link_mode { QZ_LINK_P2P, QZ_LINK_HOST };

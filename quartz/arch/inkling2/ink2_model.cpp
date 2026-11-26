@@ -171,14 +171,14 @@ struct ink2_ctx : qz_ctx {
         if (n_prompt + max_new > E.ctx) { fprintf(stderr, "inkling2: %d + %d tokens exceed the context %d\n", n_prompt, max_new, E.ctx); st.stop = -1; return fin(-1); }
         qz_sampling ms;
         qz_sampler sam;
+        sam.ncard = QZ_NC;
         if (smp) {
             if (!qz_sampling_from_c(smp, ms)) { st.stop = -1; return fin(-1); }
             sam.set(&ms);
         }
         auto pick = [&]() {
             if (!sam.smp) return E.greedy();
-            sam.tk[0] = E.tkh[0];
-            sam.tk[1] = E.tkh[1];
+            for (int c = 0; c < QZ_NC; c++) sam.tk[c] = E.tkh[c];
             return sam.sample_row(0);
         };
         // Speculative sampling of the drafts (core/spec_accept.h): with a sampler above
@@ -479,7 +479,9 @@ static qz_ctx * create(const char * path, const qz_create_opts & o) {
             ICHECK(qz_dmalloc((void **) &c->shist[i], hb.bytes));
             hb.live[i] = c->E.C[i].hist; hb.stage[i] = c->shist[i];
         }
-        c->pc.init({ hb }, 16, c->E.C[0].st, c->E.C[1].st);
+        hipStream_t ps[QZ_NC];
+        for (int i = 0; i < QZ_NC; i++) ps[i] = c->E.C[i].st;
+        c->pc.init({ hb }, 16, ps, QZ_NC);
     }
     if (const char * dp = getenv("QZ_DSPINE")) {   // QZ_DSPINE from the server, a DSpark GGUF
         c->DS.E = &c->E;
