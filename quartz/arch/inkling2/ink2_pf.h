@@ -647,10 +647,7 @@ static __global__ __launch_bounds__(256) void k_pf_conv2(pfcv a) {
 
 // Roll the conv history forward: its 3 rows become the chunk's last inputs, and rows
 // below the chunk start come from the old history. peer is null for K and V; dst may alias hrg.
-__device__ __forceinline__ float pf_to_f32(float x) { return x; }
-__device__ __forceinline__ float pf_to_f32(__half x) { return __half2float(x); }
-template <class T>
-static __global__ __launch_bounds__(256) void k_pf_commit(const T * src, const T * peer, const float * hrg,
+static __global__ __launch_bounds__(256) void k_pf_commit(const float * src, const float * peer, const float * hrg,
                                                           float * dst, int w, int m) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= w) return;
@@ -659,7 +656,7 @@ static __global__ __launch_bounds__(256) void k_pf_commit(const T * src, const T
     for (int r = 0; r < 3; r++) {
         const int idx = m - 3 + r;
         v[r] = idx < 0 ? hrg[(size_t)(idx + 3) * CHL + c]
-             : pf_to_f32(src[(size_t) idx * w + c]) + (peer ? pf_to_f32(peer[(size_t) idx * w + c]) : 0.f);
+             : src[(size_t) idx * w + c] + (peer ? peer[(size_t) idx * w + c] : 0.f);
     }
     #pragma unroll
     for (int r = 0; r < 3; r++) dst[(size_t) r * CHL + c] = v[r];
@@ -1257,7 +1254,6 @@ struct ink2_pf {
         return dgjob{W.v, W.s, (const int8_t *) av, as, C, ldc, (int) W.N, (int) W.K, C2};
     }
     // several dense GEMMs in one launch, up to 8 jobs, packed with zero empty blocks
-    template <bool HALF_OUT = false>
     void dgemm(int c, std::initializer_list<dgjob> js, int m) {
         dgjobs J{};
         int n = 0;
@@ -1268,7 +1264,7 @@ struct ink2_pf {
             n++;
         }
         J.n = n;
-        k_pf_dgemm<HALF_OUT><<<dim3(J.off[n], (m + 63) / 64), 256, 0, E->C[c].st>>>(J, m);
+        k_pf_dgemm<<<dim3(J.off[n], (m + 63) / 64), 256, 0, E->C[c].st>>>(J, m);
     }
     void normq1(int c, const float * x, const float * w, pf_plane & pl, int m, float * outf = nullptr) {
         pfnq A{};
@@ -1283,8 +1279,7 @@ struct ink2_pf {
         for (int j = 0; j < 3; j++) { A.q[j] = (int8_t *) pl[j].q; A.s[j] = pl[j].s; }
         k_pf_normq<<<dim3(m, 3), 256, 0, E->C[c].st>>>(A, E->hp.eps);
     }
-    template <class T>
-    void commit(int c, const T * src, const T * peer, float * hrg, float * shrg, float * ehrg,
+    void commit(int c, const float * src, const float * peer, float * hrg, float * shrg, float * ehrg,
                 int w, int m, int snap, int snap_end) {
         hipStream_t st = E->C[c].st;
         if (shrg && snap > 0) k_pf_commit<<<(w + 255) / 256, 256, 0, st>>>(src, peer, hrg, shrg, w, snap);
@@ -1437,8 +1432,8 @@ struct ink2_pf {
             k_pf_head_post<<<dim3(HQL + 2 * HKVL, (m + HP_R - 1) / HP_R), 128, 0, st>>>(h);
             float * sh = shist[c] ? shist[c] + (size_t) slot * 3 * CHL : nullptr;
             float * eh = ehist[c] ? ehist[c] + (size_t) slot * 3 * CHL : nullptr;
-            commit(c, b.KR, (const float *) nullptr, h.hist + H_K, sh ? sh + H_K : nullptr, eh ? eh + H_K : nullptr, KVL, m, snap, snap_end);
-            commit(c, b.VR, (const float *) nullptr, h.hist + H_V, sh ? sh + H_V : nullptr, eh ? eh + H_V : nullptr, KVL, m, snap, snap_end);
+            commit(c, b.KR, nullptr, h.hist + H_K, sh ? sh + H_K : nullptr, eh ? eh + H_K : nullptr, KVL, m, snap, snap_end);
+            commit(c, b.VR, nullptr, h.hist + H_V, sh ? sh + H_V : nullptr, eh ? eh + H_V : nullptr, KVL, m, snap, snap_end);
             // attention, then attn_output; rows are split, so each card keeps a partial
             pfat t{};
             t.q = b.Q; t.gate = b.GR; t.kc = K.kc[slot]; t.vc = K.vc[slot];
