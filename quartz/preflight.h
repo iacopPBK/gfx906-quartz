@@ -115,10 +115,6 @@ int qz_link_check_host(double timeout_s, double * gbs, double * rt_us);
 inline int qz_link_check() {
     const double timeout_s = 10.0;
     double gbs[16] = {};
-    if (qz_nphys == 1) {   // virtual cards on one GPU: nothing crosses a link
-        fprintf(stderr, "quartz: one GPU (HIP %d), no peer link\n", qz_dev_of(0));
-        return 0;
-    }
     if (qz_link == QZ_LINK_P2P) {
         const int rc = qz_link_check_p2p(timeout_s, gbs);
         // auto: a peer link that fails its check (not a hang: that kernel may still be
