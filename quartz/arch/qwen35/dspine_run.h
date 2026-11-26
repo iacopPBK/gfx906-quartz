@@ -57,7 +57,7 @@ struct qz_dsrun {
         auto hh = [&](int c) { return &eng.C[c].ld.ts[eng.C[c].ld.find("output.weight")]; };
         for (int c = 0; c < QZ_NC; c++) {
             if (qz_ds_ctx_load(cx[c], draft, qz_dev_of(c), c * DS_NKV / QZ_NC, DS_NKV / QZ_NC)) return 1;
-            if (qz_ds_block_load(blk[c], cx[c], draft, emb(c), hh(c))) return 1;
+            if (qz_ds_block_load(blk[c], cx[c], draft, emb(c), hh(c), c)) return 1;
         }
         for (int c = 0; c < QZ_NC; c++) {
             DS_CHECK(hipSetDevice(qz_dev_of(c)));

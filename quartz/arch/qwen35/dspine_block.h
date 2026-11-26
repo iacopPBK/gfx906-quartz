@@ -621,7 +621,7 @@ __global__ void __launch_bounds__(256) ds_rows_l(const float * TG, const float *
 // ----------------------------------------------------------------- host ----
 // the block-pass state on one card; the context rings live in qz_ds_ctx
 struct qz_ds_block {
-    int dev = 0;
+    int dev = 0, card = 0;           // HIP ordinal, and the card index that picks this card's rows
     hipStream_t st = nullptr;
     qz_loader ld;                     // the draft's block, bridge and codebook tensors
     // per-layer Q8 planes
@@ -760,8 +760,9 @@ __global__ void __launch_bounds__(256) ds_tab_gemm(const unsigned char * av, con
 // --------------------------------------------------------- load / free ----
 // loads the block-pass tensors from the draft GGUF, then this card's half of TG / TSV
 inline int qz_ds_block_load(qz_ds_block & d, qz_ds_ctx & cx, const char * draft,
-                            const qz_dev_tensor * emb, const qz_dev_tensor * head_half) {
+                            const qz_dev_tensor * emb, const qz_dev_tensor * head_half, int card) {
     d.dev = cx.dev;
+    d.card = card;
     DS_CHECK(hipSetDevice(d.dev));
     qz_mem_scope mem("dspine");
     qz_gguf g;
@@ -867,7 +868,7 @@ inline int qz_ds_block_load(qz_ds_block & d, qz_ds_ctx & cx, const char * draft,
         DS_CHECK(qz_dmalloc((void **) &d.TSV, (size_t) V2 * 2 * DS_R * 4, "tables"));
         ds_tab_gemm<<<dim3(DS_R / 64, V2 / 64), 256>>>(d.hh_v, d.hh_s, DS_H, d.onorm, d.Wl[DS_FL - 1], d.TG,
                                                          DS_R, DS_H, 1.f);
-        const size_t cro = (size_t) d.dev * V2;       // this card's codebook rows
+        const size_t cro = (size_t) d.card * V2;      // this card's codebook rows
         ds_tab_gemm<<<dim3(2 * DS_R / 64, V2 / 64), 256>>>(d.cb_v + cro * DS_C, d.cb_s + cro * (DS_C / 32), DS_C,
                                                              nullptr, d.Psv, d.TSV, 2 * DS_R, DS_C, 32.f);
         DS_CHECK(hipGetLastError());
