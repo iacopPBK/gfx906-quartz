@@ -475,6 +475,7 @@ int q35_ctx::generate(const int32_t * prompt, int n_prompt, const int * images, 
     c->eng.set_rope_shift(0);
     if (c->ds.on) c->ds.set_rope_shift(0);
     qz_stats_out(c, st, out);
+    QZ_XCK(qz_xck_poll(QZ_NC));
     return rc;
 }
 

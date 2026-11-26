@@ -15,6 +15,7 @@
 
 #include "core/devices.h"    // qz_link, qz_dev_of, qz_dev_max
 #include "mem.h"             // qz_dmalloc_uncached, qz_dfree, the ledger
+#include "core/xcheck.h"      // the fan-out check (check builds)
 
 // A mailbox both cards read and write, zeroed, valid on `card` and on its peer: uncached
 // VRAM on the current device (a peer's stores must land in HBM, not behind this card's L2)
@@ -113,8 +114,10 @@ inline hipStream_t qz_xdst(hipStream_t s_consumer) { return qz_link == QZ_LINK_H
 // dst and src are card indices (core/devices.h), the streams belong to those cards. The
 // p2p path adds nothing when s_dst is null: only the peer copy runs, on s_src.
 inline hipError_t qz_xcopy(void * dst, int dst_card, hipStream_t s_dst,
-                           const void * src, int src_card, hipStream_t s_src, size_t bytes) {
+                           const void * src, int src_card, hipStream_t s_src, size_t bytes,
+                           const char * file = __builtin_FILE(), int line = __builtin_LINE()) {
     if (!bytes) return hipSuccess;
+    if (dst_card != src_card) qz_xck_copy(src_card, dst_card, s_src, file, line);
     if (src_card < 0 || src_card >= qz_dev_max || dst_card < 0 || dst_card >= qz_dev_max) return hipErrorInvalidDevice;
     const int dst_dev = qz_dev_of(dst_card), src_dev = qz_dev_of(src_card);
     int dev0 = 0;

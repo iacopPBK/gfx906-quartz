@@ -574,8 +574,10 @@ __device__ __forceinline__ void qz_mtp_pass(
                 const unsigned int tok = xs + 1;
                 const int gid = i0 + A.tp_card * A.hrows;
                 #pragma unroll
-                for (int k = 0; k < QZ_NC - 1; k++)
+                for (int k = 0; k < QZ_NC - 1; k++) {
+                    QZ_XCK(qz_xck_store(A.tp_card, k + 1, XS_HM_MTP));
                     *(float2 *) (A.xhm_px[k] + (size_t)(tok & 1) * QZ_TMAX * 2) = make_float2(b0, __int_as_float(gid));
+                }
                 qz_xflag(A, tok);
                 qz_xwait(A, tok);
                 int best = gid;
@@ -846,9 +848,12 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
             A.y_part[2 * blockIdx.x] = b0;
             A.y_part[2 * blockIdx.x + 1] = __int_as_float(gid);
             #pragma unroll
-            for (int k = 0; k < QZ_NC - 1; k++)
+            for (int k = 0; k < QZ_NC - 1; k++) {
+                QZ_XCK(qz_xck_store(A.tp_card, k + 1, XS_HM_CYC));
                 *(float2 *)(A.xhm_px[k] + (size_t)(htok & 1) * QZ_TMAX * 2 + 2 * blockIdx.x) = make_float2(b0, __int_as_float(gid));
+            }
             __threadfence_system();
+            QZ_XCK(qz_xck_end(A.tp_card));
         }
     }
     // Greedy verify: accept rows while row t's argmax equals row t+1's draft. The next

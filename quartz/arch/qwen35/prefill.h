@@ -605,6 +605,7 @@ struct qz_prefill {
                 CHECK(hipStreamWaitEvent(c[i].cps, evx[i][h], 0));
                 for (int k = 1; k < QZ_NC; k++) {
                     const int p = (i + k) % QZ_NC;
+                    qz_xck_copy(i, p, c[i].cps, __FILE__, __LINE__);
                     CHECK(hipMemcpyPeerAsync((char *) c[p].pr[s_][QZ_NC - 1 - k] + off, qz_dev_of(p),
                                              (const char *) c[i].pl[s_] + off, qz_dev_of(i), nb, c[i].cps));
                 }

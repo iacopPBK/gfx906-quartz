@@ -36,3 +36,25 @@ token is not a bug.
 
 A change in `quartz/core`, `quartz/kernels` or the loader must leave every
 architecture bit-identical. See [Adding a model](adding-a-model.md#validation).
+
+## Four cards on two GPUs
+
+`QZ_TP=4 QZ_VIRT=2` with the `make tp4` library runs the 4-card path on two GPUs
+(two cards per GPU). It checks correctness, not speed: cards on one GPU write to
+each other through local memory, so the PCIe link between four real GPUs is not
+exercised.
+
+On some hosts, one GPU writing to several peers at once drops P2P to a fraction of a GB/s.
+The exchanges therefore write to one peer per step: two hops for the decode
+sums, and one copy stream per card for the prefill partials. `make tp4 XCHECK=1`
+builds `build/tp4chk`, which checks this rule under emulation
+(`core/xcheck.h`). After each request it prints, per code site and card, every
+store to a second peer within one step (between system fences, or after the
+thread's own flag), and every copy that started while the same card's copy to
+another peer was still running on another stream. Normal builds compile none of
+it.
+
+```bash
+make tp4 XCHECK=1
+QZ_TP=4 QZ_VIRT=2 LIB=build/tp4chk/libquartz.so python3 your_test.py 2>&1 | grep XCHECK
+```

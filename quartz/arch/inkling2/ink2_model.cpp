@@ -167,7 +167,7 @@ struct ink2_ctx : qz_ctx {
         using clk = std::chrono::steady_clock;
         qz_stats st{};
         st.n_prompt = n_prompt;
-        auto fin = [&](int rc) { if (out) *out = st; abort_flag = false; return rc; };
+        auto fin = [&](int rc) { if (out) *out = st; abort_flag = false; QZ_XCK(qz_xck_poll(QZ_NC)); return rc; };
         if (!prompt || n_prompt < 1 || n_images < 0 || (n_images && !images)) { st.stop = -1; return fin(-1); }
         if (n_prompt + max_new > E.ctx) { fprintf(stderr, "inkling2: %d + %d tokens exceed the context %d\n", n_prompt, max_new, E.ctx); st.stop = -1; return fin(-1); }
         qz_sampling ms;

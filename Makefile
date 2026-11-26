@@ -15,9 +15,15 @@ HEADERS := $(wildcard quartz/*.h quartz/*.hip quartz/core/*.h quartz/kernels/*.h
 all: lib
 lib: $(BIN)/libquartz.so
 
-# the 4-card library (QZ_TP=4): the arch code built for four cards, into build/tp4
+# the 4-card library (QZ_TP=4): the arch code built for four cards, into build/tp4.
+# XCHECK=1: the fan-out check build (core/xcheck.h), into build/tp4chk
+ifeq ($(XCHECK),1)
+tp4:
+	$(MAKE) BIN=build/tp4chk CXXFLAGS="$(CXXFLAGS) -DQZ_NC=4 -DQZ_XCHECK" lib
+else
 tp4:
 	$(MAKE) BIN=build/tp4 CXXFLAGS="$(CXXFLAGS) -DQZ_NC=4" lib
+endif
 
 $(BIN):
 	mkdir -p $@

@@ -77,7 +77,7 @@ struct cyc_args {
 
 // the exchange handles at inbox offset off (kernels/xchg.h): this card's pushes, and its
 // inbox to sum from
-#define INK_XDST(A, off) ({ qz_xpush<QZ_NC> d_; _Pragma("unroll") for (int k_ = 0; k_ < QZ_NC - 1; k_++) d_.p[k_] = (A).xin_px[k_] + (off); d_; })
+#define INK_XDST(A, off) ({ qz_xpush<QZ_NC> d_; _Pragma("unroll") for (int k_ = 0; k_ < QZ_NC - 1; k_++) d_.p[k_] = (A).xin_px[k_] + (off); QZ_XCK(d_.card = (A).card;) d_; })
 #define INK_XSRC(A, off) (qz_xinbox<QZ_NC>{ (A).xin_mine + (off), (A).xin_slot, (A).card })
 
 // The card's partial is in the peer inbox: pushed, fenced, grid barrier passed. The

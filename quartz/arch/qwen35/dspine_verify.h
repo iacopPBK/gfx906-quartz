@@ -310,9 +310,11 @@ __global__ void __launch_bounds__(512) mv_xfin(qz_trunk_args A, unsigned int tok
                     }
                     *(float4 *)(A.y_part + o) = v;
                 }
+                QZ_XCK(qz_xck_store(A.tp_card, qz_xkpair(A), XS_VPUSH));
                 *(float4 *)(qz_xhop1_px(A) + (size_t) par * MV_T * QZ_D + o) = v;
             }
         __threadfence_system();
+        QZ_XCK(qz_xck_end(A.tp_card));
     }
     int kb = 0;
     qz_xfinish_t<MV_T, MV_T, false>(nullptr, kb, A, tok, down ? A.y_ffn : A.y_core);
@@ -436,9 +438,12 @@ __global__ void __launch_bounds__(512) mv_argmax(qz_trunk_args A, unsigned int h
         A.y_part[2 * blockIdx.x] = b0;
         A.y_part[2 * blockIdx.x + 1] = __int_as_float(gid);
         #pragma unroll
-        for (int k = 0; k < QZ_NC - 1; k++)
+        for (int k = 0; k < QZ_NC - 1; k++) {
+            QZ_XCK(qz_xck_store(A.tp_card, k + 1, XS_HM_VER));
             *(float2 *)(A.xhm_px[k] + (size_t) (htok & 1) * MV_T * 2 + 2 * blockIdx.x) = make_float2(b0, __int_as_float(gid));
+        }
         __threadfence_system();
+        QZ_XCK(qz_xck_end(A.tp_card));
         qz_xflag_b(A, htok, 64 + blockIdx.x);
     }
 }

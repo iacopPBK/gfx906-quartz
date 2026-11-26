@@ -9,6 +9,7 @@
 #pragma once
 
 #include "kernels/gemv.h"
+#include "core/xcheck.h"
 
 // ---- TP exchange -----------------------------------------------
 // push partials to every peer's inbox in parity tok & 1, wait for their flags, then
@@ -21,6 +22,10 @@ template <int CX, int DM> constexpr size_t qz_xin_slot() { return (size_t) 2 * C
 // card me's peer k and the slot me writes into it, for the host wiring
 __host__ __device__ constexpr int qz_xpeer(int nc, int me, int k) { return (me + k) % nc; }
 __host__ __device__ constexpr int qz_xslot_in_peer(int nc, int k) { return nc - 1 - k; }
+// the card index of an args struct: tp_card (Qwen) or card (Inkling), for the fan-out check
+template <class XA> __device__ __forceinline__ auto qz_xcard(const XA & A, int) -> decltype(A.tp_card) { return A.tp_card; }
+template <class XA> __device__ __forceinline__ auto qz_xcard(const XA & A, long) -> decltype(A.card) { return A.card; }
+template <class XA> __device__ __forceinline__ int qz_xcard(const XA & A) { return qz_xcard(A, 0); }
 
 // wait in one thread for inbox flag b (slot * QZ_XFS + block) to reach tok
 template <class XA> __device__ __forceinline__ void qz_xwait_slot(const XA & A, unsigned int tok, int b) {
@@ -39,9 +44,13 @@ template <class XA> __device__ __forceinline__ void qz_xwait_slot(const XA & A, 
 // only needs the peers' pushes of block b, and flag 0 doubles as the head-merge flag.
 template <class XA> __device__ __forceinline__ void qz_xflag_b(const XA & A, unsigned int tok, int b) {
     __threadfence_system();
+    QZ_XCK(qz_xck_end(qz_xcard(A)));
     #pragma unroll
-    for (int k = 0; k < XA::NC - 1; k++)
+    for (int k = 0; k < XA::NC - 1; k++) {
+        QZ_XCK(qz_xck_store(qz_xcard(A), k + 1, XS_FLAG));
         __hip_atomic_store(A.xflag_px[k] + b, tok, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    QZ_XCK(qz_xck_end(qz_xcard(A)));
 }
 template <class XA> __device__ __forceinline__ void qz_xwait_b(const XA & A, unsigned int tok, int b) {
     #pragma unroll
@@ -68,7 +77,10 @@ template <class XA> __device__ __forceinline__ void qz_xflag_k(const XA & A, uns
     static_assert(XA::NC == 4, "one-peer flags are for the two-hop exchange");
     __threadfence_system();
     unsigned int * f = k == 1 ? A.xflag_px[0] : k == 2 ? A.xflag_px[1] : A.xflag_px[2];
+    QZ_XCK(qz_xck_end(qz_xcard(A)));
+    QZ_XCK(qz_xck_store(qz_xcard(A), k, XS_FLAGK));
     __hip_atomic_store(f + b, tok, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    QZ_XCK(qz_xck_end(qz_xcard(A)));
 }
 
 // block 0's flag, the whole-card exchange: set it, or wait in one thread for the
@@ -118,9 +130,11 @@ template <int T, int CX, bool LX = T <= 4, class XA> __device__ __forceinline__ 
         const float4 v = *(const float4 *)(stage + (k * T + t) * 32 + q * 4);
         const size_t o = (size_t) t * XA::DM + g * 32 + q * 4;
         *(float4 *)(A.y_part + o) = v;
+        QZ_XCK(qz_xck_store(qz_xcard(A), qz_xkpair(A), XS_PUSH));
         *(float4 *)(qz_xhop1_px(A) + (size_t) par * CX * XA::DM + o) = v;
     }
     __threadfence_system();
+    QZ_XCK(qz_xck_end(qz_xcard(A)));
 }
 
 // the NC partials of one element summed in card order, (p0 + p1) + (p2 + p3) at
@@ -176,10 +190,12 @@ template <int T, int CX, bool BX = true, class XA> __device__ __forceinline__ vo
                 const float pv = __builtin_nontemporal_load(src + (size_t) (kp - 1) * XS + o);
                 const float sp = odd ? __fadd_rn(pv, own) : __fadd_rn(own, pv);
                 y[o] = sp;
+                QZ_XCK(qz_xck_store(qz_xcard(A), 2, XS_HOP2));
                 dst[o] = sp;
             }
         }
         __threadfence_system();
+        QZ_XCK(qz_xck_end(qz_xcard(A)));
         __syncthreads();
         // hop 2: lower pair's sum first
         if (tid == 0) { qz_xflag_k(A, tok, 2, b); qz_xwait_slot(A, tok, QZ_XFS + b); }
@@ -223,12 +239,17 @@ __device__ __forceinline__ void qz_xfold(float & bv, int & bi, float pv, int pi)
 // all of them. A null p[0] means no push.
 template <int NC> struct qz_xpush {
     float * p[NC - 1];
+#ifdef QZ_XCHECK
+    int card = 0;
+#endif
     __device__ __forceinline__ explicit operator bool() const { return p[0] != nullptr; }
     __device__ __forceinline__ void put(size_t i, float v) const {
+        QZ_XCK(qz_xck_fan(card, NC - 1, XS_INK_PUT));
         #pragma unroll
         for (int k = 0; k < NC - 1; k++) qz_gp(p[k])[i] = v;
     }
     __device__ __forceinline__ void put4(size_t i, float4 v) const {
+        QZ_XCK(qz_xck_fan(card, NC - 1, XS_INK_PUT4));
         #pragma unroll
         for (int k = 0; k < NC - 1; k++) *(float4 *) (qz_gp(p[k]) + i) = v;
     }
