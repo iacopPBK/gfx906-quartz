@@ -17,7 +17,11 @@ struct pf_xrow { pf_u32x4 q[4][2]; pf_u32x4 pad; };
 
 // SWI = 1 runs the gate (W) and the up (W2) in one GEMM, and the epilogue writes
 // the quantized silu(g) * u for the down projection.
-template <int SWI>
+//
+// NN is the number of 64-token halves of the tile that are computed: 1 when every valid
+// row of a one-tile launch sits in its first 64 (short prompts), so the padding half
+// costs nothing. Its outputs come out as zeros, rows the later kernels skip.
+template <int SWI, int NN = 2>
 __global__ void __launch_bounds__(256, 2) pf_gemm(
         const int8_t * __restrict__ Ag, const float * __restrict__ sag, int Mp,
         const char * __restrict__ W, const __half * __restrict__ sw, int ldw, int K,
@@ -65,7 +69,7 @@ __global__ void __launch_bounds__(256, 2) pf_gemm(
         pwd = ((const unsigned short *) sw)[wd_off + (unsigned) sb0];
         const unsigned grp = (unsigned) (sb0 / 4) * (unsigned) Mp;
 #pragma unroll
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < NN; i++) {
             const pf_u32x4 * xs = (const pf_u32x4 *) (Ag + grp * 128u + x_off[i]);
             pxlo[i] = xs[0]; pxhi[i] = xs[1];
             pxd[i] = sag[grp * 4u + xd_off[i]];
@@ -74,7 +78,7 @@ __global__ void __launch_bounds__(256, 2) pf_gemm(
     auto store = [&]() {
         sWlo[t / 4][t % 4] = pwlo; sWhi[t / 4][t % 4] = pwhi; sWd[t % 4][t / 4] = pwd;
 #pragma unroll
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < NN; i++) {
             const int e = t + 256 * i;
             sX[e / 4].q[e % 4][0] = pxlo[i]; sX[e / 4].q[e % 4][1] = pxhi[i]; sXd[e / 4][e % 4] = pxd[i];
         }
@@ -89,7 +93,7 @@ __global__ void __launch_bounds__(256, 2) pf_gemm(
             int xq[2][8];
             float dx[2];
 #pragma unroll
-            for (int n = 0; n < 2; n++) {
+            for (int n = 0; n < NN; n++) {
                 const pf_u32x4 q0 = sX[tx + 64 * n].q[kk][0], q1 = sX[tx + 64 * n].q[kk][1];
                 xq[n][0] = q0.x; xq[n][1] = q0.y; xq[n][2] = q0.z; xq[n][3] = q0.w;
                 xq[n][4] = q1.x; xq[n][5] = q1.y; xq[n][6] = q1.z; xq[n][7] = q1.w;
@@ -108,7 +112,7 @@ __global__ void __launch_bounds__(256, 2) pf_gemm(
                     const unsigned dw32 = rr < 2 ? dh4.x : rr < 4 ? dh4.y : rr < 6 ? dh4.z : dh4.w;
                     const float d = __half2float(__ushort_as_half((unsigned short) ((rr & 1) ? dw32 >> 16 : dw32 & 0xffffu)));
 #pragma unroll
-                    for (int n = 0; n < 2; n++) {
+                    for (int n = 0; n < NN; n++) {
                         int isum = 0;
                         isum = __builtin_amdgcn_sdot4(xq[n][0], (int) lo.x, isum, false);
                         isum = __builtin_amdgcn_sdot4(xq[n][1], (int) lo.y, isum, false);
@@ -323,4 +327,11 @@ __global__ void __launch_bounds__(256) pf_addnorm_quant4(
 static __global__ void __launch_bounds__(256) pf_quant(const float * __restrict__ y, int ldy, int K, int8_t * Ag, float * sag, int Mp, int m0 = 0) {
     const int m = m0 + blockIdx.x;
     for (int k = threadIdx.x; k < K; k += 256) pf_quant_unit(y[(size_t) m * ldy + k], k, m, Mp, Ag, sag, threadIdx.x & 31);
+}
+
+// launch pf_gemm over ntiles token tiles with `valid` rows in all: the half-tile body
+// when it is one tile and the rows fit in its first 64
+template <int SWI, class... Ar> inline void pf_gemm_go(int ntiles, int valid, dim3 grid, hipStream_t st, Ar... a) {
+    if (ntiles == 1 && valid <= 64) hipLaunchKernelGGL((pf_gemm<SWI, 1>), grid, dim3(256), 0, st, a...);
+    else                            hipLaunchKernelGGL((pf_gemm<SWI, 2>), grid, dim3(256), 0, st, a...);
 }
