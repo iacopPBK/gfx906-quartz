@@ -70,7 +70,12 @@ struct q35_ctx : qz_ctx {
     // drafter switch, on with DSpine unless QZ_NO_SWITCH: DSpine or MTP, mid-answer
     struct {
         bool on = false;
-        float lo = 3.8f, hi = 3.4f;       // leave DSpine below lo tok/round, MTP at hi and above
+        // by speed: leave DSpine when its tok/s over the window drops below margin x MTP's
+        // (the last measured, kept across requests; before any, a guess from DSpine's round
+        // time). Leave MTP after `probe` tokens to re-measure DSpine, or at hi tok/round.
+        float hi = 3.4f, margin = 0.95f;
+        int probe = 384;
+        double mtp_tps = 0;               // MTP tok/s, an average of the measured windows
         int win = 128, flush = 512;       // window tokens, and MTP feature rows per DSpine ring fill
         int cap = 1024;                   // staged MTP entries per flush
         float * hn[QZ_NC] = {};               // staged entry inputs [cap + 12][QZ_D] per card
@@ -178,6 +183,17 @@ static int qz_switch_run(q35_ctx * c, int pos, int32_t anchor, int max_new, cons
             a += n;
         }
     };
+    // tok/s over the segment's last w.win tokens, from (tokens so far, time) after each round
+    std::vector<std::pair<int, double>> pts;
+    auto now_ms = [&]() { return std::chrono::duration<double, std::milli>(clk::now().time_since_epoch()).count(); };
+    auto rate = [&]() {
+        const int need = pts.back().first - w.win;
+        size_t i = pts.size() - 1;
+        while (i > 0 && pts[i].first > need) i--;
+        const double dt = pts.back().second - pts[i].second;
+        return dt > 0 ? (pts.back().first - pts[i].first) * 1000.0 / dt : 0.0;
+    };
+    double ds_tps = 0, mtp_est = 0;
     ds.sw_hook = [&](int p, int n, int W, const int32_t * toks, const int * out) {
         if (w.tok.empty()) w.p0 = p + 1;
         for (int i = 0; i < QZ_NC; i++) {   // entries p+1 .. p+n: the token there and row j's normed hidden
@@ -190,18 +206,29 @@ static int qz_switch_run(q35_ctx * c, int pos, int32_t anchor, int max_new, cons
         if ((int) w.tok.size() > w.cap - 12) stage_flush();
         win.add(n, w.win);
         seg_tok[0] += n; seg_rnd[0]++;
-        return win.seg >= w.win && win.avg() < w.lo;
+        pts.push_back({pts.back().first + n, now_ms()});
+        if (win.seg < w.win) return false;
+        ds_tps = rate();
+        // MTP's speed: measured, or 2.5 tok/round at 0.8 of this segment's DSpine round
+        const double ds_ms = (pts.back().second - pts[0].second) / (pts.size() - 1);
+        mtp_est = w.mtp_tps > 0 ? w.mtp_tps : 2.5 * 1000.0 / (0.8 * ds_ms);
+        return ds_tps < w.margin * mtp_est;
     };
     e.sw_hook = [&](int p, int n) {
         if (p - fl >= w.flush) { feat_fill(fl, p); fl = p; }
         win.add(n, w.win);
         seg_tok[1] += n; seg_rnd[1]++;
-        return win.seg >= w.win && win.avg() >= w.hi;
+        pts.push_back({pts.back().first + n, now_ms()});
+        if (win.seg < w.win) return false;
+        const double r = rate();
+        w.mtp_tps = w.mtp_tps > 0 ? 0.75 * w.mtp_tps + 0.25 * r : r;
+        return pts.back().first >= w.probe || win.avg() >= w.hi;
     };
     e.C[0].A.fcap = pf.feat;
     e.C[0].A.fcap_cap = fcap;
     for (;;) {
         win = qz_win();
+        pts.assign(1, {0, now_ms()});
         int r;
         if (on_ds) {
             r = ds.generate(e, pc, anchor, left, s, (qz_emit_fn) cb, user, &g);
@@ -234,8 +261,10 @@ static int qz_switch_run(q35_ctx * c, int pos, int32_t anchor, int max_new, cons
     ds.sw_hook = nullptr; e.sw_hook = nullptr;
     e.C[0].A.fcap = nullptr;
     qz_stamp(stderr);
-    fprintf(stderr, "  switch: %d, catch-up %.1f ms to dspine, %.1f ms to mtp | dspine %d tok %.2f/rnd | mtp %d tok %.2f/rnd\n", nsw, cu_ms[0], cu_ms[1],
-            seg_tok[0], seg_rnd[0] ? (double) seg_tok[0] / seg_rnd[0] : 0.0, seg_tok[1], seg_rnd[1] ? (double) seg_tok[1] / seg_rnd[1] : 0.0);
+    fprintf(stderr, "  switch: %d, catch-up %.1f ms to dspine, %.1f ms to mtp | dspine %d tok %.2f/rnd | mtp %d tok %.2f/rnd"
+            " | last dspine %.1f t/s, mtp %.1f t/s (est %.1f)\n", nsw, cu_ms[0], cu_ms[1],
+            seg_tok[0], seg_rnd[0] ? (double) seg_tok[0] / seg_rnd[0] : 0.0, seg_tok[1], seg_rnd[1] ? (double) seg_tok[1] / seg_rnd[1] : 0.0,
+            ds_tps, w.mtp_tps, mtp_est);
     if (st) *st = tot;
     return rc;
 }
@@ -495,14 +524,16 @@ static qz_ctx * create(const char * model, const qz_create_opts & o) {
     const char * no_sw = getenv("QZ_NO_SWITCH");
     if (c->ds.on && !(no_sw && *no_sw && strcmp(no_sw, "0") != 0)) {
         auto & w = c->sw;
-        if (const char * v = getenv("QZ_SW_LO")) w.lo = (float) atof(v);
+        if (const char * v = getenv("QZ_SW_MARGIN")) w.margin = (float) atof(v);
+        if (const char * v = getenv("QZ_SW_PROBE")) w.probe = atoi(v);
         if (const char * v = getenv("QZ_SW_HI")) w.hi = (float) atof(v);
         if (const char * v = getenv("QZ_SW_WIN")) w.win = atoi(v);
         qz_mem_scope mem("drafter switch");
         for (int i = 0; i < QZ_NC; i++) { CHECK(hipSetDevice(qz_dev_of(i))); CHECK(qz_dmalloc(&w.hn[i], (size_t) (w.cap + 12) * QZ_D * 4)); }
         CHECK(hipSetDevice(qz_dev_of(0)));
         w.on = true;
-        fprintf(stderr, "quartz: drafter switch on: leave DSpine < %.2f, MTP >= %.2f tok/round, window %d\n", w.lo, w.hi, w.win);
+        fprintf(stderr, "quartz: drafter switch on: by tok/s, leave DSpine below %.2f x MTP, MTP after %d tok or at %.2f tok/round, window %d\n",
+                w.margin, w.probe, w.hi, w.win);
     }
     // per card: used and free, the ledger's tags, what the runtime holds beyond them
     qz_mem_report(stderr, QZ_NC);
