@@ -790,28 +790,39 @@ static __global__ __launch_bounds__(256) void k_pf_tiles(const int * start, int4
     }
 }
 
-// Two tile lists: A holds the BN-wide tiles (the full ones plus a remainder above BN/2),
-// and B the BN/2-wide tiles for remainders up to BN/2; ntl counts both.
-constexpr int TM_B = PF_NP / 16 + NE;      // list B offset in tm; list A: np / 16 + NE tiles
+// Three tile lists for BN = 64: A holds BN-wide tiles (full tiles + remainders > 32),
+// B holds BN/2-wide tiles (17..32), and C holds BN/4-wide tiles (1..16). ntl[0..2] counts them.
+constexpr int TM_B = PF_NP / 16 + NE;          // list B offset in tm
+constexpr int TM_C = PF_NP / 16 + 2 * NE;      // list C offset in tm
 template <int BN>
 static __global__ __launch_bounds__(256) void k_pf_tiles2(const int * start, int4 * tm, int * ntl) {
-    __shared__ int offa[NE], offb[NE];
+    __shared__ int offa[NE], offb[NE], offc[NE];
     if (threadIdx.x == 0) {
-        int sa = 0, sb = 0;
+        int sa = 0, sb = 0, sc = 0;
         for (int e = 0; e < NE; e++) {
             const int cnt = start[e + 1] - start[e], r = cnt % BN;
-            offa[e] = sa; offb[e] = sb;
+            offa[e] = sa; offb[e] = sb; offc[e] = sc;
             sa += cnt / BN + (r > BN / 2);
-            sb += (r > 0 && r <= BN / 2);
+            if constexpr (BN == 64) {
+                sb += (r > 16 && r <= 32);
+                sc += (r > 0 && r <= 16);
+            } else {
+                sb += (r > 0 && r <= BN / 2);
+            }
         }
-        ntl[0] = sa; ntl[1] = sb;
+        ntl[0] = sa; ntl[1] = sb; ntl[2] = sc;
     }
     __syncthreads();
     for (int e = threadIdx.x; e < NE; e += 256) {
         const int a0 = start[e], cnt = start[e + 1] - a0, full = cnt / BN, r = cnt % BN;
         for (int j = 0; j < full; j++) tm[offa[e] + j] = make_int4(e, a0 + j * BN, BN, 0);
         if (r > BN / 2) tm[offa[e] + full] = make_int4(e, a0 + full * BN, r, 0);
-        else if (r > 0) tm[TM_B + offb[e]] = make_int4(e, a0 + full * BN, r, 0);
+        else if constexpr (BN == 64) {
+            if (r > 16) tm[TM_B + offb[e]] = make_int4(e, a0 + full * BN, r, 0);
+            else if (r > 0) tm[TM_C + offc[e]] = make_int4(e, a0 + full * BN, r, 0);
+        } else if (r > 0) {
+            tm[TM_B + offb[e]] = make_int4(e, a0 + full * BN, r, 0);
+        }
     }
 }
 
@@ -821,23 +832,31 @@ static __global__ __launch_bounds__(256) void k_pf_tiles2(const int * start, int
 // Fused SITU output of gate_up: int8 planes [NGRP_FF][np][128] plus scales.
 struct pf_situo { unsigned char * q = nullptr; float * qs = nullptr; int np = 0; float beta = 0.f, lb = 0.f; };
 
-template <int BN, int GATHER, int NTT, int FS = 0>
+template <int BN, int GATHER, int NTT, int FS = 0, bool K_DIV4 = false>
 static __device__ __forceinline__ void moe_gemm_body(
-        const int4 tl,
-        const char * W, const __half * sw, const int * perm,
-        const int8_t * Ag, const float * sag, int Mp, int K,
-        float * C, int ldc, int N, const pf_situo so = pf_situo{}, float * C2 = nullptr) {
+        const int4 tl, int bx,
+        const char * __restrict__ W, const __half * __restrict__ sw, const int * __restrict__ perm,
+        const int8_t * __restrict__ Ag, const float * __restrict__ sag, int Mp, int K,
+        float * __restrict__ C, int ldc, int N, const pf_situo so = pf_situo{}, float * __restrict__ C2 = nullptr) {
     constexpr int NT = NTT;                    // pair lanes
     constexpr int RG = 256 / NT;               // row groups
     constexpr int RR = 64 / RG;                // rows per thread
     constexpr int NH = BN / NT;                // pair halves
     constexpr int NXF = BN * 4 >= 256 ? BN * 4 / 256 : 1;   // activation slots per thread
-    __shared__ pf_u32x4 sWlo[64][4], sWhi[64][4];
-    __shared__ unsigned short sWd[4][64];
-    __shared__ pf_xrow sX[BN];
-    __shared__ float sXd[BN][4];
+    __shared__ union {
+        struct {
+            pf_u32x4 wlo[64][4], whi[64][4];
+            unsigned short wd[4][64];
+            pf_xrow x[BN];
+            float xd[BN][4];
+        } g;
+        struct {
+            float a[32][BN + 1];               // gate [j][slot]
+            float u[BN * 32];                  // up [slot][j ^ slot]
+        } f;
+    } sm;
     const int t = threadIdx.x, tx = t % NT, ty = t / NT;
-    const int nkb = K / 32, row0 = blockIdx.x * 64, cnt = tl.z;
+    const int nkb = K / 32, row0 = bx * 64, cnt = tl.z;
     W += (size_t) tl.x * N * K;
     sw += (size_t) tl.x * N * (K / 32);
     const unsigned wrow = (unsigned) min(row0 + t / 4, N - 1);
@@ -862,7 +881,7 @@ static __device__ __forceinline__ void moe_gemm_body(
     unsigned short pwd;
     float pxd[NXF];
     auto prefetch = [&](int sb0) {
-        if (sb0 + (t % 4) < nkb) {
+        if (K_DIV4 || sb0 + (t % 4) < nkb) {
             const pf_u32x4 * ws = (const pf_u32x4 *) (W + w_off + (unsigned) sb0 * 32u);
             pwlo = ws[0]; pwhi = ws[1];
             pwd = ((const unsigned short *) sw)[wd_off + (unsigned) sb0];
@@ -881,13 +900,13 @@ static __device__ __forceinline__ void moe_gemm_body(
     auto store = [&]() {
         // K slot XOR the row group: row groups in one wave hit distinct banks
         const int ks = (t % 4) ^ ((t / 4 / RR) & 3);
-        sWlo[t / 4][ks] = pwlo; sWhi[t / 4][ks] = pwhi; sWd[t % 4][t / 4] = pwd;
+        sm.g.wlo[t / 4][ks] = pwlo; sm.g.whi[t / 4][ks] = pwhi; sm.g.wd[t % 4][t / 4] = pwd;
 #pragma unroll
         for (int i = 0; i < NXF; i++) {
             if (!xok[i]) continue;
             const int e = t + 256 * i;
-            sX[e / 4].q[e % 4][0] = pxlo[i]; sX[e / 4].q[e % 4][1] = pxhi[i];
-            sXd[e / 4][e % 4] = pxd[i];
+            sm.g.x[e / 4].q[e % 4][0] = pxlo[i]; sm.g.x[e / 4].q[e % 4][1] = pxhi[i];
+            sm.g.xd[e / 4][e % 4] = pxd[i];
         }
     };
     prefetch(0);
@@ -898,23 +917,25 @@ static __device__ __forceinline__ void moe_gemm_body(
         if (sb0 + 4 < nkb) prefetch(sb0 + 4);
 #pragma unroll 1
         for (int kk = 0; kk < 4; kk++) {
-            if (sb0 + kk >= nkb) break;
+            if (!K_DIV4 && sb0 + kk >= nkb) break;
             int xq[NH][8];
             float dx[NH];
 #pragma unroll
             for (int n = 0; n < NH; n++) {
-                const pf_u32x4 q0 = sX[tx + NT * n].q[kk][0], q1 = sX[tx + NT * n].q[kk][1];
+                const pf_u32x4 q0 = sm.g.x[tx + NT * n].q[kk][0], q1 = sm.g.x[tx + NT * n].q[kk][1];
                 xq[n][0] = q0.x; xq[n][1] = q0.y; xq[n][2] = q0.z; xq[n][3] = q0.w;
                 xq[n][4] = q1.x; xq[n][5] = q1.y; xq[n][6] = q1.z; xq[n][7] = q1.w;
-                dx[n] = sXd[tx + NT * n][kk];
+                dx[n] = sm.g.xd[tx + NT * n][kk];
             }
             const int kw = kk ^ (ty & 3);
-            pf_u32x4 wlo = sWlo[rb][kw], whi = sWhi[rb][kw];
+            pf_u32x4 wlo = sm.g.wlo[rb][kw], whi = sm.g.whi[rb][kw];
+            const uint2 dw = *(const uint2 *) &sm.g.wd[kk][rb];
 #pragma unroll
             for (int r = 0; r < RR; r++) {
                 const pf_u32x4 lo = wlo, hi = whi;
-                if (r + 1 < RR) { wlo = sWlo[rb + r + 1][kw]; whi = sWhi[rb + r + 1][kw]; }
-                const float d = __half2float(__ushort_as_half(sWd[kk][rb + r]));
+                if (r + 1 < RR) { wlo = sm.g.wlo[rb + r + 1][kw]; whi = sm.g.whi[rb + r + 1][kw]; }
+                const unsigned dw32 = r < 2 ? dw.x : dw.y;
+                const float d = __half2float(__ushort_as_half((unsigned short) ((r & 1) ? dw32 >> 16 : dw32 & 0xffffu)));
 #pragma unroll
                 for (int n = 0; n < NH; n++) {
                     int isum = 0;
@@ -934,24 +955,21 @@ static __device__ __forceinline__ void moe_gemm_body(
     }
     if constexpr (FS) {
         // tile rows 0..31 hold gate rows and rows 32..63 their up rows (gu_row). Stage
-        // both halves in LDS; every thread then applies SITU and the per-32 quant, one
-        // group per pair
-        __shared__ float sA[32][BN + 1];          // gate [j][slot]
-        float * sU = (float *) sX;                 // up [slot][j ^ slot], the staging buffer is free
+        // both halves in the aliased LDS union; every thread applies SITU and per-32 quant.
 #pragma unroll
         for (int n = 0; n < NH; n++) {
             const int slot = tx + NT * n;
 #pragma unroll
             for (int r = 0; r < RR; r++) {
-                if (rb < 32) sA[rb + r][slot] = acc[r][n];
-                else sU[slot * 32 + ((rb - 32 + r) ^ (slot & 31))] = acc[r][n];
+                if (rb < 32) sm.f.a[rb + r][slot] = acc[r][n];
+                else sm.f.u[slot * 32 + ((rb - 32 + r) ^ (slot & 31))] = acc[r][n];
             }
         }
         __syncthreads();
-        const int j0 = blockIdx.x * 32;
+        const int j0 = bx * 32;
         for (int i = t; i < BN * 32; i += 256) {
             const int slot = i / 32, jj = i % 32;
-            const float g = sA[jj][slot], u = sU[slot * 32 + (jj ^ (slot & 31))];
+            const float g = sm.f.a[jj][slot], u = sm.f.u[slot * 32 + (jj ^ (slot & 31))];
             const float x = so.beta * tanhf(g / so.beta) * sigm(g) * (so.lb * tanhf(u / so.lb));
             const float amax = qz_amax32(fabsf(x));
             if (slot < cnt) {
@@ -991,26 +1009,47 @@ static __device__ __forceinline__ void moe_gemm_body(
     }
 }
 
-template <int BN, int GATHER, int NTT = (BN < 64 ? BN : 64), int FS = 0>
-static __global__ __launch_bounds__(256, BN <= 32 ? 3 : 2) void k_pf_moe_gemm(
+template <int BN, int GATHER, int NTT = (BN < 64 ? BN : 64), int FS = 0, bool K_DIV4 = false, int GG = 4>
+static __global__ __launch_bounds__(256, BN == 16 ? 3 : 2) void k_pf_moe_gemm(
         const int4 * tm, const int * ntl,
         const char * W, const __half * sw, const int * perm,
         const int8_t * Ag, const float * sag, int Mp, int K,
         float * C, int ldc, int N, const pf_situo so) {
-    if (blockIdx.y >= *ntl) return;
-    moe_gemm_body<BN, GATHER, NTT, FS>(tm[blockIdx.y], W, sw, perm, Ag, sag, Mp, K, C, ldc, N, so);
+    const int n = *ntl;
+    int bx, by;
+    if constexpr (GG > 1) {
+        const int gx = gridDim.x, lin = blockIdx.y * gx + blockIdx.x;
+        if (lin >= n * gx) return;
+        const int per = GG * gx, fy = (lin / per) * GG;
+        const int gs = min(n - fy, GG), rem = lin - fy * gx;
+        bx = rem / gs; by = fy + rem % gs;
+    } else {
+        if ((int) blockIdx.y >= n) return;
+        bx = blockIdx.x; by = blockIdx.y;
+    }
+    moe_gemm_body<BN, GATHER, NTT, FS, K_DIV4>(tm[by], bx, W, sw, perm, Ag, sag, Mp, K, C, ldc, N, so);
 }
 
-// Dense projections through the same tile body. One launch runs up to 8 jobs along
-// blockIdx.z, with 64-row token tiles along blockIdx.y; a job's last weight tile may be partial.
-// C2, when set (P2P row-parallel partial), streams a second copy straight into the peer's inbox.
+// Dense projections as packed 64x64 Q8 GEMMs (up to 8 jobs in one launch, zero empty
+// blocks, 8-way L2-grouped dispatch across token tiles). C2, when set (P2P row-parallel
+// partial), streams a second copy straight into the peer's inbox. All dense K are multiples of 128.
 struct dgjob { const char * W; const __half * sw; const int8_t * A; const float * as; float * C; int ldc, N, K; float * C2; };
-struct dgjobs { dgjob j[8]; };
+struct dgjobs { dgjob j[8]; int off[9]; int n; };
 static __global__ __launch_bounds__(256, 2) void k_pf_dgemm(dgjobs J, int m) {
-    const dgjob & g = J.j[blockIdx.z];
-    if ((int) blockIdx.x * 64 >= g.N) return;
-    const int a0 = blockIdx.y * 64;
-    moe_gemm_body<64, 0, 16>(make_int4(0, a0, min(64, m - a0), 0), g.W, g.sw, nullptr, g.A, g.as, PF_M, g.K, g.C, g.ldc, g.N, pf_situo{}, g.C2);
+    constexpr int DG_GG = 8;
+    int bx, by;
+    {
+        const int gx = gridDim.x, lin = blockIdx.y * gx + blockIdx.x, per = DG_GG * gx, fy = (lin / per) * DG_GG;
+        const int gs = min((int) gridDim.y - fy, DG_GG), rem = lin - fy * gx;
+        bx = rem / gs; by = fy + rem % gs;
+    }
+    int ji = 0;
+#pragma unroll
+    for (int k = 1; k < 8; k++) if (k < J.n && bx >= J.off[k]) ji = k;
+    const dgjob & g = J.j[ji];
+    const int a0 = by * 64;
+    moe_gemm_body<64, 0, 16, 0, true>(make_int4(0, a0, min(64, m - a0), 0), bx - J.off[ji],
+                                      g.W, g.sw, nullptr, g.A, g.as, PF_M, g.K, g.C, g.ldc, g.N, pf_situo{}, g.C2);
 }
 
 // Per row, the weighted sum of its pairs' partials in the router's selection order. That
@@ -1142,7 +1181,7 @@ struct ink2_pf {
         f((size_t) PF_NP * NSC_FF); f((size_t) PF_M * NE_USED);               // APS WTS
         f((size_t) PF_M * NE_USED);                                           // IDS (as floats)
         f((size_t) PF_NP); f((size_t) PF_NP); f((size_t) (NE + 1)); f(PF_M);  // PERM INV START TOK
-        f((size_t) (PF_NP / 16 + 2 * NE) * 4); f(1);                          // TM (lists A, B) NTL
+        f((size_t) (PF_NP / 16 + 3 * NE) * 4); f(4);                          // TM (lists A, B, C) NTL
         for (int i = 0; i < 3; i++) plane(D);                                 // INP
         plane(D); plane(QL);                                                  // FF AT
         by((size_t) PF_NP * FFL_PAD);                                         // APQ
@@ -1188,12 +1227,18 @@ struct ink2_pf {
     dgjob djob(const qw & W, const unsigned char * av, const float * as, float * C, int ldc, float * C2 = nullptr) {
         return dgjob{W.v, W.s, (const int8_t *) av, as, C, ldc, (int) W.N, (int) W.K, C2};
     }
-    // several dense GEMMs in one launch, up to 8 jobs
+    // several dense GEMMs in one launch, up to 8 jobs, packed with zero empty blocks
     void dgemm(int c, std::initializer_list<dgjob> js, int m) {
         dgjobs J{};
-        int n = 0, mx = 0;
-        for (const dgjob & g : js) { J.j[n++] = g; mx = std::max(mx, g.N); }
-        k_pf_dgemm<<<dim3((mx + 63) / 64, (m + 63) / 64, n), 256, 0, E->C[c].st>>>(J, m);
+        int n = 0;
+        J.off[0] = 0;
+        for (const dgjob & g : js) {
+            J.j[n] = g;
+            J.off[n + 1] = J.off[n] + (g.N + 63) / 64;
+            n++;
+        }
+        J.n = n;
+        k_pf_dgemm<<<dim3(J.off[n], (m + 63) / 64), 256, 0, E->C[c].st>>>(J, m);
     }
     void normq1(int c, const float * x, const float * w, pf_plane & pl, int m, float * outf = nullptr) {
         pfnq A{};
@@ -1250,27 +1295,28 @@ struct ink2_pf {
         else if (bn == 32) k_pf_tiles2<32><<<1, 256, 0, st>>>(B[c].START, B[c].TM, B[c].NTL);
         else k_pf_tiles2<64><<<1, 256, 0, st>>>(B[c].START, B[c].TM, B[c].NTL);
     }
-    template <int BN, int G>
+    template <int BN, int G, int GG>
     void moe_gemm(pf_card & b, hipStream_t st, const qw & W, const unsigned char * aq, const float * as,
                   int Mp, int K, float * C, int ldc, int N, int yt, const int4 * tm, const int * ntl, const pf_situo & so) {
-        // 4 rows x 4 pairs per thread, so 16 pair lanes. The gate_up GEMM (G = 1) ends
-        // in the fused SITU
+        // 4 rows x 4 pairs per thread, so 16 pair lanes. The gate_up GEMM (G = 1, K = D % 128 == 0)
+        // ends in the fused SITU.
         if constexpr (G == 1)
-            k_pf_moe_gemm<BN, G, 16, 1><<<dim3(N / 64, yt), 256, 0, st>>>(tm, ntl, W.v, W.s, b.PERM, (const int8_t *) aq, as, Mp, K, C, ldc, N, so);
+            k_pf_moe_gemm<BN, G, 16, 1, true, GG><<<dim3(N / 64, yt), 256, 0, st>>>(tm, ntl, W.v, W.s, b.PERM, (const int8_t *) aq, as, Mp, K, C, ldc, N, so);
         else
-            k_pf_moe_gemm<BN, G, 16, 0><<<dim3(N / 64, yt), 256, 0, st>>>(tm, ntl, W.v, W.s, b.PERM, (const int8_t *) aq, as, Mp, K, C, ldc, N, so);
+            k_pf_moe_gemm<BN, G, 16, 0, false, GG><<<dim3(N / 64, yt), 256, 0, st>>>(tm, ntl, W.v, W.s, b.PERM, (const int8_t *) aq, as, Mp, K, C, ldc, N, so);
     }
+    template <int GG>
     void moe_run(pf_card & b, hipStream_t st, int bn, int gather, const qw & W, const unsigned char * aq, const float * as,
                  int Mp, int K, float * C, int ldc, int N, int yt, const int4 * tm, const int * ntl, const pf_situo & so) {
         if (bn == 16) {
-            if (gather) moe_gemm<16, 1>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
-            else        moe_gemm<16, 0>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
+            if (gather) moe_gemm<16, 1, GG>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
+            else        moe_gemm<16, 0, GG>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
         } else if (bn == 32) {
-            if (gather) moe_gemm<32, 1>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
-            else        moe_gemm<32, 0>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
+            if (gather) moe_gemm<32, 1, GG>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
+            else        moe_gemm<32, 0, GG>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
         } else {
-            if (gather) moe_gemm<64, 1>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
-            else        moe_gemm<64, 0>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
+            if (gather) moe_gemm<64, 1, GG>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
+            else        moe_gemm<64, 0, GG>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
         }
     }
     void moe(int c, int bn, int gather, const qw & W, const unsigned char * aq, const float * as, int Mp, int K,
@@ -1278,8 +1324,10 @@ struct ink2_pf {
         ICHECK(hipSetDevice(qz_dev_of(c)));
         pf_card & b = B[c];
         hipStream_t st = E->C[c].st;
-        moe_run(b, st, bn, gather, W, aq, as, Mp, K, C, ldc, N, yt, b.TM, b.NTL, so);
-        if (bn >= 32) moe_run(b, st, bn / 2, gather, W, aq, as, Mp, K, C, ldc, N, NE, b.TM + TM_B, b.NTL + 1, so);
+        if (gather) moe_run<8>(b, st, bn, 1, W, aq, as, Mp, K, C, ldc, N, yt, b.TM, b.NTL, so);
+        else        moe_run<1>(b, st, bn, 0, W, aq, as, Mp, K, C, ldc, N, yt, b.TM, b.NTL, so);
+        if (bn >= 32) moe_run<1>(b, st, bn / 2, gather, W, aq, as, Mp, K, C, ldc, N, NE, b.TM + TM_B, b.NTL + 1, so);
+        if (bn == 64) moe_run<1>(b, st, 16, gather, W, aq, as, Mp, K, C, ldc, N, NE, b.TM + TM_C, b.NTL + 2, so);
     }
 
     void layer(int slot, int ip, int pos0, int m, ink2_engine::seq & S, int snap, int snap_end) {
