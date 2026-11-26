@@ -44,104 +44,156 @@ static __global__ __launch_bounds__(256) void k_pf_img(const int * irow, const f
 
 // mix(blocks, cur; query) for a whole chunk, one block per row. Each state is a
 // [PF_M][D] buffer read at the same row; the MQ query columns land in out[j*ostr + row].
-// A state value is read once and stays in registers.
+// Templated on the active state count NS so only live states occupy registers and reductions.
 struct pfmix { const float * p[6]; int n; const float * qy; int m; float * out; size_t ostr; };
-template <int MQ>
+template <int MQ, int NS>
 static __global__ __launch_bounds__(256) void k_pf_mix2(pfmix A) {
     constexpr int NV = D / 256;
-    __shared__ float red[4 * 6 * (MQ + 1)];
-    __shared__ float wsh[6][4];
-    const int row = blockIdx.x, tid = threadIdx.x, n = A.n;
-    float v[6][NV];
-    float ss[6];
+    __shared__ float red[4 * NS * (MQ + 1)];
+    __shared__ float wsh[NS][MQ];
+    const int row = blockIdx.x, tid = threadIdx.x;
+    float v[NS][NV];
+    float ss[NS];
     #pragma unroll
-    for (int s = 0; s < 6; s++) {
+    for (int s = 0; s < NS; s++) {
         ss[s] = 0.f;
+        const float * ps = A.p[s] + (size_t) row * D;
         #pragma unroll
         for (int k = 0; k < NV; k++) {
-            v[s][k] = s < n ? A.p[s][(size_t) row * D + tid + 256 * k] : 0.f;
+            v[s][k] = ps[tid + 256 * k];
             ss[s] += v[s][k] * v[s][k];
         }
     }
-    bsum<6>(ss, red);
-    float sc[6 * MQ];
+    bsum<NS>(ss, red);
+    float sc[NS * MQ];
     #pragma unroll
-    for (int s = 0; s < 6; s++) {
+    for (int s = 0; s < NS; s++) {
         const float rs = rsqrtf(ss[s] / D + 1e-6f);
         #pragma unroll
         for (int k = 0; k < NV; k++) v[s][k] *= rs;
+    }
+    #pragma unroll
+    for (int j = 0; j < MQ; j++) {
+        const float * qj = A.qy + (size_t) j * D;
+        float qv[NV];
         #pragma unroll
-        for (int j = 0; j < MQ; j++) {
+        for (int k = 0; k < NV; k++) qv[k] = qj[tid + 256 * k];
+        #pragma unroll
+        for (int s = 0; s < NS; s++) {
             float a = 0.f;
             #pragma unroll
-            for (int k = 0; k < NV; k++) a += v[s][k] * A.qy[(size_t) j * D + tid + 256 * k];
+            for (int k = 0; k < NV; k++) a += v[s][k] * qv[k];
             sc[s * MQ + j] = a;
         }
     }
-    bsum<6 * MQ>(sc, red);
+    bsum<NS * MQ>(sc, red);
     if (tid < MQ) {
         const int j = tid;
         const float scale = 1.f / sqrtf((float) D);
         float mx = -INFINITY;
-        for (int s = 0; s < n; s++) mx = fmaxf(mx, sc[s * MQ + j] * scale);
+        #pragma unroll
+        for (int s = 0; s < NS; s++) mx = fmaxf(mx, sc[s * MQ + j] * scale);
         float sum = 0.f;
-        for (int s = 0; s < n; s++) { const float e = expf(sc[s * MQ + j] * scale - mx); wsh[s][j] = e; sum += e; }
-        for (int s = 0; s < n; s++) wsh[s][j] /= sum;
+        #pragma unroll
+        for (int s = 0; s < NS; s++) { const float e = expf(sc[s * MQ + j] * scale - mx); wsh[s][j] = e; sum += e; }
+        #pragma unroll
+        for (int s = 0; s < NS; s++) wsh[s][j] /= sum;
     }
     __syncthreads();
     #pragma unroll
-    for (int j = 0; j < MQ; j++)
+    for (int j = 0; j < MQ; j++) {
+        float * dst = A.out + (size_t) j * A.ostr + (size_t) row * D;
         #pragma unroll
         for (int k = 0; k < NV; k++) {
             float o = 0.f;
             #pragma unroll
-            for (int s = 0; s < 6; s++) if (s < n) o += wsh[s][j] * v[s][k];
-            A.out[(size_t) j * A.ostr + (size_t) row * D + tid + 256 * k] = o;
+            for (int s = 0; s < NS; s++) o += wsh[s][j] * v[s][k];
+            dst[tid + 256 * k] = o;
         }
+    }
+}
+template <int MQ>
+static inline void launch_pf_mix(int m, hipStream_t st, const pfmix & A) {
+    switch (A.n) {
+        case 2: k_pf_mix2<MQ, 2><<<m, 256, 0, st>>>(A); break;
+        case 3: k_pf_mix2<MQ, 3><<<m, 256, 0, st>>>(A); break;
+        case 4: k_pf_mix2<MQ, 4><<<m, 256, 0, st>>>(A); break;
+        case 5: k_pf_mix2<MQ, 5><<<m, 256, 0, st>>>(A); break;
+        default: k_pf_mix2<MQ, 6><<<m, 256, 0, st>>>(A); break;
+    }
 }
 
-// z[j][row][2D] = [rmsnorm(cur_j); rmsnorm(msg_j)] with no gain, the down GEMM's input.
-// One block per (row, j), grid (m, nj), job j0 + blockIdx.y.
-struct pfrms { const float * cur[4]; const float * msg; float * z; int j0; };
-static __global__ __launch_bounds__(256) void k_pf_rms2(pfrms A) {
+// Per-row inverse RMS scales {rc, rm} for [rmsnorm(cur_j); rmsnorm(msg_j)], applied on the
+// fly inside k_pf_ctrl_down2 so the 2*D concatenated buffer is never materialized.
+struct pfrms { const float * cur[4]; const float * msg; float * rinv; int j0; };
+static __global__ __launch_bounds__(256) void k_pf_rms_inv(pfrms A) {
     __shared__ float red[4 * 2];
     const int row = blockIdx.x, j = A.j0 + blockIdx.y, tid = threadIdx.x;
-    const float * c = A.cur[j] + (size_t) row * D;
-    const float * g = A.msg + ((size_t) j * PF_M + row) * D;
+    const float * __restrict__ c = A.cur[j] + (size_t) row * D;
+    const float * __restrict__ g = A.msg + ((size_t) j * PF_M + row) * D;
     float ss[2] = {0.f, 0.f};
-    for (int i = tid; i < D; i += 256) { ss[0] += c[i] * c[i]; ss[1] += g[i] * g[i]; }
+    #pragma unroll
+    for (int k = 0; k < D / 256; k++) {
+        const float cv = c[tid + 256 * k], gv = g[tid + 256 * k];
+        ss[0] = fmaf(cv, cv, ss[0]); ss[1] = fmaf(gv, gv, ss[1]);
+    }
     bsum<2>(ss, red);
-    const float rc = rsqrtf(ss[0] / D + 1e-6f), rm = rsqrtf(ss[1] / D + 1e-6f);
-    float * z = A.z + ((size_t) j * PF_M + row) * 2 * D;
-    for (int i = tid; i < D; i += 256) { z[i] = c[i] * rc; z[D + i] = g[i] * rm; }
+    if (tid == 0) {
+        float * dst = A.rinv + ((size_t) j * PF_M + row) * 2;
+        dst[0] = rsqrtf(ss[0] / D + 1e-6f);
+        dst[1] = rsqrtf(ss[1] / D + 1e-6f);
+    }
 }
 
-// The controller down GEMM: g[j][row][64] = Z[j][row][2D] . wd[64][2D], in f32.
-struct pfcdn { const float * z; const float * wd0, *wd1, *wd2, *wd3; float * g; int j0, m; };
+// The controller down GEMM: g[j][row][64] = [cur*rc; msg*rm] . wd[64][2D], in f32.
+struct pfcdn { const float * cur[4]; const float * msg, * rinv; const float * wd[4]; float * g; int j0, m; };
 
 // The state update: out = (1 - tanh(g.forget)) * cur + tanh(g.gain) * msg per row, in f32.
-struct pfcup { const float * g, * msg; const float * cur[4]; const float * wgs[4], * wfs[4]; float * out; int j0, m; };
+// wgt / wft are the transposed [GRANK][D] gain / forget weights.
+struct pfcup { const float * g, * msg; const float * cur[4]; const float * wgt[4], * wft[4]; float * out; int j0, m; };
 
-// The loop controllers as 64x64-tiled f32 GEMMs, 4 x 4 per thread. down splits K = 2D
-// CT_S ways into gp[ks][j][row][GRANK]; up sums the parts in order (deterministic), then
-// runs the gain and forget GEMMs against g and applies the update.
+// The loop controllers as 64x64-tiled f32 GEMMs, 4 x 4 per thread with float4 loads and
+// register prefetching. down splits K = 2D CT_S ways into gp[ks][j][row][GRANK] (splits
+// 0..3 read cur, 4..7 read msg); up sums the parts in order (deterministic), then tiles
+// GRANK in KU = 16 steps for high occupancy and applies the update.
 constexpr int CT_S = 8, CT_KS = 2 * D / CT_S, CT_KC = 32;
-static __global__ __launch_bounds__(256) void k_pf_ctrl_down2(pfcdn a, float * gp) {
-    __shared__ float sX[64][CT_KC + 1], sW[GRANK][CT_KC + 1];
+static_assert(CT_S % 2 == 0 && CT_KS * (CT_S / 2) == D, "controller K splits align to D");
+typedef float pf_f32x4 __attribute__((ext_vector_type(4)));
+
+static __global__ __launch_bounds__(256, 3) void k_pf_ctrl_down2(pfcdn a, float * __restrict__ gp) {
+    __shared__ float sX[64][CT_KC + 4], sW[GRANK][CT_KC + 4], sR[64];
     const int t = threadIdx.x, tr = t >> 4, tc = t & 15, j = a.j0 + blockIdx.y, ks = blockIdx.z;
     const int r0 = blockIdx.x * 64;
-    const float * wd = j == 0 ? a.wd0 : j == 1 ? a.wd1 : j == 2 ? a.wd2 : a.wd3;
-    const float * z = a.z + (size_t) j * PF_M * 2 * D;
+    const bool is_msg = ks >= CT_S / 2;
+    const float * __restrict__ wd = a.wd[j];
+    const float * __restrict__ xsrc = is_msg ? (a.msg + (size_t) j * PF_M * D) : a.cur[j];
+    const float * __restrict__ rsrc = a.rinv + (size_t) j * PF_M * 2 + (is_msg ? 1 : 0);
+    if (t < 64) sR[t] = r0 + t < a.m ? rsrc[(size_t)(r0 + t) * 2] : 0.f;
+    __syncthreads();
+    const int xk0 = (is_msg ? (ks - CT_S / 2) : ks) * CT_KS;
+    const int wk0 = ks * CT_KS;
+    const int lr0 = t >> 3, lr1 = (t + 256) >> 3, lc = (t & 7) << 2;
+    const float rr0 = sR[lr0], rr1 = sR[lr1];
+    const pf_f32x4 z4 = {0.f, 0.f, 0.f, 0.f};
+    pf_f32x4 px0 = r0 + lr0 < a.m ? *(const pf_f32x4 *) (xsrc + (size_t)(r0 + lr0) * D + xk0 + lc) : z4;
+    pf_f32x4 px1 = r0 + lr1 < a.m ? *(const pf_f32x4 *) (xsrc + (size_t)(r0 + lr1) * D + xk0 + lc) : z4;
+    pf_f32x4 pw0 = *(const pf_f32x4 *) (wd + (size_t) lr0 * 2 * D + wk0 + lc);
+    pf_f32x4 pw1 = *(const pf_f32x4 *) (wd + (size_t) lr1 * 2 * D + wk0 + lc);
     float acc[4][4] = {};
-    for (int k0 = ks * CT_KS; k0 < (ks + 1) * CT_KS; k0 += CT_KC) {
+    for (int dk = 0; dk < CT_KS; dk += CT_KC) {
+        *(pf_f32x4 *) &sX[lr0][lc] = px0 * rr0;
+        *(pf_f32x4 *) &sX[lr1][lc] = px1 * rr1;
+        *(pf_f32x4 *) &sW[lr0][lc] = pw0;
+        *(pf_f32x4 *) &sW[lr1][lc] = pw1;
         __syncthreads();
-        for (int i = t; i < 64 * CT_KC; i += 256) {
-            const int r = i / CT_KC, k = i % CT_KC;
-            sX[r][k] = r0 + r < a.m ? z[(size_t)(r0 + r) * 2 * D + k0 + k] : 0.f;
-            sW[r][k] = wd[(size_t) r * 2 * D + k0 + k];
+        const int nk = dk + CT_KC;
+        if (nk < CT_KS) {
+            px0 = r0 + lr0 < a.m ? *(const pf_f32x4 *) (xsrc + (size_t)(r0 + lr0) * D + xk0 + nk + lc) : z4;
+            px1 = r0 + lr1 < a.m ? *(const pf_f32x4 *) (xsrc + (size_t)(r0 + lr1) * D + xk0 + nk + lc) : z4;
+            pw0 = *(const pf_f32x4 *) (wd + (size_t) lr0 * 2 * D + wk0 + nk + lc);
+            pw1 = *(const pf_f32x4 *) (wd + (size_t) lr1 * 2 * D + wk0 + nk + lc);
         }
-        __syncthreads();
-#pragma unroll 8
+#pragma unroll 2
         for (int k = 0; k < CT_KC; k++) {
             float xv[4], wv[4];
 #pragma unroll
@@ -151,6 +203,7 @@ static __global__ __launch_bounds__(256) void k_pf_ctrl_down2(pfcdn a, float * g
 #pragma unroll
                 for (int c = 0; c < 4; c++) acc[i][c] = fmaf(xv[i], wv[c], acc[i][c]);
         }
+        __syncthreads();
     }
 #pragma unroll
     for (int i = 0; i < 4; i++) {
@@ -168,102 +221,165 @@ static __global__ __launch_bounds__(256) void k_pf_gsum(const float * gp, float 
     for (int ks = 0; ks < CT_S; ks++) s += gp[((size_t) ks * 4 + j) * PF_M * GRANK + i];
     g[(size_t) j * PF_M * GRANK + i] = s;
 }
-static __global__ __launch_bounds__(256) void k_pf_ctrl_up2(pfcup a) {
-    __shared__ float sG[64][GRANK + 1], sWg[GRANK][64 + 1], sWf[GRANK][64 + 1];
+constexpr int CT_KU = 16;
+static __global__ __launch_bounds__(256, 3) void k_pf_ctrl_up2(pfcup a) {
+    __shared__ float sG[64][CT_KU + 4], sWg[CT_KU][64 + 4], sWf[CT_KU][64 + 4];
     const int t = threadIdx.x, tr = t >> 4, tc = t & 15, j = a.j0 + blockIdx.z;
     const int r0 = blockIdx.x * 64, c0 = blockIdx.y * 64;
-    for (int i = t; i < 64 * GRANK; i += 256) {
-        const int r = i / GRANK, k = i % GRANK;
-        sG[r][k] = r0 + r < a.m ? a.g[((size_t) j * PF_M + r0 + r) * GRANK + k] : 0.f;
-        const int col = i / GRANK;                 // weights [column][rank] -> [rank][column]
-        sWg[k][col] = a.wgs[j][(size_t)(c0 + col) * GRANK + k];
-        sWf[k][col] = a.wfs[j][(size_t)(c0 + col) * GRANK + k];
-    }
-    __syncthreads();
+    const float * __restrict__ gb = a.g + (size_t) j * PF_M * GRANK;
+    const float * __restrict__ wgt = a.wgt[j];
+    const float * __restrict__ wft = a.wft[j];
+    const int gr = t >> 2, gk = (t & 3) << 2;
+    const int wk = t >> 4, wc = (t & 15) << 2;
+    const pf_f32x4 z4 = {0.f, 0.f, 0.f, 0.f};
+    pf_f32x4 pg = r0 + gr < a.m ? *(const pf_f32x4 *) (gb + (size_t)(r0 + gr) * GRANK + gk) : z4;
+    pf_f32x4 pwg = *(const pf_f32x4 *) (wgt + (size_t) wk * D + c0 + wc);
+    pf_f32x4 pwf = *(const pf_f32x4 *) (wft + (size_t) wk * D + c0 + wc);
     float ga[4][4] = {}, fo[4][4] = {};
-#pragma unroll 8
-    for (int k = 0; k < GRANK; k++) {
-        float gv[4], wg[4], wf[4];
+    for (int k0 = 0; k0 < GRANK; k0 += CT_KU) {
+        *(pf_f32x4 *) &sG[gr][gk] = pg;
+        *(pf_f32x4 *) &sWg[wk][wc] = pwg;
+        *(pf_f32x4 *) &sWf[wk][wc] = pwf;
+        __syncthreads();
+        const int nk = k0 + CT_KU;
+        if (nk < GRANK) {
+            pg = r0 + gr < a.m ? *(const pf_f32x4 *) (gb + (size_t)(r0 + gr) * GRANK + nk + gk) : z4;
+            pwg = *(const pf_f32x4 *) (wgt + (size_t)(nk + wk) * D + c0 + wc);
+            pwf = *(const pf_f32x4 *) (wft + (size_t)(nk + wk) * D + c0 + wc);
+        }
+#pragma unroll 4
+        for (int k = 0; k < CT_KU; k++) {
+            float gv[4];
 #pragma unroll
-        for (int i = 0; i < 4; i++) { gv[i] = sG[tr * 4 + i][k]; wg[i] = sWg[k][tc + 16 * i]; wf[i] = sWf[k][tc + 16 * i]; }
+            for (int i = 0; i < 4; i++) gv[i] = sG[tr * 4 + i][k];
+            const pf_f32x4 wg = *(const pf_f32x4 *) &sWg[k][tc * 4];
+            const pf_f32x4 wf = *(const pf_f32x4 *) &sWf[k][tc * 4];
 #pragma unroll
-        for (int i = 0; i < 4; i++)
-#pragma unroll
-            for (int c = 0; c < 4; c++) { ga[i][c] = fmaf(gv[i], wg[c], ga[i][c]); fo[i][c] = fmaf(gv[i], wf[c], fo[i][c]); }
+            for (int i = 0; i < 4; i++) {
+                ga[i][0] = fmaf(gv[i], wg.x, ga[i][0]); fo[i][0] = fmaf(gv[i], wf.x, fo[i][0]);
+                ga[i][1] = fmaf(gv[i], wg.y, ga[i][1]); fo[i][1] = fmaf(gv[i], wf.y, fo[i][1]);
+                ga[i][2] = fmaf(gv[i], wg.z, ga[i][2]); fo[i][2] = fmaf(gv[i], wf.z, fo[i][2]);
+                ga[i][3] = fmaf(gv[i], wg.w, ga[i][3]); fo[i][3] = fmaf(gv[i], wf.w, fo[i][3]);
+            }
+        }
+        __syncthreads();
     }
-    const float * cur = a.cur[j], * msg = a.msg + (size_t) j * PF_M * D;
-    float * out = a.out + (size_t) j * PF_M * D;
+    const float * __restrict__ cur = a.cur[j], * __restrict__ msg = a.msg + (size_t) j * PF_M * D;
+    float * __restrict__ out = a.out + (size_t) j * PF_M * D;
 #pragma unroll
     for (int i = 0; i < 4; i++) {
         const int row = r0 + tr * 4 + i;
         if (row >= a.m) continue;
-#pragma unroll
-        for (int c = 0; c < 4; c++) {
-            const size_t o = (size_t) row * D + c0 + tc + 16 * c;
-            const float x = cur[o];
-            out[o] = (x - tanhf(fo[i][c]) * x) + tanhf(ga[i][c]) * msg[o];
-        }
+        const size_t o = (size_t) row * D + c0 + tc * 4;
+        const pf_f32x4 x = *(const pf_f32x4 *) (cur + o);
+        const pf_f32x4 mg = *(const pf_f32x4 *) (msg + o);
+        pf_f32x4 y;
+        y.x = fmaf(tanhf(ga[i][0]), mg.x, fmaf(-tanhf(fo[i][0]), x.x, x.x));
+        y.y = fmaf(tanhf(ga[i][1]), mg.y, fmaf(-tanhf(fo[i][1]), x.y, x.y));
+        y.z = fmaf(tanhf(ga[i][2]), mg.z, fmaf(-tanhf(fo[i][2]), x.z, x.z));
+        y.w = fmaf(tanhf(ga[i][3]), mg.w, fmaf(-tanhf(fo[i][3]), x.w, x.w));
+        *(pf_f32x4 *) (out + o) = y;
     }
 }
 
-// Head post, one chunk row per blockIdx.y. Local heads: the Q and R clips, tau and the
-// clipped R for the attention bias. Kv heads: the K or V conv along rows, then clip or norm.
+// Batched RMSNorm + int8 plane quantization (1 or 3 streams per launch). Keeps the row
+// in registers so the input is read once from HBM.
+struct pfnq { const float * x[3]; const float * w[3]; int8_t * q[3]; float * s[3]; float * outf; };
+static __global__ __launch_bounds__(256) void k_pf_normq(pfnq A, float eps) {
+    constexpr int NV = D / 256;
+    __shared__ float red[4];
+    const int m = blockIdx.x, j = blockIdx.y, t = threadIdx.x;
+    const float * __restrict__ xr = A.x[j] + (size_t) m * D;
+    const float * __restrict__ w = A.w[j];
+    float v[NV], ss = 0.f;
+#pragma unroll
+    for (int k = 0; k < NV; k++) { v[k] = xr[t + 256 * k]; ss = fmaf(v[k], v[k], ss); }
+#pragma unroll
+    for (int off = 32; off > 0; off >>= 1) ss += __shfl_down(ss, off, 64);
+    if ((t & 63) == 0) red[t >> 6] = ss;
+    __syncthreads();
+    const float r = 1.f / sqrtf((red[0] + red[1] + red[2] + red[3]) / D + eps);
+    int8_t * __restrict__ Ag = A.q[j];
+    float * __restrict__ sag = A.s[j];
+    float * __restrict__ outf = j == 0 ? A.outf : nullptr;
+#pragma unroll
+    for (int k = 0; k < NV; k++) {
+        const int idx = t + 256 * k;
+        const float y = v[k] * r * w[idx];
+        if (outf) outf[(size_t) m * D + idx] = y;
+        pf_quant_unit(y, idx, m, PF_M, Ag, sag, t & 31);
+    }
+}
+
+// Head post, HP_R chunk rows per blockIdx.y. Local heads: the Q and R clips, tau and the
+// clipped R for the attention bias. Kv heads: the K or V conv walked along rows so each
+// input is read once, then clip or norm.
+constexpr int HP_R = 16;
 struct pfhp {
     const float * qr, * rr, * kr, * vr, * dk, * dv;          // [M][QL/HL../KVL/16]
     const float * qclip, * rclip, * kconv, * vconv;
     float * hist, * q;                                        // slot hist, [M][QL]
     float * rvo;                                              // [M][HQL][DREL] clipped R
     __half * kc, * vc;
-    int pos0, full;
+    int pos0, m, full;
     float tau_a; int tau_f;
     float qk_clip, rel_clip, eps;
 };
 static __global__ __launch_bounds__(128) void k_pf_head_post(pfhp a) {
-    __shared__ float rv[DREL];
     __shared__ float red[2];
-    const int b = blockIdx.x, row = blockIdx.y, t = threadIdx.x, pos = a.pos0 + row;
+    const int b = blockIdx.x, r0 = blockIdx.y * HP_R, r1 = min(r0 + HP_R, a.m), t = threadIdx.x;
     if (b < HQL) {
         const int h = b, i = h * HD + t;
-        const float tau = a.full ? 1.f + a.tau_a * logf(fmaxf(1.f, (float) (pos + 1) / (float) a.tau_f)) : 1.f;
-        float x = a.qr[(size_t) row * QL + i] * a.qclip[i];
-        float n2[1] = {x * x};
-        bsum<1>(n2, red);
-        const float nr = sqrtf(n2[0]) + 1e-6f;
-        x *= fminf(fmaxf(a.qk_clip / nr, 0.f), 1.f);
-        a.q[(size_t) row * QL + i] = x * tau;
-        float r = t < DREL ? a.rr[(size_t) row * (HQL * DREL) + h * DREL + t] * a.rclip[h * DREL + t] : 0.f;
-        float r2[1] = {r * r};
-        bsum<1>(r2, red);
-        const float rn = sqrtf(r2[0]) + 1e-6f;
-        if (t < DREL) rv[t] = r * fminf(fmaxf(a.rel_clip / rn, 0.f), 1.f) * tau;
-        if (t < DREL) a.rvo[((size_t) row * HQL + h) * DREL + t] = rv[t];
+        const float qc = a.qclip[i];
+        const float rc = t < DREL ? a.rclip[h * DREL + t] : 0.f;
+        for (int row = r0; row < r1; row++) {
+            const int pos = a.pos0 + row;
+            const float tau = a.full ? 1.f + a.tau_a * logf(fmaxf(1.f, (float) (pos + 1) / (float) a.tau_f)) : 1.f;
+            float x = a.qr[(size_t) row * QL + i] * qc;
+            float n2[1] = {x * x};
+            bsum<1>(n2, red);
+            const float nr = sqrtf(n2[0]) + 1e-6f;
+            x *= fminf(fmaxf(a.qk_clip / nr, 0.f), 1.f);
+            a.q[(size_t) row * QL + i] = x * tau;
+            float r = t < DREL ? a.rr[(size_t) row * (HQL * DREL) + h * DREL + t] * rc : 0.f;
+            float r2[1] = {r * r};
+            bsum<1>(r2, red);
+            const float rn = sqrtf(r2[0]) + 1e-6f;
+            if (t < DREL) a.rvo[((size_t) row * HQL + h) * DREL + t] = r * fminf(fmaxf(a.rel_clip / rn, 0.f), 1.f) * tau;
+        }
         return;
     }
     const bool isk = b < HQL + HKVL;
     const int hk = isk ? b - HQL : b - HQL - HKVL, ch = hk * HD + t;
-    const float * rb = isk ? a.kr : a.vr;                     // [M][KVL]
-    const float * hb = a.hist + (isk ? H_K : H_V) + ch;
-    const float u = rb[(size_t) row * KVL + ch];
-    const float v1 = row >= 1 ? rb[(size_t)(row - 1) * KVL + ch] : hb[(size_t)(row + 2) * CHL];
-    const float v2 = row >= 2 ? rb[(size_t)(row - 2) * KVL + ch] : hb[(size_t)(row + 1) * CHL];
-    const float v3 = row >= 3 ? rb[(size_t)(row - 3) * KVL + ch] : hb[(size_t) row * CHL];
-    const float * w = (isk ? a.kconv : a.vconv) + (size_t) ch * NCONV;
-    float o = w[0] * v3 + w[1] * v2 + w[2] * v1 + w[3] * u;
-    if (a.dk) {
-        const float * tp = (isk ? a.dk : a.dv) + (size_t) row * (HKVL * NCONV) + hk * NCONV;
-        o += u * tp[0] + v1 * tp[1] + v2 * tp[2] + v3 * tp[3];
-    }
-    float y = (u + o) * (a.dk ? 1.f / sqrtf(2.f * NCONV + 1.f) : 1.f / sqrtf((float) NCONV + 1.f));
-    float n2[1] = {y * y};
-    bsum<1>(n2, red);
-    const int rrow = a.full ? pos : pos % PF_RING;
-    if (isk) {
-        const float nr = sqrtf(n2[0]) + 1e-6f;
-        y *= fminf(fmaxf(a.qk_clip / nr, 0.f), 1.f);
-        a.kc[(size_t) rrow * KVL + ch] = __float2half(y);
-    } else {
-        y *= rsqrtf(n2[0] / HD + a.eps);
-        a.vc[(size_t) rrow * KVL + ch] = __float2half(y);
+    const float * __restrict__ rb = isk ? a.kr : a.vr;        // [M][KVL]
+    const float * __restrict__ hb = a.hist + (isk ? H_K : H_V) + ch;
+    const float4 w = *(const float4 *) ((isk ? a.kconv : a.vconv) + (size_t) ch * NCONV);
+    const float sc = a.dk ? 1.f / sqrtf(2.f * NCONV + 1.f) : 1.f / sqrtf((float) NCONV + 1.f);
+    auto in = [&](int r) {
+        return r >= 0 ? rb[(size_t) r * KVL + ch] : hb[(size_t)(r + 3) * CHL];
+    };
+    float v3 = in(r0 - 3), v2 = in(r0 - 2), v1 = in(r0 - 1);
+    for (int row = r0; row < r1; row++) {
+        const float u = rb[(size_t) row * KVL + ch];
+        float o = w.x * v3 + w.y * v2 + w.z * v1 + w.w * u;
+        if (a.dk) {
+            const float * tp = (isk ? a.dk : a.dv) + (size_t) row * (HKVL * NCONV) + hk * NCONV;
+            o += u * tp[0] + v1 * tp[1] + v2 * tp[2] + v3 * tp[3];
+        }
+        float y = (u + o) * sc;
+        float n2[1] = {y * y};
+        bsum<1>(n2, red);
+        const int pos = a.pos0 + row;
+        const int rrow = a.full ? pos : pos % PF_RING;
+        if (isk) {
+            const float nr = sqrtf(n2[0]) + 1e-6f;
+            y *= fminf(fmaxf(a.qk_clip / nr, 0.f), 1.f);
+            a.kc[(size_t) rrow * KVL + ch] = __float2half(y);
+        } else {
+            y *= rsqrtf(n2[0] / HD + a.eps);
+            a.vc[(size_t) rrow * KVL + ch] = __float2half(y);
+        }
+        v3 = v2; v2 = v1; v1 = u;
     }
 }
 
@@ -278,12 +394,25 @@ struct pfat {
 };
 
 // Tiled flash attention, one block per (row tile, q head) and 64-wide key tiles.
-// S = Q.K^T uses packed f16 dots, 4 rows x 4 keys per thread. The online softmax runs
-// per row with the bias R . relb - sink, the causal and window masks and the zero sink
-// logit. O += P.V in f32. Row statistics stay in registers because the 16 lanes of a
-// row group own the same rows in both phases.
+// S = Q.K^T uses packed f16 dots with hi+lo Q, RPT rows x 4 keys per thread. Online
+// softmax uses 16-lane DPP reductions; O += P.V in f32. Reverse blockIdx.x schedules
+// long causal tiles first.
 constexpr int FA_K = 64, FA_QS = HD + 8;                // key tile, Q / K / V LDS row stride in halves
 typedef __fp16 fa_h2 __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ float fa_sum16(float x) {
+    x += qz_dpp<0x128>(x);
+    x += qz_dpp<0x124>(x);
+    x += qz_dpp<0x4E>(x);
+    x += qz_dpp<0xB1>(x);
+    return x;
+}
+__device__ __forceinline__ float fa_max16(float x) {
+    x = qz_dpp_fmax<0x128>(x);
+    x = qz_dpp_fmax<0x124>(x);
+    x = qz_dpp_fmax<0x4E>(x);
+    x = qz_dpp_fmax<0xB1>(x);
+    return x;
+}
 // RPT rows per thread, so a tile holds 16 * RPT rows. QLO splits Q into an f16 hi and lo.
 template <int RPT, bool QLO, int FA_R = 32>
 static __global__ __launch_bounds__(16 * FA_R / RPT) void k_pf_fattn(pfat a, int m) {
@@ -293,7 +422,7 @@ static __global__ __launch_bounds__(16 * FA_R / RPT) void k_pf_fattn(pfat a, int
     __shared__ float sP[FA_R][FA_K + 4];
     __shared__ float sB[FA_R + FA_K - 1][DREL + 1];          // bias basis rows of this tile's distances
     const int t = threadIdx.x, rg = t >> 4, cg = t & 15;
-    const int h = blockIdx.y, kvh = h / (HQ / HKV), r0 = blockIdx.x * FA_R;
+    const int h = blockIdx.y, kvh = h / (HQ / HKV), r0 = (gridDim.x - 1 - blockIdx.x) * FA_R;
     const int rows = min(FA_R, m - r0);
     const float scale = 1.f / sqrtf((float) HD);
     for (int e = t; e < FA_R * HD / 4; e += NTH) {
@@ -410,8 +539,7 @@ static __global__ __launch_bounds__(16 * FA_R / RPT) void k_pf_fattn(pfat a, int
                     tm = fmaxf(tm, s);
                 }
             }
-            #pragma unroll
-            for (int off = 8; off > 0; off >>= 1) tm = fmaxf(tm, __shfl_xor(tm, off, 16));
+            tm = fa_max16(tm);
             const float mn = fmaxf(mx[i], tm);
             const float cr = mn == -INFINITY ? 1.f : expf(mx[i] - mn);
             float ps = 0.f;
@@ -421,12 +549,13 @@ static __global__ __launch_bounds__(16 * FA_R / RPT) void k_pf_fattn(pfat a, int
                 sP[rg * RPT + i][cg + 16 * c] = p;
                 ps += p;
             }
-            #pragma unroll
-            for (int off = 8; off > 0; off >>= 1) ps += __shfl_xor(ps, off, 16);
+            ps = fa_sum16(ps);
             l[i] = l[i] * cr + ps;
             mx[i] = mn;
-            #pragma unroll
-            for (int d = 0; d < 8; d++) o[i][d] *= cr;
+            if (cr < 1.f) {
+                #pragma unroll
+                for (int d = 0; d < 8; d++) o[i][d] *= cr;
+            }
         }
         __syncthreads();
         st(vr);
@@ -478,7 +607,7 @@ static __global__ __launch_bounds__(16 * FA_R / RPT) void k_pf_fattn(pfat a, int
 // fresh residual block, otherwise the conv is added to x. Row t reads rows t-1..t-3 or
 // the slot's conv history, and u is the sum of every card's partial in card order (p[j]:
 // card j's, this card's own PART or its inbox copy PARTP of the others'). One thread per
-// column walks CV_R rows, so each input is read once.
+// 4 columns (float4) walks CV_R rows.
 struct pfparts { const float * p[QZ_NC]; };
 // Card-order sum of the partials at o (TP2: p0 + p1; TP4: (p0 + p1) + (p2 + p3)). p[1]
 // null: a single source (K and V commits).
@@ -493,34 +622,55 @@ static __device__ __forceinline__ float pf_psum(const pfparts & P, size_t o) {
 struct pfcv { pfparts P; const float * w; float * hrg; float * x, * blk; int m, push; };
 constexpr int CV_R = 32;
 static __global__ __launch_bounds__(256) void k_pf_conv2(pfcv a) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x, r0 = blockIdx.y * CV_R;
-    if (i >= D) return;
-    auto in = [&](int r) {   // input at chunk row r (r < 0: history row 3 + r)
-        if (r < 0) return a.hrg[(size_t)(r + 3) * CHL + i];
+    const int i4 = blockIdx.x * blockDim.x + threadIdx.x, r0 = blockIdx.y * CV_R;
+    if (i4 >= D / 4) return;
+    const int i = i4 * 4;
+    const float4 * __restrict__ p0 = (const float4 *) a.P.p[0];
+    const float4 * __restrict__ p1 = (const float4 *) a.P.p[1];
 #if QZ_NC == 4
-        const size_t o = (size_t) r * D + i;
-        return (a.P.p[0][o] + a.P.p[1][o]) + (a.P.p[2][o] + a.P.p[3][o]);
+    const float4 * __restrict__ p2 = (const float4 *) a.P.p[2];
+    const float4 * __restrict__ p3 = (const float4 *) a.P.p[3];
+#endif
+    const float4 * __restrict__ hr = (const float4 *) a.hrg;
+    auto in = [&](int r) -> float4 {   // input at chunk row r (r < 0: history row 3 + r)
+        if (r < 0) return hr[(size_t)(r + 3) * (CHL / 4) + i4];
+        const size_t o = (size_t) r * (D / 4) + i4;
+        const float4 a0 = p0[o], a1 = p1[o];
+#if QZ_NC == 4
+        const float4 a2 = p2[o], a3 = p3[o];
+        return make_float4((a0.x + a1.x) + (a2.x + a3.x), (a0.y + a1.y) + (a2.y + a3.y),
+                           (a0.z + a1.z) + (a2.z + a3.z), (a0.w + a1.w) + (a2.w + a3.w));
 #else
-        return a.P.p[0][(size_t) r * D + i] + a.P.p[1][(size_t) r * D + i];
+        return make_float4(a0.x + a1.x, a0.y + a1.y, a0.z + a1.z, a0.w + a1.w);
 #endif
     };
-    float v3 = in(r0 - 3), v2 = in(r0 - 2), v1 = in(r0 - 1);
-    const float * wi = a.w + (size_t) i * NCONV;
-    const float w0 = wi[0], w1 = wi[1], w2 = wi[2], w3 = wi[3], sc = 1.f / sqrtf((float) NCONV + 1.f);
+    float4 v3 = in(r0 - 3), v2 = in(r0 - 2), v1 = in(r0 - 1);
+    const float4 w0 = *(const float4 *) (a.w + (size_t) (i + 0) * NCONV);
+    const float4 w1 = *(const float4 *) (a.w + (size_t) (i + 1) * NCONV);
+    const float4 w2 = *(const float4 *) (a.w + (size_t) (i + 2) * NCONV);
+    const float4 w3 = *(const float4 *) (a.w + (size_t) (i + 3) * NCONV);
+    const float sc = 1.f / sqrtf((float) NCONV + 1.f);
+    float4 * __restrict__ x4 = (float4 *) a.x;
+    float4 * __restrict__ b4 = (float4 *) a.blk;
     const int r1 = min(r0 + CV_R, a.m);
     for (int row = r0; row < r1; row++) {
-        const float u = in(row);
-        const float y = (u + (w0 * v3 + w1 * v2 + w2 * v1 + w3 * u)) * sc;
-        const size_t o = (size_t) row * D + i;
-        if (a.push) { a.blk[o] = a.x[o]; a.x[o] = y; }
-        else a.x[o] += y;
+        const float4 u = in(row);
+        float4 y;
+        y.x = (u.x + (w0.x * v3.x + w0.y * v2.x + w0.z * v1.x + w0.w * u.x)) * sc;
+        y.y = (u.y + (w1.x * v3.y + w1.y * v2.y + w1.z * v1.y + w1.w * u.y)) * sc;
+        y.z = (u.z + (w2.x * v3.z + w2.y * v2.z + w2.z * v1.z + w2.w * u.z)) * sc;
+        y.w = (u.w + (w3.x * v3.w + w3.y * v2.w + w3.z * v1.w + w3.w * u.w)) * sc;
+        const size_t o = (size_t) row * (D / 4) + i4;
+        if (a.push) { b4[o] = x4[o]; x4[o] = y; }
+        else { const float4 xv = x4[o]; x4[o] = make_float4(xv.x + y.x, xv.y + y.y, xv.z + y.z, xv.w + y.w); }
         v3 = v2; v2 = v1; v1 = u;
     }
 }
 
 // Roll the conv history forward: its 3 rows become the chunk's last inputs, and rows
-// below the chunk start come from the old history. K and V have one source (P.p[1] null).
-static __global__ __launch_bounds__(256) void k_pf_commit(pfparts P, float * hrg, int w, int m) {
+// below the chunk start come from the old history. K and V have one source (P.p[1] null);
+// dst may alias hrg.
+static __global__ __launch_bounds__(256) void k_pf_commit(pfparts P, const float * hrg, float * dst, int w, int m) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= w) return;
     float v[3];
@@ -531,47 +681,57 @@ static __global__ __launch_bounds__(256) void k_pf_commit(pfparts P, float * hrg
              : pf_psum(P, (size_t) idx * w + c);
     }
     #pragma unroll
-    for (int r = 0; r < 3; r++) hrg[(size_t) r * CHL + c] = v[r];
+    for (int r = 0; r < 3; r++) dst[(size_t) r * CHL + c] = v[r];
 }
 
 // The router as a tiled f32 GEMM, with K split RT_S ways for occupancy: one block per
-// (16 rows, one K split) over 128 experts, 2 rows x 4 experts per thread, K chunks of
-// 32 in LDS. k_pf_topk sums the partials in order, which keeps the result
-// deterministic, applies sigmoid, then picks the top NE_USED by p + bias and scales by 1/sum.
-constexpr int RT_R = 16, RT_K = 32, RT_S = 4;
-static __global__ __launch_bounds__(256) void k_pf_router2(const float * f, const float * wr, float * part, int m) {
-    __shared__ float sF[RT_R][RT_K + 1], sW[NE][RT_K + 1];
-    const int t = threadIdx.x, tr = t >> 5, te = t & 31, r0 = blockIdx.x * RT_R;
+// (64 rows, one K split) over 128 experts, 4 rows x 8 experts per thread, K chunks of
+// 16 in LDS with float4 loads and register prefetching. k_pf_topk sums the partials in
+// order, which keeps the result deterministic, applies sigmoid, then picks the top NE_USED.
+constexpr int RT_R = 64, RT_K = 16, RT_S = 4;
+static __global__ __launch_bounds__(256, 3) void k_pf_router2(const float * __restrict__ f, const float * __restrict__ wr,
+                                                              float * __restrict__ part, int m) {
+    __shared__ float sF[RT_R][RT_K + 4], sW[NE][RT_K + 4];
+    const int t = threadIdx.x, tr = t >> 4, te = t & 15, r0 = blockIdx.x * RT_R;
     const int kl = blockIdx.y * (D / RT_S), kh = kl + D / RT_S;
-    float acc[2][4] = {};
+    const int fr = t >> 2, fk = (t & 3) << 2;
+    const int wx0 = t >> 2, wx1 = (t + 256) >> 2;
+    const pf_f32x4 z4 = {0.f, 0.f, 0.f, 0.f};
+    pf_f32x4 pf = r0 + fr < m ? *(const pf_f32x4 *) (f + (size_t)(r0 + fr) * D + kl + fk) : z4;
+    pf_f32x4 pw0 = *(const pf_f32x4 *) (wr + (size_t) wx0 * D + kl + fk);
+    pf_f32x4 pw1 = *(const pf_f32x4 *) (wr + (size_t) wx1 * D + kl + fk);
+    float acc[4][8] = {};
     for (int k0 = kl; k0 < kh; k0 += RT_K) {
+        *(pf_f32x4 *) &sF[fr][fk] = pf;
+        *(pf_f32x4 *) &sW[wx0][fk] = pw0;
+        *(pf_f32x4 *) &sW[wx1][fk] = pw1;
         __syncthreads();
-        for (int e = t; e < RT_R * RT_K; e += 256) {
-            const int r = e / RT_K, k = e % RT_K;
-            sF[r][k] = r0 + r < m ? f[(size_t)(r0 + r) * D + k0 + k] : 0.f;
+        const int nk = k0 + RT_K;
+        if (nk < kh) {
+            pf = r0 + fr < m ? *(const pf_f32x4 *) (f + (size_t)(r0 + fr) * D + nk + fk) : z4;
+            pw0 = *(const pf_f32x4 *) (wr + (size_t) wx0 * D + nk + fk);
+            pw1 = *(const pf_f32x4 *) (wr + (size_t) wx1 * D + nk + fk);
         }
-        for (int e = t; e < NE * RT_K; e += 256) {
-            const int x = e / RT_K, k = e % RT_K;
-            sW[x][k] = wr[(size_t) x * D + k0 + k];
-        }
-        __syncthreads();
-        #pragma unroll 8
+        #pragma unroll 4
         for (int k = 0; k < RT_K; k++) {
-            const float f0 = sF[tr * 2][k], f1 = sF[tr * 2 + 1][k];
+            float fv[4];
             #pragma unroll
-            for (int c = 0; c < 4; c++) {
-                const float w = sW[te + 32 * c][k];
-                acc[0][c] = fmaf(f0, w, acc[0][c]);
-                acc[1][c] = fmaf(f1, w, acc[1][c]);
+            for (int i = 0; i < 4; i++) fv[i] = sF[tr * 4 + i][k];
+            #pragma unroll
+            for (int c = 0; c < 8; c++) {
+                const float w = sW[te + 16 * c][k];
+                #pragma unroll
+                for (int i = 0; i < 4; i++) acc[i][c] = fmaf(fv[i], w, acc[i][c]);
             }
         }
+        __syncthreads();
     }
     #pragma unroll
-    for (int i = 0; i < 2; i++) {
-        const int r = r0 + tr * 2 + i;
+    for (int i = 0; i < 4; i++) {
+        const int r = r0 + tr * 4 + i;
         if (r < m)
             #pragma unroll
-            for (int c = 0; c < 4; c++) part[((size_t) blockIdx.y * m + r) * NE + te + 32 * c] = acc[i][c];
+            for (int c = 0; c < 8; c++) part[((size_t) blockIdx.y * m + r) * NE + te + 16 * c] = acc[i][c];
     }
 }
 // One 64-lane wave per row.
@@ -652,28 +812,39 @@ static __global__ __launch_bounds__(256) void k_pf_tiles(const int * start, int4
     }
 }
 
-// Two tile lists: A holds the BN-wide tiles (the full ones plus a remainder above BN/2),
-// and B the BN/2-wide tiles for remainders up to BN/2; ntl counts both.
-constexpr int TM_B = PF_NP / 16 + NE;      // list B offset in tm; list A: np / 16 + NE tiles
+// Three tile lists for BN = 64: A holds BN-wide tiles (full tiles + remainders > 32),
+// B holds BN/2-wide tiles (17..32), and C holds BN/4-wide tiles (1..16). ntl[0..2] counts them.
+constexpr int TM_B = PF_NP / 16 + NE;          // list B offset in tm
+constexpr int TM_C = PF_NP / 16 + 2 * NE;      // list C offset in tm
 template <int BN>
 static __global__ __launch_bounds__(256) void k_pf_tiles2(const int * start, int4 * tm, int * ntl) {
-    __shared__ int offa[NE], offb[NE];
+    __shared__ int offa[NE], offb[NE], offc[NE];
     if (threadIdx.x == 0) {
-        int sa = 0, sb = 0;
+        int sa = 0, sb = 0, sc = 0;
         for (int e = 0; e < NE; e++) {
             const int cnt = start[e + 1] - start[e], r = cnt % BN;
-            offa[e] = sa; offb[e] = sb;
+            offa[e] = sa; offb[e] = sb; offc[e] = sc;
             sa += cnt / BN + (r > BN / 2);
-            sb += (r > 0 && r <= BN / 2);
+            if constexpr (BN == 64) {
+                sb += (r > 16 && r <= 32);
+                sc += (r > 0 && r <= 16);
+            } else {
+                sb += (r > 0 && r <= BN / 2);
+            }
         }
-        ntl[0] = sa; ntl[1] = sb;
+        ntl[0] = sa; ntl[1] = sb; ntl[2] = sc;
     }
     __syncthreads();
     for (int e = threadIdx.x; e < NE; e += 256) {
         const int a0 = start[e], cnt = start[e + 1] - a0, full = cnt / BN, r = cnt % BN;
         for (int j = 0; j < full; j++) tm[offa[e] + j] = make_int4(e, a0 + j * BN, BN, 0);
         if (r > BN / 2) tm[offa[e] + full] = make_int4(e, a0 + full * BN, r, 0);
-        else if (r > 0) tm[TM_B + offb[e]] = make_int4(e, a0 + full * BN, r, 0);
+        else if constexpr (BN == 64) {
+            if (r > 16) tm[TM_B + offb[e]] = make_int4(e, a0 + full * BN, r, 0);
+            else if (r > 0) tm[TM_C + offc[e]] = make_int4(e, a0 + full * BN, r, 0);
+        } else if (r > 0) {
+            tm[TM_B + offb[e]] = make_int4(e, a0 + full * BN, r, 0);
+        }
     }
 }
 
@@ -683,23 +854,31 @@ static __global__ __launch_bounds__(256) void k_pf_tiles2(const int * start, int
 // Fused SITU output of gate_up: int8 planes [NGRP_FF][np][128] plus scales.
 struct pf_situo { unsigned char * q = nullptr; float * qs = nullptr; int np = 0; float beta = 0.f, lb = 0.f; };
 
-template <int BN, int GATHER, int NTT, int FS = 0>
+template <int BN, int GATHER, int NTT, int FS = 0, bool K_DIV4 = false, bool HALF_OUT = false>
 static __device__ __forceinline__ void moe_gemm_body(
-        const int4 tl,
-        const char * W, const __half * sw, const int * perm,
-        const int8_t * Ag, const float * sag, int Mp, int K,
-        float * C, int ldc, int N, const pf_situo so = pf_situo{}) {
+        const int4 tl, int bx,
+        const char * __restrict__ W, const __half * __restrict__ sw, const int * __restrict__ perm,
+        const int8_t * __restrict__ Ag, const float * __restrict__ sag, int Mp, int K,
+        void * __restrict__ Cv, int ldc, int N, const pf_situo so = pf_situo{}, void * __restrict__ C2v = nullptr) {
     constexpr int NT = NTT;                    // pair lanes
     constexpr int RG = 256 / NT;               // row groups
     constexpr int RR = 64 / RG;                // rows per thread
     constexpr int NH = BN / NT;                // pair halves
     constexpr int NXF = BN * 4 >= 256 ? BN * 4 / 256 : 1;   // activation slots per thread
-    __shared__ pf_u32x4 sWlo[64][4], sWhi[64][4];
-    __shared__ unsigned short sWd[4][64];
-    __shared__ pf_xrow sX[BN];
-    __shared__ float sXd[BN][4];
+    __shared__ union {
+        struct {
+            pf_u32x4 wlo[64][4], whi[64][4];
+            unsigned short wd[4][64];
+            pf_xrow x[BN];
+            float xd[BN][4];
+        } g;
+        struct {
+            float a[32][BN + 1];               // gate [j][slot]
+            float u[BN * 32];                  // up [slot][j ^ slot]
+        } f;
+    } sm;
     const int t = threadIdx.x, tx = t % NT, ty = t / NT;
-    const int nkb = K / 32, row0 = blockIdx.x * 64, cnt = tl.z;
+    const int nkb = K / 32, row0 = bx * 64, cnt = tl.z;
     W += (size_t) tl.x * N * K;
     sw += (size_t) tl.x * N * (K / 32);
     const unsigned wrow = (unsigned) min(row0 + t / 4, N - 1);
@@ -724,7 +903,7 @@ static __device__ __forceinline__ void moe_gemm_body(
     unsigned short pwd;
     float pxd[NXF];
     auto prefetch = [&](int sb0) {
-        if (sb0 + (t % 4) < nkb) {
+        if (K_DIV4 || sb0 + (t % 4) < nkb) {
             const pf_u32x4 * ws = (const pf_u32x4 *) (W + w_off + (unsigned) sb0 * 32u);
             pwlo = ws[0]; pwhi = ws[1];
             pwd = ((const unsigned short *) sw)[wd_off + (unsigned) sb0];
@@ -743,13 +922,13 @@ static __device__ __forceinline__ void moe_gemm_body(
     auto store = [&]() {
         // K slot XOR the row group: row groups in one wave hit distinct banks
         const int ks = (t % 4) ^ ((t / 4 / RR) & 3);
-        sWlo[t / 4][ks] = pwlo; sWhi[t / 4][ks] = pwhi; sWd[t % 4][t / 4] = pwd;
+        sm.g.wlo[t / 4][ks] = pwlo; sm.g.whi[t / 4][ks] = pwhi; sm.g.wd[t % 4][t / 4] = pwd;
 #pragma unroll
         for (int i = 0; i < NXF; i++) {
             if (!xok[i]) continue;
             const int e = t + 256 * i;
-            sX[e / 4].q[e % 4][0] = pxlo[i]; sX[e / 4].q[e % 4][1] = pxhi[i];
-            sXd[e / 4][e % 4] = pxd[i];
+            sm.g.x[e / 4].q[e % 4][0] = pxlo[i]; sm.g.x[e / 4].q[e % 4][1] = pxhi[i];
+            sm.g.xd[e / 4][e % 4] = pxd[i];
         }
     };
     prefetch(0);
@@ -760,23 +939,25 @@ static __device__ __forceinline__ void moe_gemm_body(
         if (sb0 + 4 < nkb) prefetch(sb0 + 4);
 #pragma unroll 1
         for (int kk = 0; kk < 4; kk++) {
-            if (sb0 + kk >= nkb) break;
+            if (!K_DIV4 && sb0 + kk >= nkb) break;
             int xq[NH][8];
             float dx[NH];
 #pragma unroll
             for (int n = 0; n < NH; n++) {
-                const pf_u32x4 q0 = sX[tx + NT * n].q[kk][0], q1 = sX[tx + NT * n].q[kk][1];
+                const pf_u32x4 q0 = sm.g.x[tx + NT * n].q[kk][0], q1 = sm.g.x[tx + NT * n].q[kk][1];
                 xq[n][0] = q0.x; xq[n][1] = q0.y; xq[n][2] = q0.z; xq[n][3] = q0.w;
                 xq[n][4] = q1.x; xq[n][5] = q1.y; xq[n][6] = q1.z; xq[n][7] = q1.w;
-                dx[n] = sXd[tx + NT * n][kk];
+                dx[n] = sm.g.xd[tx + NT * n][kk];
             }
             const int kw = kk ^ (ty & 3);
-            pf_u32x4 wlo = sWlo[rb][kw], whi = sWhi[rb][kw];
+            pf_u32x4 wlo = sm.g.wlo[rb][kw], whi = sm.g.whi[rb][kw];
+            const uint2 dw = *(const uint2 *) &sm.g.wd[kk][rb];
 #pragma unroll
             for (int r = 0; r < RR; r++) {
                 const pf_u32x4 lo = wlo, hi = whi;
-                if (r + 1 < RR) { wlo = sWlo[rb + r + 1][kw]; whi = sWhi[rb + r + 1][kw]; }
-                const float d = __half2float(__ushort_as_half(sWd[kk][rb + r]));
+                if (r + 1 < RR) { wlo = sm.g.wlo[rb + r + 1][kw]; whi = sm.g.whi[rb + r + 1][kw]; }
+                const unsigned dw32 = r < 2 ? dw.x : dw.y;
+                const float d = __half2float(__ushort_as_half((unsigned short) ((r & 1) ? dw32 >> 16 : dw32 & 0xffffu)));
 #pragma unroll
                 for (int n = 0; n < NH; n++) {
                     int isum = 0;
@@ -796,24 +977,21 @@ static __device__ __forceinline__ void moe_gemm_body(
     }
     if constexpr (FS) {
         // tile rows 0..31 hold gate rows and rows 32..63 their up rows (gu_row). Stage
-        // both halves in LDS; every thread then applies SITU and the per-32 quant, one
-        // group per pair
-        __shared__ float sA[32][BN + 1];          // gate [j][slot]
-        float * sU = (float *) sX;                 // up [slot][j ^ slot], the staging buffer is free
+        // both halves in the aliased LDS union; every thread applies SITU and per-32 quant.
 #pragma unroll
         for (int n = 0; n < NH; n++) {
             const int slot = tx + NT * n;
 #pragma unroll
             for (int r = 0; r < RR; r++) {
-                if (rb < 32) sA[rb + r][slot] = acc[r][n];
-                else sU[slot * 32 + ((rb - 32 + r) ^ (slot & 31))] = acc[r][n];
+                if (rb < 32) sm.f.a[rb + r][slot] = acc[r][n];
+                else sm.f.u[slot * 32 + ((rb - 32 + r) ^ (slot & 31))] = acc[r][n];
             }
         }
         __syncthreads();
-        const int j0 = blockIdx.x * 32;
+        const int j0 = bx * 32;
         for (int i = t; i < BN * 32; i += 256) {
             const int slot = i / 32, jj = i % 32;
-            const float g = sA[jj][slot], u = sU[slot * 32 + (jj ^ (slot & 31))];
+            const float g = sm.f.a[jj][slot], u = sm.f.u[slot * 32 + (jj ^ (slot & 31))];
             const float x = so.beta * tanhf(g / so.beta) * sigm(g) * (so.lb * tanhf(u / so.lb));
             const float amax = qz_amax32(fabsf(x));
             if (slot < cnt) {
@@ -826,53 +1004,127 @@ static __device__ __forceinline__ void moe_gemm_body(
         }
         return;
     }
+    if constexpr (HALF_OUT) {
+        __half * __restrict__ C = (__half *) Cv;
+        __half * __restrict__ C2 = (__half *) C2v;
+#pragma unroll
+        for (int n = 0; n < NH; n++) {
+            const int slot = tx + NT * n;
+            if (slot >= cnt) continue;
+            const size_t off = (size_t) (tl.y + slot) * ldc + row0 + rb;
+            __half * dst = C + off;
+            __half * d2 = C2 ? C2 + off : nullptr;
+#pragma unroll
+            for (int r = 0; r < RR; r += 4) {
+                const __half2 h0 = __floats2half2_rn(acc[r][n], acc[r + 1][n]);
+                const __half2 h1 = __floats2half2_rn(acc[r + 2][n], acc[r + 3][n]);
+                const uint2 u = make_uint2(*(const unsigned *) &h0, *(const unsigned *) &h1);
+                *(uint2 *) (dst + r) = u;
+                if (d2) *(uint2 *) (d2 + r) = u;
+            }
+        }
+        return;
+    }
+    float * __restrict__ C = (float *) Cv;
+    float * __restrict__ C2 = (float *) C2v;
 #pragma unroll
     for (int n = 0; n < NH; n++) {
         const int slot = tx + NT * n;
         if (slot >= cnt) continue;
         if (row0 + 64 > N) {                       // partial weight tile (N % 64 != 0): guard each row
 #pragma unroll
-            for (int r = 0; r < RR; r++) if (row0 + rb + r < N) C[(size_t) (tl.y + slot) * ldc + row0 + rb + r] = acc[r][n];
+            for (int r = 0; r < RR; r++) if (row0 + rb + r < N) {
+                const size_t o = (size_t) (tl.y + slot) * ldc + row0 + rb + r;
+                C[o] = acc[r][n];
+                if (C2) C2[o] = acc[r][n];
+            }
             continue;
         }
-        float * dst = C + (size_t) (tl.y + slot) * ldc + row0 + rb;
+        const size_t off = (size_t) (tl.y + slot) * ldc + row0 + rb;
+        float * dst = C + off;
 #pragma unroll
         for (int r = 0; r < RR; r += 4)
             *(float4 *) (dst + r) = make_float4(acc[r][n], acc[r + 1][n], acc[r + 2][n], acc[r + 3][n]);
+        if (C2) {
+            float * d2 = C2 + off;
+#pragma unroll
+            for (int r = 0; r < RR; r += 4)
+                *(float4 *) (d2 + r) = make_float4(acc[r][n], acc[r + 1][n], acc[r + 2][n], acc[r + 3][n]);
+        }
     }
 }
 
-template <int BN, int GATHER, int NTT = (BN < 64 ? BN : 64), int FS = 0>
-static __global__ __launch_bounds__(256, BN <= 32 ? 3 : 2) void k_pf_moe_gemm(
+template <int BN, int GATHER, int NTT = (BN < 64 ? BN : 64), int FS = 0, bool K_DIV4 = false, int GG = 4>
+static __global__ __launch_bounds__(256, BN == 16 ? 3 : 2) void k_pf_moe_gemm(
         const int4 * tm, const int * ntl,
         const char * W, const __half * sw, const int * perm,
         const int8_t * Ag, const float * sag, int Mp, int K,
         float * C, int ldc, int N, const pf_situo so) {
-    if (blockIdx.y >= *ntl) return;
-    moe_gemm_body<BN, GATHER, NTT, FS>(tm[blockIdx.y], W, sw, perm, Ag, sag, Mp, K, C, ldc, N, so);
+    const int n = *ntl;
+    int bx, by;
+    if constexpr (GG > 1) {
+        const int gx = gridDim.x, lin = blockIdx.y * gx + blockIdx.x;
+        if (lin >= n * gx) return;
+        const int per = GG * gx, fy = (lin / per) * GG;
+        const int gs = min(n - fy, GG), rem = lin - fy * gx;
+        bx = rem / gs; by = fy + rem % gs;
+    } else {
+        if ((int) blockIdx.y >= n) return;
+        bx = blockIdx.x; by = blockIdx.y;
+    }
+    moe_gemm_body<BN, GATHER, NTT, FS, K_DIV4>(tm[by], bx, W, sw, perm, Ag, sag, Mp, K, C, ldc, N, so);
 }
 
-// Dense projections through the same tile body. One launch runs up to 8 jobs along
-// blockIdx.z, with 64-row token tiles along blockIdx.y; a job's last weight tile may be partial.
-struct dgjob { const char * W; const __half * sw; const int8_t * A; const float * as; float * C; int ldc, N, K; };
-struct dgjobs { dgjob j[8]; };
-static __global__ __launch_bounds__(256, 2) void k_pf_dgemm(dgjobs J, int m) {
-    const dgjob & g = J.j[blockIdx.z];
-    if ((int) blockIdx.x * 64 >= g.N) return;
-    const int a0 = blockIdx.y * 64;
-    moe_gemm_body<64, 0, 16>(make_int4(0, a0, min(64, m - a0), 0), g.W, g.sw, nullptr, g.A, g.as, PF_M, g.K, g.C, g.ldc, g.N);
+// Dense projections as packed 64x64 Q8 GEMMs (up to 8 jobs in one launch, zero empty
+// blocks, 8-way L2-grouped dispatch across token tiles). C2, when set (P2P row-parallel
+// partial), streams a second copy straight into the peer's inbox. All dense K are multiples of 128.
+struct dgjob { const char * W; const __half * sw; const int8_t * A; const float * as; void * C; int ldc, N, K; void * C2; };
+struct dgjobs { dgjob j[8]; int off[9]; int n; };
+template <bool HALF_OUT = false>
+static __global__ __launch_bounds__(256, 2) void k_pf_dgemm(dgjobs J, int m, int Mp = PF_M) {
+    constexpr int DG_GG = 8;
+    int bx, by;
+    {
+        const int gx = gridDim.x, lin = blockIdx.y * gx + blockIdx.x, per = DG_GG * gx, fy = (lin / per) * DG_GG;
+        const int gs = min((int) gridDim.y - fy, DG_GG), rem = lin - fy * gx;
+        bx = rem / gs; by = fy + rem % gs;
+    }
+    int ji = 0;
+#pragma unroll
+    for (int k = 1; k < 8; k++) if (k < J.n && bx >= J.off[k]) ji = k;
+    const dgjob & g = J.j[ji];
+    const int a0 = by * 64;
+    moe_gemm_body<64, 0, 16, 0, true, HALF_OUT>(make_int4(0, a0, min(64, m - a0), 0), bx - J.off[ji],
+                                                g.W, g.sw, nullptr, g.A, g.as, Mp, g.K, g.C, g.ldc, g.N, pf_situo{}, g.C2);
 }
 
 // Per row, the weighted sum of its pairs' partials in the router's selection order. That
 // order fixes the rounding and there are no atomics, so the sum is deterministic.
-static __global__ __launch_bounds__(256) void k_pf_moe_reduce(const float * y, const int * inv, const float * wts, float * out) {
-    const int r = blockIdx.x;
+// out2, when set (P2P), writes a second copy straight into the peer's inbox.
+static __global__ __launch_bounds__(256) void k_pf_moe_reduce(
+        const float * __restrict__ y, const int * __restrict__ inv, const float * __restrict__ wts,
+        float * __restrict__ out, float * __restrict__ out2) {
+    const int r = blockIdx.x, t = threadIdx.x;
     const int * iv = inv + (size_t) r * NE_USED;
     const float * wt = wts + (size_t) r * NE_USED;
-    for (int o = threadIdx.x; o < D; o += 256) {
-        float acc = 0.f;
-        for (int k = 0; k < NE_USED; k++) acc = fmaf(wt[k], y[(size_t) iv[k] * D + o], acc);
-        out[(size_t) r * D + o] = acc;
+    const float * yp[NE_USED];
+    float w[NE_USED];
+#pragma unroll
+    for (int k = 0; k < NE_USED; k++) { yp[k] = y + (size_t) iv[k] * D; w[k] = wt[k]; }
+    float4 * o1 = (float4 *) (out + (size_t) r * D);
+    float4 * o2 = out2 ? (float4 *) (out2 + (size_t) r * D) : nullptr;
+    for (int o = t; o < D / 4; o += 256) {
+        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int k = 0; k < NE_USED; k++) {
+            const float4 v = ((const float4 *) yp[k])[o];
+            acc.x = fmaf(w[k], v.x, acc.x);
+            acc.y = fmaf(w[k], v.y, acc.y);
+            acc.z = fmaf(w[k], v.z, acc.z);
+            acc.w = fmaf(w[k], v.w, acc.w);
+        }
+        o1[o] = acc;
+        if (o2) o2[o] = acc;
     }
 }
 
@@ -883,7 +1135,7 @@ struct pf_plane { unsigned char * q; float * s; };   // pf_gemm activation plane
 struct pf_card {
     float * X, * P, * OUT[2], * BLK[8];
     float * IN;                        // [3][PF_M][D]
-    float * MSG, * CT, * Z;            // [4][PF_M][D], [4][PF_M][D], [4][PF_M][2D]
+    float * MSG, * CT, * RINV;         // [4][PF_M][D], [4][PF_M][D], [4][PF_M][2]
     float * Gb;                        // [4][PF_M][GRANK]
     float * F, * FN, * PART[2];        // [PF_M][D]
     float * PARTP[2][QZ_NC - 1];       // the other cards' PART[buf], pushed here: slot k-1 holds peer (me+k)%NC's
@@ -926,6 +1178,8 @@ struct ink2_pf {
     const int * irow = nullptr;
     const float * img[QZ_NC] = {};
     int * irw[QZ_NC] = {};                 // the chunk's irow, one per card
+    float * shist[QZ_NC] = {};             // mid-chunk conv-history snapshot buffers (prefix cache)
+    float * ehist[QZ_NC] = {};             // full-chunk conv-history when the last prompt token rides along
     bool tapping() const { return dtaps != nullptr; }
     void tap(int k, int p0, int m) {
         if (!tapping()) return;
@@ -939,11 +1193,13 @@ struct ink2_pf {
         ink2_card & K = E.C[0];
         ICHECK(hipSetDevice(qz_dev_of(0)));
         if (!tapd) ICHECK(hipMalloc(&tapd, (size_t) PF_M * D * 4));
-        for (int r = 0; r < m; r++) {
-            std::vector<const float *> bl;
-            for (int ib : S.blocks) bl.push_back(B[0].BLK[ib] + (size_t) r * D);
-            E.mix(0, bl, B[0].X + (size_t) r * D, K.out_q, 1, tapd + (size_t) r * D);
-        }
+        pfmix A{};
+        int nst = 0;
+        for (int ib : S.blocks) A.p[nst++] = B[0].BLK[ib];
+        A.p[nst++] = B[0].X;
+        A.n = nst;
+        A.qy = K.out_q; A.m = 1; A.out = tapd; A.ostr = 0;
+        launch_pf_mix<1>(m, K.st, A);
         k_pf_rmsw<<<m, 256, 0, K.st>>>(tapd, K.out_norm, dtaps + 3 * D, 4 * D, E.hp.eps);
         if (on_chunk) on_chunk(p0, m);
     }
@@ -962,7 +1218,7 @@ struct ink2_pf {
             f((size_t) (K / 32) * PF_M);
         };
         for (int i = 0; i < 1 + 1 + 2 + 8; i++) f(MD);                       // X P OUT BLK
-        f(3 * MD); f(4 * MD); f(4 * MD); f(4 * PF_M * 2 * D);                 // IN MSG CT Z
+        f(3 * MD); f(4 * MD); f(4 * MD); f(4 * (size_t) PF_M * 2);           // IN MSG CT RINV
         f(4 * (size_t) PF_M * GRANK); f(MD); f(MD); f(MD); f(MD);             // Gb F FN PART x2
         f((size_t) PF_M * QL); f((size_t) PF_M * QL); f((size_t) PF_M * QL);  // QR GR Q
         f((size_t) PF_M * (HQL * DREL)); f((size_t) PF_M * HQL);              // RR SK
@@ -973,7 +1229,7 @@ struct ink2_pf {
         f((size_t) PF_NP * NSC_FF); f((size_t) PF_M * NE_USED);               // APS WTS
         f((size_t) PF_M * NE_USED);                                           // IDS (as floats)
         f((size_t) PF_NP); f((size_t) PF_NP); f((size_t) (NE + 1)); f(PF_M);  // PERM INV START TOK
-        f((size_t) (PF_NP / 16 + 2 * NE) * 4); f(1);                          // TM (lists A, B) NTL
+        f((size_t) (PF_NP / 16 + 3 * NE) * 4); f(4);                          // TM (lists A, B, C) NTL
         for (int i = 0; i < 3; i++) plane(D);                                 // INP
         plane(D); plane(QL);                                                  // FF AT
         by((size_t) PF_NP * FFL_PAD);                                         // APQ
@@ -988,7 +1244,7 @@ struct ink2_pf {
         b.P = (float *) nx();
         for (auto & q : b.OUT) q = (float *) nx();
         for (auto & q : b.BLK) q = (float *) nx();
-        b.IN = (float *) nx(); b.MSG = (float *) nx(); b.CT = (float *) nx(); b.Z = (float *) nx();
+        b.IN = (float *) nx(); b.MSG = (float *) nx(); b.CT = (float *) nx(); b.RINV = (float *) nx();
         b.Gb = (float *) nx(); b.F = (float *) nx(); b.FN = (float *) nx();
         for (auto & q : b.PART) q = (float *) nx();
         b.QR = (float *) nx(); b.GR = (float *) nx(); b.Q = (float *) nx(); b.RR = (float *) nx(); b.SK = (float *) nx();
@@ -1016,35 +1272,63 @@ struct ink2_pf {
 
     // ---- launch helpers (current device = card c), then one application: all m chunk
     // rows of positions pos0..pos0+m-1 through state slot `slot` of physical layer ip
-    dgjob djob(const qw & W, const unsigned char * av, const float * as, float * C, int ldc) {
-        return dgjob{W.v, W.s, (const int8_t *) av, as, C, ldc, (int) W.N, (int) W.K};
+    dgjob djob(const qw & W, const unsigned char * av, const float * as, void * C, int ldc, void * C2 = nullptr) {
+        return dgjob{W.v, W.s, (const int8_t *) av, as, C, ldc, (int) W.N, (int) W.K, C2};
     }
-    // several dense GEMMs in one launch, up to 8 jobs
+    // several dense GEMMs in one launch, up to 8 jobs, packed with zero empty blocks
     void dgemm(int c, std::initializer_list<dgjob> js, int m) {
         dgjobs J{};
-        int n = 0, mx = 0;
-        for (const dgjob & g : js) { J.j[n++] = g; mx = std::max(mx, g.N); }
-        k_pf_dgemm<<<dim3((mx + 63) / 64, (m + 63) / 64, n), 256, 0, E->C[c].st>>>(J, m);
+        int n = 0;
+        J.off[0] = 0;
+        for (const dgjob & g : js) {
+            J.j[n] = g;
+            J.off[n + 1] = J.off[n] + (g.N + 63) / 64;
+            n++;
+        }
+        J.n = n;
+        k_pf_dgemm<<<dim3(J.off[n], (m + 63) / 64), 256, 0, E->C[c].st>>>(J, m);
     }
-    void normq(int c, const float * x, const float * w, pf_plane & pl, int m) {
-        pf_norm_quant<<<m, 256, 0, E->C[c].st>>>(x, D, w, E->hp.eps, D, (int8_t *) pl.q, pl.s, PF_M, nullptr, 0);
+    void normq1(int c, const float * x, const float * w, pf_plane & pl, int m, float * outf = nullptr) {
+        pfnq A{};
+        A.x[0] = x; A.w[0] = w; A.q[0] = (int8_t *) pl.q; A.s[0] = pl.s; A.outf = outf;
+        k_pf_normq<<<dim3(m, 1), 256, 0, E->C[c].st>>>(A, E->hp.eps);
     }
-    void commit(int c, const pfparts & P, float * hrg, int w, int m) {
+    void normq3(int c, const float * x0, const float * x1, const float * x2,
+                const float * w0, const float * w1, const float * w2, pf_plane (&pl)[3], int m) {
+        pfnq A{};
+        A.x[0] = x0; A.x[1] = x1; A.x[2] = x2;
+        A.w[0] = w0; A.w[1] = w1; A.w[2] = w2;
+        for (int j = 0; j < 3; j++) { A.q[j] = (int8_t *) pl[j].q; A.s[j] = pl[j].s; }
+        k_pf_normq<<<dim3(m, 3), 256, 0, E->C[c].st>>>(A, E->hp.eps);
+    }
+    void commit(int c, const pfparts & P, float * hrg, float * shrg, float * ehrg, int w, int m, int snap, int snap_end) {
         hipStream_t st = E->C[c].st;
-        k_pf_commit<<<(w + 255) / 256, 256, 0, st>>>(P, hrg, w, m);
+        if (shrg && snap > 0) k_pf_commit<<<(w + 255) / 256, 256, 0, st>>>(P, hrg, shrg, w, snap);
+        if (ehrg && snap_end > 0) {
+            k_pf_commit<<<(w + 255) / 256, 256, 0, st>>>(P, hrg, ehrg, w, m);
+            k_pf_commit<<<(w + 255) / 256, 256, 0, st>>>(P, hrg, hrg, w, snap_end);
+        } else {
+            k_pf_commit<<<(w + 255) / 256, 256, 0, st>>>(P, hrg, hrg, w, m);
+        }
     }
-    void commit(int c, const float * src, float * hrg, int w, int m) {
+    void commit(int c, const float * src, float * hrg, float * shrg, float * ehrg, int w, int m, int snap, int snap_end) {
         pfparts P{}; P.p[0] = src;
-        commit(c, P, hrg, w, m);
+        commit(c, P, hrg, shrg, ehrg, w, m, snap, snap_end);
     }
     // Every card's partial PART[buf] in card order, as card c sees it: its own, and its
-    // inbox copies (PARTP[buf]) of the others', which push_part() filled.
+    // inbox copies (PARTP[buf]) of the others', which push_part() (or, at two cards over
+    // P2P, the GEMM's second output) filled.
     pfparts parts(int c, int buf) const {
         pfparts P{};
         P.p[c] = B[c].PART[buf];
         for (int k = 1; k < QZ_NC; k++) P.p[(c + k) % QZ_NC] = B[c].PARTP[buf][k - 1];
         return P;
     }
+    // Two cards over P2P: the partial's producer writes a second copy straight into the
+    // peer's inbox. At more cards that would be one GPU writing to several peers at once,
+    // so push_part() copies them in order instead.
+    static bool pdirect() { return QZ_NC == 2 && qz_link == QZ_LINK_P2P; }
+    float * peer_out(int c, int buf) const { return pdirect() ? B[(c + 1) % QZ_NC].PARTP[buf][0] : nullptr; }
     // Hand both cards' PART[buf] to their peer's inbox, after both cards' GEMMs
     // have been queued (a separate pass on purpose: the H2D goes on the peer's stream, so
     // queuing it inside the GEMM loop would park it in front of the peer's own GEMM for the
@@ -1076,27 +1360,28 @@ struct ink2_pf {
         else if (bn == 32) k_pf_tiles2<32><<<1, 256, 0, st>>>(B[c].START, B[c].TM, B[c].NTL);
         else k_pf_tiles2<64><<<1, 256, 0, st>>>(B[c].START, B[c].TM, B[c].NTL);
     }
-    template <int BN, int G>
+    template <int BN, int G, int GG>
     void moe_gemm(pf_card & b, hipStream_t st, const qw & W, const unsigned char * aq, const float * as,
                   int Mp, int K, float * C, int ldc, int N, int yt, const int4 * tm, const int * ntl, const pf_situo & so) {
-        // 4 rows x 4 pairs per thread, so 16 pair lanes. The gate_up GEMM (G = 1) ends
-        // in the fused SITU
+        // 4 rows x 4 pairs per thread, so 16 pair lanes. The gate_up GEMM (G = 1, K = D % 128 == 0)
+        // ends in the fused SITU.
         if constexpr (G == 1)
-            k_pf_moe_gemm<BN, G, 16, 1><<<dim3(N / 64, yt), 256, 0, st>>>(tm, ntl, W.v, W.s, b.PERM, (const int8_t *) aq, as, Mp, K, C, ldc, N, so);
+            k_pf_moe_gemm<BN, G, 16, 1, true, GG><<<dim3(N / 64, yt), 256, 0, st>>>(tm, ntl, W.v, W.s, b.PERM, (const int8_t *) aq, as, Mp, K, C, ldc, N, so);
         else
-            k_pf_moe_gemm<BN, G, 16, 0><<<dim3(N / 64, yt), 256, 0, st>>>(tm, ntl, W.v, W.s, b.PERM, (const int8_t *) aq, as, Mp, K, C, ldc, N, so);
+            k_pf_moe_gemm<BN, G, 16, 0, false, GG><<<dim3(N / 64, yt), 256, 0, st>>>(tm, ntl, W.v, W.s, b.PERM, (const int8_t *) aq, as, Mp, K, C, ldc, N, so);
     }
+    template <int GG>
     void moe_run(pf_card & b, hipStream_t st, int bn, int gather, const qw & W, const unsigned char * aq, const float * as,
                  int Mp, int K, float * C, int ldc, int N, int yt, const int4 * tm, const int * ntl, const pf_situo & so) {
         if (bn == 16) {
-            if (gather) moe_gemm<16, 1>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
-            else        moe_gemm<16, 0>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
+            if (gather) moe_gemm<16, 1, GG>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
+            else        moe_gemm<16, 0, GG>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
         } else if (bn == 32) {
-            if (gather) moe_gemm<32, 1>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
-            else        moe_gemm<32, 0>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
+            if (gather) moe_gemm<32, 1, GG>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
+            else        moe_gemm<32, 0, GG>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
         } else {
-            if (gather) moe_gemm<64, 1>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
-            else        moe_gemm<64, 0>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
+            if (gather) moe_gemm<64, 1, GG>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
+            else        moe_gemm<64, 0, GG>(b, st, W, aq, as, Mp, K, C, ldc, N, yt, tm, ntl, so);
         }
     }
     void moe(int c, int bn, int gather, const qw & W, const unsigned char * aq, const float * as, int Mp, int K,
@@ -1104,11 +1389,13 @@ struct ink2_pf {
         ICHECK(hipSetDevice(qz_dev_of(c)));
         pf_card & b = B[c];
         hipStream_t st = E->C[c].st;
-        moe_run(b, st, bn, gather, W, aq, as, Mp, K, C, ldc, N, yt, b.TM, b.NTL, so);
-        if (bn >= 32) moe_run(b, st, bn / 2, gather, W, aq, as, Mp, K, C, ldc, N, NE, b.TM + TM_B, b.NTL + 1, so);
+        if (gather) moe_run<8>(b, st, bn, 1, W, aq, as, Mp, K, C, ldc, N, yt, b.TM, b.NTL, so);
+        else        moe_run<1>(b, st, bn, 0, W, aq, as, Mp, K, C, ldc, N, yt, b.TM, b.NTL, so);
+        if (bn >= 32) moe_run<1>(b, st, bn / 2, gather, W, aq, as, Mp, K, C, ldc, N, NE, b.TM + TM_B, b.NTL + 1, so);
+        if (bn == 64) moe_run<1>(b, st, 16, gather, W, aq, as, Mp, K, C, ldc, N, NE, b.TM + TM_C, b.NTL + 2, so);
     }
 
-    void layer(int slot, int ip, int pos0, int m, ink2_engine::seq & S) {
+    void layer(int slot, int ip, int pos0, int m, ink2_engine::seq & S, int snap, int snap_end) {
         ink2_engine & E = *this->E;
         const bool full = is_full(ip), msg = S.bank >= 0;
         const int buf = bnx & 1;
@@ -1127,28 +1414,28 @@ struct ink2_pf {
                 A.p[nst++] = b.X;
                 A.n = nst;
                 A.qy = L.resq; A.m = full ? 3 : 1; A.out = b.IN; A.ostr = (size_t) PF_M * D;
-                if (full) k_pf_mix2<3><<<m, 256, 0, st>>>(A); else k_pf_mix2<1><<<m, 256, 0, st>>>(A);
+                if (full) launch_pf_mix<3>(m, st, A); else launch_pf_mix<1>(m, st, A);
                 for (int j = 0; j < 3; j++) in[j] = b.IN + (full ? (size_t) j : 0) * PF_M * D;
             }
             if (msg) {
                 pfmix A{};
                 A.p[0] = b.BLK[S.bank]; A.p[1] = b.OUT[S.bank_out]; A.n = 2;
                 A.qy = L.msgq; A.m = NCTRL; A.out = b.MSG; A.ostr = (size_t) PF_M * D;
-                k_pf_mix2<4><<<m, 256, 0, st>>>(A);
+                launch_pf_mix<4>(m, st, A);
                 pfrms R{};
                 for (int j = 0; j < 3; j++) R.cur[j] = in[j];
-                R.msg = b.MSG; R.z = b.Z; R.j0 = 0;
-                k_pf_rms2<<<dim3(m, 3), 256, 0, st>>>(R);
+                R.msg = b.MSG; R.rinv = b.RINV; R.j0 = 0;
+                k_pf_rms_inv<<<dim3(m, 3), 256, 0, st>>>(R);
                 pfcdn Da{};
-                Da.z = b.Z; Da.wd0 = L.cd[0]; Da.wd1 = L.cd[1]; Da.wd2 = L.cd[2]; Da.wd3 = L.cd[3];
-                Da.g = b.Gb; Da.j0 = 0; Da.m = m;
+                for (int j = 0; j < 4; j++) { Da.cur[j] = j < 3 ? in[j] : b.F; Da.wd[j] = L.cd[j]; }
+                Da.msg = b.MSG; Da.rinv = b.RINV; Da.g = b.Gb; Da.j0 = 0; Da.m = m;
                 k_pf_ctrl_down2<<<dim3((m + 63) / 64, 3, CT_S), 256, 0, st>>>(Da, b.GP);
                 pfcup Ua{};
                 Ua.g = b.Gb; Ua.msg = b.MSG; Ua.out = b.CT; Ua.j0 = 0; Ua.m = m;
                 for (int j = 0; j < 4; j++) {
                     Ua.cur[j] = j < 3 ? in[j] : b.F;
-                    Ua.wgs[j] = L.cg[j];
-                    Ua.wfs[j] = L.cf[j];
+                    Ua.wgt[j] = L.cgt[j];
+                    Ua.wft[j] = L.cft[j];
                 }
                 k_pf_gsum<<<dim3((m * GRANK + 255) / 256, 3), 256, 0, st>>>(b.GP, b.Gb, 0, m);
                 k_pf_ctrl_up2<<<dim3((m + 63) / 64, D / 64, 3), 256, 0, st>>>(Ua);
@@ -1157,13 +1444,11 @@ struct ink2_pf {
             // norm and int8 quant per stream, then the Q8 GEMMs
             const int ik = full || msg ? 1 : 0, ivv = full || msg ? 2 : 0;
             if (full) {
-                normq(c, in[0], L.qn, b.INP[0], m);
-                normq(c, in[1], L.kn, b.INP[1], m);
-                normq(c, in[2], L.vn, b.INP[2], m);
+                normq3(c, in[0], in[1], in[2], L.qn, L.kn, L.vn, b.INP, m);
             } else if (msg) {
-                for (int j = 0; j < 3; j++) normq(c, in[j], L.an, b.INP[j], m);
+                normq3(c, in[0], in[1], in[2], L.an, L.an, L.an, b.INP, m);
             } else {
-                normq(c, in[0], L.an, b.INP[0], m);
+                normq1(c, in[0], L.an, b.INP[0], m);
             }
             if (!full) dgemm(c, {djob(L.q, b.INP[0].q, b.INP[0].s, b.QR, QL), djob(L.gate, b.INP[0].q, b.INP[0].s, b.GR, QL),
                       djob(L.rel, b.INP[0].q, b.INP[0].s, b.RR, HQL * DREL), djob(L.k, b.INP[ik].q, b.INP[ik].s, b.KR, KVL),
@@ -1180,21 +1465,23 @@ struct ink2_pf {
             h.hist = K.hist + (size_t) slot * 3 * CHL;
             h.q = b.Q; h.kc = K.kc[slot]; h.vc = K.vc[slot];
             h.rvo = b.TB;
-            h.pos0 = pos0; h.full = full;
+            h.pos0 = pos0; h.m = m; h.full = full;
             h.tau_a = E.hp.tau_alpha; h.tau_f = E.hp.tau_floor;
             h.qk_clip = E.hp.qk_clip; h.rel_clip = E.hp.rel_clip; h.eps = E.hp.eps;
-            k_pf_head_post<<<dim3(HQL + 2 * HKVL, m), 128, 0, st>>>(h);
-            commit(c, b.KR, h.hist + H_K, KVL, m);
-            commit(c, b.VR, h.hist + H_V, KVL, m);
+            k_pf_head_post<<<dim3(HQL + 2 * HKVL, (m + HP_R - 1) / HP_R), 128, 0, st>>>(h);
+            float * sh = shist[c] ? shist[c] + (size_t) slot * 3 * CHL : nullptr;
+            float * eh = ehist[c] ? ehist[c] + (size_t) slot * 3 * CHL : nullptr;
+            commit(c, b.KR, h.hist + H_K, sh ? sh + H_K : nullptr, eh ? eh + H_K : nullptr, KVL, m, snap, snap_end);
+            commit(c, b.VR, h.hist + H_V, sh ? sh + H_V : nullptr, eh ? eh + H_V : nullptr, KVL, m, snap, snap_end);
             // attention, then attn_output; rows are split, so each card keeps a partial
             pfat t{};
             t.q = b.Q; t.gate = b.GR; t.kc = K.kc[slot]; t.vc = K.vc[slot];
             t.pos0 = pos0; t.full = full; t.oq = b.AT.q; t.os = b.AT.s;
             t.rv = b.TB; t.relb = L.relb; t.sk = b.SK;
             k_pf_fattn<1, true><<<dim3((m + 31) / 32, HQL), 512, 0, st>>>(t, m);
-            dgemm(c, {djob(L.out, b.AT.q, b.AT.s, b.PART[buf], D)}, m);
+            dgemm(c, {djob(L.out, b.AT.q, b.AT.s, b.PART[buf], D, peer_out(c, buf))}, m);
         }
-        push_part(buf, m);
+        if (!pdirect()) push_part(buf, m);
         E.exchange();
         bnx++;
         for (int c = 0; c < QZ_NC; c++) {
@@ -1207,8 +1494,10 @@ struct ink2_pf {
             ca.P = parts(c, buf); ca.w = L.pconv;
             ca.hrg = K.hist + (size_t) slot * 3 * CHL + H_A;
             ca.x = b.X; ca.blk = push >= 0 ? b.BLK[push] : nullptr; ca.m = m; ca.push = push >= 0;
-            k_pf_conv2<<<dim3((D + 255) / 256, (m + CV_R - 1) / CV_R), 256, 0, st>>>(ca);
-            commit(c, ca.P, ca.hrg, D, m);
+            k_pf_conv2<<<dim3((D / 4 + 255) / 256, (m + CV_R - 1) / CV_R), 256, 0, st>>>(ca);
+            float * sha = shist[c] ? shist[c] + (size_t) slot * 3 * CHL + H_A : nullptr;
+            float * eha = ehist[c] ? ehist[c] + (size_t) slot * 3 * CHL + H_A : nullptr;
+            commit(c, ca.P, ca.hrg, sha, eha, D, m, snap, snap_end);
         }
         if (push >= 0) { S.blocks.push_back(push); S.nblk++; }
         const int buf2 = bnx & 1;
@@ -1225,23 +1514,23 @@ struct ink2_pf {
             A.p[nst++] = b.X;
             A.n = nst;
             A.qy = L.ffq; A.m = 1; A.out = b.F; A.ostr = 0;
-            k_pf_mix2<1><<<m, 256, 0, st>>>(A);
+            launch_pf_mix<1>(m, st, A);
             const float * f = b.F;
             if (msg) {
                 pfrms R{};
-                R.cur[3] = b.F; R.msg = b.MSG; R.z = b.Z; R.j0 = 3;
-                k_pf_rms2<<<dim3(m, 1), 256, 0, st>>>(R);
+                R.cur[3] = b.F; R.msg = b.MSG; R.rinv = b.RINV; R.j0 = 3;
+                k_pf_rms_inv<<<dim3(m, 1), 256, 0, st>>>(R);
                 pfcdn Da{};
-                Da.z = b.Z; Da.wd3 = L.cd[3]; Da.g = b.Gb; Da.j0 = 3; Da.m = m;
+                Da.cur[3] = b.F; Da.msg = b.MSG; Da.rinv = b.RINV; Da.wd[3] = L.cd[3]; Da.g = b.Gb; Da.j0 = 3; Da.m = m;
                 k_pf_ctrl_down2<<<dim3((m + 63) / 64, 1, CT_S), 256, 0, st>>>(Da, b.GP);
                 pfcup Ua{};
                 Ua.g = b.Gb; Ua.msg = b.MSG; Ua.out = b.CT; Ua.j0 = 3; Ua.m = m;
-                Ua.cur[3] = b.F; Ua.wgs[3] = L.cg[3]; Ua.wfs[3] = L.cf[3];
+                Ua.cur[3] = b.F; Ua.wgt[3] = L.cgt[3]; Ua.wft[3] = L.cft[3];
                 k_pf_gsum<<<dim3((m * GRANK + 255) / 256, 1), 256, 0, st>>>(b.GP, b.Gb, 3, m);
                 k_pf_ctrl_up2<<<dim3((m + 63) / 64, D / 64, 1), 256, 0, st>>>(Ua);
                 f = b.CT + (size_t) 3 * PF_M * D;
             }
-            pf_norm_quant<<<m, 256, 0, st>>>(f, D, L.ffn, E.hp.eps, D, (int8_t *) b.FF.q, b.FF.s, PF_M, b.FN, 0);
+            normq1(c, f, L.ffn, b.FF, m, b.FN);
             {
                 k_pf_router2<<<dim3((m + RT_R - 1) / RT_R, RT_S), 256, 0, st>>>(b.FN, L.gin, b.YD, m);   // YD is scratch until the down GEMM
                 k_pf_topk<<<(m + 3) / 4, 256, 0, st>>>(b.YD, L.pb, E.hp.route_scale, b.IDS, b.WTS, m);
@@ -1252,9 +1541,9 @@ struct ink2_pf {
             so.q = b.APQ; so.qs = b.APS; so.np = np; so.beta = E.hp.situ_beta; so.lb = E.hp.situ_lin_beta;
             moe(c, bn, 1, L.gu, b.FF.q, b.FF.s, PF_M, D, nullptr, GUL, GUL, yt, so);
             moe(c, bn, 0, L.dn, b.APQ, b.APS, np, FFL, b.YD, D, D, yt);
-            k_pf_moe_reduce<<<m, 256, 0, st>>>(b.YD, b.INV, b.WTS, b.PART[buf2]);
+            k_pf_moe_reduce<<<m, 256, 0, st>>>(b.YD, b.INV, b.WTS, b.PART[buf2], peer_out(c, buf2));
         }
-        push_part(buf2, m);
+        if (!pdirect()) push_part(buf2, m);
         E.exchange();
         bnx++;
         for (int c = 0; c < QZ_NC; c++) {
@@ -1267,8 +1556,10 @@ struct ink2_pf {
             cf.P = parts(c, buf2); cf.w = L.fconv;
             cf.hrg = K.hist + (size_t) slot * 3 * CHL + H_F;
             cf.x = b.X; cf.blk = nullptr; cf.m = m; cf.push = 0;
-            k_pf_conv2<<<dim3((D + 255) / 256, (m + CV_R - 1) / CV_R), 256, 0, st>>>(cf);
-            commit(c, cf.P, cf.hrg, D, m);
+            k_pf_conv2<<<dim3((D / 4 + 255) / 256, (m + CV_R - 1) / CV_R), 256, 0, st>>>(cf);
+            float * shf = shist[c] ? shist[c] + (size_t) slot * 3 * CHL + H_F : nullptr;
+            float * ehf = ehist[c] ? ehist[c] + (size_t) slot * 3 * CHL + H_F : nullptr;
+            commit(c, cf.P, cf.hrg, shf, ehf, D, m, snap, snap_end);
         }
     }
 
@@ -1295,12 +1586,16 @@ struct ink2_pf {
     }
 
     // ---- the batched prefill of prompt rows a .. n-1. Rows below a are already in
-    // the KV and conv history. logits asks for the head on row n-1; false if aborted
-    bool prefill(const int32_t * prompt, int a, int n, bool logits) {
+    // the KV and conv history. logits asks for the head on row n-1; snap > 0 stages
+    // the conv history after snap rows into shist; snap_end > 0 leaves hist at snap_end
+    // rows and stages the full chunk's conv history into ehist; false if aborted
+    bool prefill(const int32_t * prompt, int a, int n, bool logits, int snap = -1, int snap_end = -1) {
         ink2_engine & E = *this->E;
         for (int p0 = a; p0 < n; p0 += PF_M) {
             if (abort && abort->load()) return false;
             const int m = std::min(PF_M, n - p0);
+            const int sn = (snap > 0 && p0 == a && snap < m) ? snap : -1;
+            const int se = (snap_end > 0 && p0 == a && snap_end < m) ? snap_end : -1;
             for (int c = 0; c < QZ_NC; c++) {
                 ICHECK(hipSetDevice(qz_dev_of(c)));
                 ink2_card & K = E.C[c];
@@ -1314,7 +1609,7 @@ struct ink2_pf {
                 }
             }
             ink2_engine::seq S;
-            for (int il = 0; il < LOOP0; il++) { if (il == 5) tap(0, p0, m); layer(il, il, p0, m, S); }
+            for (int il = 0; il < LOOP0; il++) { if (il == 5) tap(0, p0, m); layer(il, il, p0, m, S, sn, se); }
             const ink2_engine::seq pre = S;
             for (int c = 0; c < QZ_NC; c++) {
                 ICHECK(hipSetDevice(qz_dev_of(c)));
@@ -1338,11 +1633,11 @@ struct ink2_pf {
                 for (int ip = LOOP0; ip < LOOP1; ip++) {
                     const int slot = pass == 0 ? ip : NL + (pass - 1) * (LOOP1 - LOOP0) + (ip - LOOP0);
                     if ((pass == 1 && ip == 11) || (pass == 2 && ip == 17)) tap(pass, p0, m);   // visits 23 and 41
-                    layer(slot, ip, p0, m, S);
+                    layer(slot, ip, p0, m, S, sn, se);
                 }
             }
             S.bank = -1;
-            for (int il = LOOP1; il < NL; il++) layer(il, il, p0, m, S);
+            for (int il = LOOP1; il < NL; il++) layer(il, il, p0, m, S, sn, se);
             tap_head(S, p0, m);
             if (logits && p0 + m == n) head_last(S, m);
         }

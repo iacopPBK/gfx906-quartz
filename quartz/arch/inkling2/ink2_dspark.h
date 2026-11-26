@@ -82,6 +82,27 @@ static __global__ __launch_bounds__(256) void k_ds_mixq(const float * taps, size
         quant32(v[k] * r * w[i], q + (size_t) blockIdx.x * D, qs + (size_t) blockIdx.x * (D / 32), i);
     }
 }
+// batched prefill mix + RMSNorm into grouped int8 planes [D/128][m][128] for k_pf_dgemm
+static __global__ __launch_bounds__(256) void k_ds_mixq_pf(const float * taps, size_t tstride, float4 a, const float * w,
+                                                           int8_t * q, float * qs, int m, float eps) {
+    __shared__ float red[16];
+    const int row = blockIdx.x;
+    const float * t = taps + (size_t) row * tstride;
+    float v[D / 256], ss[1] = {0.f};
+    #pragma unroll
+    for (int k = 0; k < D / 256; k++) {
+        const int i = threadIdx.x + k * 256;
+        v[k] = a.x * t[i] + a.y * t[D + i] + a.z * t[2 * D + i] + a.w * t[3 * D + i];
+        ss[0] += v[k] * v[k];
+    }
+    bsum<1, false>(ss, red, 4);
+    const float r = rsqrtf(ss[0] / D + eps);
+    #pragma unroll
+    for (int k = 0; k < D / 256; k++) {
+        const int i = threadIdx.x + k * 256;
+        pf_quant_unit(v[k] * r * w[i], i, row, m, q, qs, threadIdx.x & 31);
+    }
+}
 // rows of x (row stride K) to int8 with per-32 scales. When w is non-null, each row is
 // RMSNormed by it first. With y, the normed f32 rows are also written.
 static __global__ __launch_bounds__(256) void k_ds_quant(const float * x, const float * w, int K, unsigned char * q, float * qs,
@@ -137,8 +158,7 @@ static __global__ __launch_bounds__(256) void k_ds_swiglu_quant(float * g, const
     }
 }
 // T-row Q8_0 GEMV, y = [T][N], 4 rows per wave. Accumulates like ink2_verify's v_core_acc
-// (units past 64 spread over the wave), then sums with the v_tsum butterfly, which handles
-// all T x 4 values at once with T padded to 8. Every value keeps the plain walk's bits.
+// (units past 64 spread over the wave), then sums with the v_tsum butterfly.
 template <int T, int NT = DS_NT>
 static __global__ __launch_bounds__(NT) void k_ds_gemv(const unsigned char * aq, const float * as, int K,
                                                        const char * wv, const __half * ws, int N, float * y) {
@@ -151,7 +171,7 @@ static __global__ __launch_bounds__(NT) void k_ds_gemv(const unsigned char * aq,
     for (int i = tid; i < T * n_u; i += NT) ls[i] = as[i];
     __syncthreads();
     const int S = 4;
-    constexpr int TP = T == 1 ? 1 : 8, NV = TP * 4;
+    constexpr int TP = T <= 1 ? 1 : (T <= 2 ? 2 : (T <= 4 ? 4 : 8)), NV = TP * 4;
     static_assert(T <= TP, "T <= 8");
     for (int g = blockIdx.x; g * (NT / 64 * S) < N; g += gridDim.x) {
         const int r0 = g * (NT / 64 * S) + wave * S;
@@ -161,10 +181,44 @@ static __global__ __launch_bounds__(NT) void k_ds_gemv(const unsigned char * aq,
         #pragma unroll
         for (int t = 0; t < TP; t++)
             #pragma unroll
-            for (int q = 0; q < 4; q++) fv[t * 4 + q] = t < T ? acc[t < T ? t : 0][q] : 0.f;   // index kept in range
+            for (int q = 0; q < 4; q++) fv[t * 4 + q] = t < T ? acc[t < T ? t : 0][q] : 0.f;
         const float val = v_tsum<NV>(fv, lane);
         const int kv = v_tsum_k<NV>(lane), vt = kv / 4, vs = kv % 4;
         if ((lane & (64 / NV - 1)) == 0 && vt < T && r0 + vs < N) y[(size_t) vt * N + r0 + vs] = val;
+    }
+}
+// Batched 2- or 3-projection GEMV sharing one activation staging in LDS (q|k|v and gate|up)
+struct ds_gjob { const char * wv; const __half * ws; float * y; int N, g1; };
+struct ds_gjobs { ds_gjob j[3]; int n; };
+template <int T, int NT = DS_NT>
+static __global__ __launch_bounds__(NT) void k_ds_gemv_batch(const unsigned char * aq, const float * as, int K,
+                                                             ds_gjobs J) {
+    extern __shared__ char lds[];
+    const int wave = threadIdx.x >> 6, lane = threadIdx.x & 63, tid = threadIdx.x;
+    const int n_u = K / 32;
+    unsigned char * la = (unsigned char *) lds;
+    float * ls = (float *) (lds + (size_t) T * K);
+    for (int i = tid; i < T * K / 16; i += NT) ((uint4 *) la)[i] = ((const uint4 *) aq)[i];
+    for (int i = tid; i < T * n_u; i += NT) ls[i] = as[i];
+    __syncthreads();
+    const int S = 4, total_g = J.j[J.n - 1].g1;
+    constexpr int TP = T <= 1 ? 1 : (T <= 2 ? 2 : (T <= 4 ? 4 : 8)), NV = TP * 4;
+    for (int b = blockIdx.x; b < total_g; b += gridDim.x) {
+        int k = 0;
+        while (k + 1 < J.n && b >= J.j[k].g1) k++;
+        const ds_gjob & j = J.j[k];
+        const int g = b - (k ? J.j[k - 1].g1 : 0);
+        const int r0 = g * (NT / 64 * S) + wave * S;
+        float acc[T][4];
+        v_core_acc<T, 4>(la, ls, K, n_u, n_u, j.wv, j.ws, K, n_u, j.N, r0, lane, acc);
+        float fv[NV];
+        #pragma unroll
+        for (int t = 0; t < TP; t++)
+            #pragma unroll
+            for (int q = 0; q < 4; q++) fv[t * 4 + q] = t < T ? acc[t < T ? t : 0][q] : 0.f;
+        const float val = v_tsum<NV>(fv, lane);
+        const int kv = v_tsum_k<NV>(lane), vt = kv / 4, vs = kv % 4;
+        if ((lane & (64 / NV - 1)) == 0 && vt < T && r0 + vs < j.N) j.y[(size_t) vt * j.N + r0 + vs] = val;
     }
 }
 // the same walk for a K too wide to stage (the FFN down projection, T = 8, K = 9216). The
@@ -222,6 +276,32 @@ static __global__ void k_ds_store(const float * k, const float * v, __half * ck,
     ck[(size_t) pos0 * DS_KVL + i] = __float2half(k[i]);
     cv[(size_t) pos0 * DS_KVL + i] = __float2half(v[i]);
 }
+// batched context K: per-(row, kv head) RMSNorm, NeoX rope at pos0 + row, and f16 cache store
+static __global__ __launch_bounds__(128) void k_ds_knorm_rope_store(const float * xk, const float * wk, __half * ck,
+                                                                    int pos0, float eps) {
+    __shared__ float red[4], s[HD];
+    const int h = blockIdx.x, row = blockIdx.y, e = threadIdx.x;
+    const float * xr = xk + ((size_t) row * DS_NKVL + h) * HD;
+    const float v = xr[e];
+    float ss = v * v;
+    #pragma unroll
+    for (int off = 32; off > 0; off >>= 1) ss += __shfl_xor(ss, off, 64);
+    if ((e & 63) == 0) red[e >> 6] = ss;
+    __syncthreads();
+    const float r = rsqrtf((red[0] + red[1]) / HD + eps);
+    s[e] = v * r * wk[e];
+    __syncthreads();
+    if (e < HD / 2) {
+        const float inv = powf(DS_THETA, -2.f * e / HD);
+        const float ang = (float) (pos0 + row) * inv;
+        float sn, cs;
+        sincosf(ang, &sn, &cs);
+        const float x0 = s[e], x1 = s[e + HD / 2];
+        __half * dst = ck + ((size_t) (pos0 + row) * DS_NKVL + h) * HD;
+        dst[e] = __float2half(x0 * cs - x1 * sn);
+        dst[e + HD / 2] = __float2half(x0 * sn + x1 * cs);
+    }
+}
 // attention of the block's DS_BS query rows, KV head blockIdx.x of this card, over the
 // context keys [lo, a) of the f16 cache and the DS_BS block keys in f32, with no mask.
 // One block per (KV head, key split): its DS_NQV = 3 q heads x 8 rows query vectors share
@@ -232,7 +312,7 @@ static __global__ void k_ds_store(const float * k, const float * v, __half * ck,
 // own DS_BS f32 keys. Only the split count varies with the context length.
 constexpr int DS_GQA = DS_NQL / DS_NKVL;                     // 3 q heads per KV head
 constexpr int DS_NQV = DS_BS * DS_GQA;                       // 24 query vectors of one KV head
-constexpr int DS_NSPL = 64;                                  // key splits per KV head (bounds the partials)
+constexpr int DS_NSPL = 60;                                  // key splits per KV head (4 * 60 = 240 blocks = 4/CU)
 constexpr int DS_TILE = 12;                                  // cache keys staged per tile
 constexpr int DS_ATT_T = DS_NQV * 8;                         // 192 threads: one 8-lane group per query vector
 constexpr int DS_PW = HD + 2;
@@ -269,7 +349,7 @@ __device__ __forceinline__ void ds_attn_key(const float * qq, const float * kf, 
         x2 += qq[k + 2] * kf[k + 2]; x3 += qq[k + 3] * kf[k + 3];
     }
     const float s = ds_row8((x0 + x1) + (x2 + x3));
-    const float mn = fmaxf(m, s), c = expf(m - mn), p = expf(s - mn);
+    const float mn = fmaxf(m, s), c = __builtin_amdgcn_exp2f(m - mn), p = __builtin_amdgcn_exp2f(s - mn);
     l = l * c + p;
     if (c < 1.f)
         #pragma unroll
@@ -300,7 +380,7 @@ __device__ __forceinline__ void ds_attn_tile(const float * qq, const float * sk,
     float mt = s[0];
     #pragma unroll
     for (int t = 1; t < DS_TILE; t++) mt = fmaxf(mt, s[t]);
-    const float mn = fmaxf(m, mt), c = expf(m - mn);
+    const float mn = fmaxf(m, mt), c = __builtin_amdgcn_exp2f(m - mn);
     l *= c;
     if (c < 1.f)
         #pragma unroll
@@ -308,7 +388,7 @@ __device__ __forceinline__ void ds_attn_tile(const float * qq, const float * sk,
     m = mn;
     #pragma unroll
     for (int t = 0; t < DS_TILE; t++) {
-        const float p = expf(s[t] - mn);
+        const float p = __builtin_amdgcn_exp2f(s[t] - mn);
         l += p;
         float vf[16];
         ds_ld16(sv + t * DS_TROW + li * DS_TPAD, vf);
@@ -323,7 +403,7 @@ static __global__ __launch_bounds__(DS_ATT_T) void k_ds_attn(const float * q, co
     const int kh = blockIdx.x, sp = blockIdx.y, tid = threadIdx.x;
     const int grp = tid >> 3, li = tid & 7;                  // query vector, its 16 dims
     const int r = grp % DS_BS, gq = grp / DS_BS, h = kh * DS_GQA + gq;
-    const float scale = 1.f / sqrtf((float) HD);
+    const float scale = FL_L2E / sqrtf((float) HD);
     float qq[16], o[16];
     #pragma unroll
     for (int k = 0; k < 16; k++) {
@@ -365,8 +445,8 @@ static __global__ __launch_bounds__(DS_ATT_T) void k_ds_attn(const float * q, co
     #pragma unroll
     for (int k = 0; k < 16; k++) P[2 + li * 16 + k] = o[k];
 }
-// merge the nspl partials of q head blockIdx.x, row blockIdx.y, into o [row][DS_QL]
-static __global__ __launch_bounds__(128) void k_ds_attn_merge(const float * part, float * o, int nspl) {
+// merge the nspl partials of q head blockIdx.x, row blockIdx.y, directly into int8 planes
+static __global__ __launch_bounds__(128) void k_ds_attn_merge_quant(const float * part, unsigned char * oq, float * os, int nspl) {
     const int h = blockIdx.x, r = blockIdx.y, d = threadIdx.x;
     const int kh = h / DS_GQA, grp = (h % DS_GQA) * DS_BS + r;
     const float * B = part + ((size_t) kh * DS_NSPL * DS_NQV + grp) * DS_PW;
@@ -386,11 +466,12 @@ static __global__ __launch_bounds__(128) void k_ds_attn_merge(const float * part
         #pragma unroll
         for (int k = 0; k < 16; k++) {
             if (pm[k] == -INFINITY) continue;
-            const float e = expf(pm[k] - M);
+            const float e = __builtin_amdgcn_exp2f(pm[k] - M);
             L += pl[k] * e; O += po[k] * e;
         }
     }
-    o[(size_t) r * DS_QL + h * HD + d] = O / L;
+    const float v = O / L;
+    quant32(v, oq + (size_t) r * DS_QL, os + (size_t) r * (DS_QL / 32), h * HD + d);
 }
 static __global__ __launch_bounds__(256) void k_ds_embed(const char * ev, const __half * es, int tok, const float * w, float eps,
                                                          float * x, const float * mask) {
@@ -612,6 +693,7 @@ static __global__ __launch_bounds__(64) void k_ds_last(const unsigned long long 
     if (threadIdx.x != 0) return;
     for (int k = 0; k < QZ_NC - 1; k++) ds_wait(fl + k, seq, err);
     out[slot] = ds_best_tok(best, xbest);
+    out[7] = *err;
 }
 static __global__ void k_ds_tohalf(const float * y, __half * o, int n, int stride) {
     const int r = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -654,7 +736,7 @@ struct ink2_dspark {
         const uint16_t * how = nullptr;
         __half * ck[DS_NL] = {}, * cv[DS_NL] = {};   // [ctx][DS_KVL]
         unsigned char * fq = nullptr; float * fs = nullptr;   // context fill: the 3 layers' mixed rows, int8 [3][m][D]
-        float * ckf = nullptr, * cvf = nullptr;      // context fill: k / v [8][DS_KVL]
+        float * ckf = nullptr, * cvf = nullptr, * ckf_pf = nullptr;   // context fill: k / v [8][DS_KVL], batched k [3][PF_M][DS_KVL]
         float * X = nullptr, * Y = nullptr;          // residual [8][D], this card's partial
         float * Yp[2][QZ_NC - 1] = {};               // the others' partials: parity, slot k - 1 from card (c + k) % NC
         float * Q = nullptr, * Kb = nullptr, * Vb = nullptr, * O = nullptr, * G = nullptr, * U = nullptr;
@@ -773,7 +855,7 @@ struct ink2_dspark {
         qz_mem_scope mem("dspark state");
         al(&g, D); al(&tap, 4 * D); al(&vtap, (size_t) VR * 4 * D); al(&joint, 3 * DS_R); al(&state, DS_R);
         ICHECK(qz_dmalloc((void **) &out_d, 8 * sizeof(int), "dspark"));
-        ICHECK(hipHostMalloc((void **) &out_h, 8 * sizeof(int), 0));
+        ICHECK(hipHostMalloc((void **) &out_h, (8 + QZ_NC) * sizeof(int), 0));
         ICHECK(hipMemset(out_d, 0, 8 * sizeof(int)));
         for (int c = 0; c < QZ_NC; c++) {
             card & k = K[c];
@@ -781,6 +863,7 @@ struct ink2_dspark {
             for (int l = 0; l < DS_NL; l++) { al(&k.ck[l], (size_t) ctx * DS_KVL); al(&k.cv[l], (size_t) ctx * DS_KVL); }
             al(&k.fq, (size_t) DS_NL * PF_M * D); al(&k.fs, (size_t) DS_NL * PF_M * D / 32);
             al(&k.ckf, 8 * DS_KVL); al(&k.cvf, 8 * DS_KVL);
+            al(&k.ckf_pf, (size_t) DS_NL * PF_M * DS_KVL);
             al(&k.X, DS_BS * D); al(&k.Y, DS_BS * D);
             for (int j = 0; j < QZ_NC - 1; j++) { al(&k.Yp[0][j], DS_BS * D); al(&k.Yp[1][j], DS_BS * D); }
             al(&k.Q, DS_BS * DS_QL); al(&k.Kb, DS_BS * DS_KVL); al(&k.Vb, DS_BS * DS_KVL);
@@ -820,6 +903,7 @@ struct ink2_dspark {
                 const int nj = std::min(8, DS_R + 1 - j0);
                 k_ds_tohalf<<<dim3((H.N + 255) / 256, nj), 256>>>(y, fold[c] + (size_t) j0 * nhp[c], H.N, nhp[c]);
             }
+            ICHECK(hipFuncSetAttribute((const void *) k_ds_gemv<8>, hipFuncAttributeMaxDynamicSharedMemorySize, 49152));
             ICHECK(hipDeviceSynchronize());
             (void) hipFree(rows); (void) hipFree(y);
         }
@@ -829,13 +913,19 @@ struct ink2_dspark {
         return true;
     }
 
-    // the T-row GEMV. Stages the planes in LDS while they fit, else takes the wide walk
+    // the T-row GEMV. Stages the planes in LDS up to 48 KB (covers ffn_down 8 x 4608 = 41.5 KB).
     void gemv(hipStream_t st, const unsigned char * q, const float * s, const qw & W, float * y, int T) {
         const int lds = T * W.K + T * (W.K / 32) * 4;
-        if (lds <= 32768) {
-            const int nb = std::min((W.N + 15) / 16, 240);
+        if (lds <= 49152) {
+            const int maxb = lds > 32768 ? 60 : 240;
+            const int nb = std::min((W.N + 15) / 16, maxb);
             if (T == 8) k_ds_gemv<8><<<nb, DS_NT, lds, st>>>(q, s, W.K, W.v, W.s, W.N, y);
             else if (T == 7) k_ds_gemv<7><<<nb, DS_NT, lds, st>>>(q, s, W.K, W.v, W.s, W.N, y);
+            else if (T == 6) k_ds_gemv<6><<<nb, DS_NT, lds, st>>>(q, s, W.K, W.v, W.s, W.N, y);
+            else if (T == 5) k_ds_gemv<5><<<nb, DS_NT, lds, st>>>(q, s, W.K, W.v, W.s, W.N, y);
+            else if (T == 4) k_ds_gemv<4><<<nb, DS_NT, lds, st>>>(q, s, W.K, W.v, W.s, W.N, y);
+            else if (T == 3) k_ds_gemv<3><<<nb, DS_NT, lds, st>>>(q, s, W.K, W.v, W.s, W.N, y);
+            else if (T == 2) k_ds_gemv<2><<<nb, DS_NT, lds, st>>>(q, s, W.K, W.v, W.s, W.N, y);
             else k_ds_gemv<1><<<nb, DS_NT, lds, st>>>(q, s, W.K, W.v, W.s, W.N, y);
         } else {
             const int nb = (W.N + 7) / 8;
@@ -843,6 +933,17 @@ struct ink2_dspark {
             else if (T == 7) k_ds_gemv_wide<7><<<nb, 256, 0, st>>>(q, s, W.K, W.v, W.s, W.N, y);
             else k_ds_gemv_wide<1><<<nb, 256, 0, st>>>(q, s, W.K, W.v, W.s, W.N, y);
         }
+    }
+    void gemv_batch8(hipStream_t st, const unsigned char * q, const float * s, int K, std::initializer_list<std::pair<const qw *, float *>> js) {
+        ds_gjobs J{};
+        int g = 0;
+        for (const auto & pr : js) {
+            g += (pr.first->N + 15) / 16;
+            J.j[J.n++] = ds_gjob{pr.first->v, pr.first->s, pr.second, pr.first->N, g};
+        }
+        const int lds = 8 * K + 8 * (K / 32) * 4;
+        const int nb = std::min(g, 240);
+        k_ds_gemv_batch<8><<<nb, DS_NT, lds, st>>>(q, s, K, J);
     }
     // run fn(c, card, stream) on each card in order, its device current
     template <class F> void each(F && fn) {
@@ -883,13 +984,21 @@ struct ink2_dspark {
     // the 3 layers and hands the int8 planes to the other cards; each card fills its own kv heads.
     void fill(const float * taps, size_t tstride, int p0, int m) {
         if (m > PF_M) { fprintf(stderr, "dspark: fill of %d rows (max %d)\n", m, PF_M); exit(1); }
+        const bool batched = m > 8;
         {
             ICHECK(hipSetDevice(qz_dev_of(0)));
             hipStream_t st = E->C[0].st;
             card & k = K[0];
             for (int c = 1; c < QZ_NC; c++) ICHECK(hipStreamWaitEvent(st, K[c].ev, 0));   // done with the last fill's planes
-            for (int l = 0; l < DS_NL; l++)
-                k_ds_mixq<<<m, 256, 0, st>>>(taps, tstride, alpha[l], k.L[l].dn, k.fq + (size_t) l * m * D, k.fs + (size_t) l * m * (D / 32), DS_EPS);
+            for (int l = 0; l < DS_NL; l++) {
+                if (batched)
+                    k_ds_mixq_pf<<<m, 256, 0, st>>>(taps, tstride, alpha[l], k.L[l].dn,
+                                                    (int8_t *) (k.fq + (size_t) l * m * D),
+                                                    k.fs + (size_t) l * m * (D / 32), m, DS_EPS);
+                else
+                    k_ds_mixq<<<m, 256, 0, st>>>(taps, tstride, alpha[l], k.L[l].dn,
+                                                 k.fq + (size_t) l * m * D, k.fs + (size_t) l * m * (D / 32), DS_EPS);
+            }
             k_ds_mixnorm<<<1, 256, 0, st>>>(taps + (size_t) (m - 1) * tstride, tstride, alpha[DS_NL], dsn, g, D, DS_EPS);
             // qz_xdst: card c's gemvs below are ordered by the k.ev handoff that follows, so
             // p2p stays the peer copies on card 0's stream; host mode puts the H2Ds on card
@@ -903,15 +1012,37 @@ struct ink2_dspark {
         }
         each([&](int c, card & k, hipStream_t st) {
             if (c != 0) ICHECK(hipStreamWaitEvent(st, K[0].ev, 0));
-            for (int r0 = 0; r0 < m; r0 += 8) {
-                const int n = std::min(8, m - r0);
+            if (batched) {
+                dgjobs Jk{}, Jv{};
+                Jk.off[0] = Jv.off[0] = 0;
                 for (int l = 0; l < DS_NL; l++) {
-                    const unsigned char * q = k.fq + ((size_t) l * m + r0) * D;
-                    const float * s = k.fs + ((size_t) l * m + r0) * (D / 32);
-                    gemv(st, q, s, k.L[l].kc, k.ckf, n == 1 ? 1 : 8);
-                    gemv(st, q, s, k.L[l].vc, k.cvf, n == 1 ? 1 : 8);
-                    k_ds_hnorm_rope<<<dim3(DS_NKVL, n), 128, 0, st>>>(k.ckf, k.L[l].kcn, DS_NKVL, k.ckf, k.L[l].kcn, 0, p0 + r0, DS_EPS);
-                    k_ds_store<<<(n * DS_KVL + 255) / 256, 256, 0, st>>>(k.ckf, k.cvf, k.ck[l], k.cv[l], p0 + r0, n);
+                    const int8_t * q = (const int8_t *) (k.fq + (size_t) l * m * D);
+                    const float * s = k.fs + (size_t) l * m * (D / 32);
+                    float * ko = k.ckf_pf + (size_t) l * m * DS_KVL;
+                    __half * vo = k.cv[l] + (size_t) p0 * DS_KVL;
+                    Jk.j[l] = dgjob{k.L[l].kc.v, k.L[l].kc.s, q, s, ko, DS_KVL, DS_KVL, D, nullptr};
+                    Jv.j[l] = dgjob{k.L[l].vc.v, k.L[l].vc.s, q, s, vo, DS_KVL, DS_KVL, D, nullptr};
+                    Jk.off[l + 1] = Jk.off[l] + (DS_KVL + 63) / 64;
+                    Jv.off[l + 1] = Jv.off[l] + (DS_KVL + 63) / 64;
+                }
+                Jk.n = Jv.n = DS_NL;
+                const int yt = (m + 63) / 64;
+                k_pf_dgemm<false><<<dim3(Jk.off[DS_NL], yt), 256, 0, st>>>(Jk, m, m);
+                k_pf_dgemm<true><<<dim3(Jv.off[DS_NL], yt), 256, 0, st>>>(Jv, m, m);
+                for (int l = 0; l < DS_NL; l++)
+                    k_ds_knorm_rope_store<<<dim3(DS_NKVL, m), 128, 0, st>>>(
+                            k.ckf_pf + (size_t) l * m * DS_KVL, k.L[l].kcn, k.ck[l], p0, DS_EPS);
+            } else {
+                for (int r0 = 0; r0 < m; r0 += 8) {
+                    const int n = std::min(8, m - r0);
+                    for (int l = 0; l < DS_NL; l++) {
+                        const unsigned char * q = k.fq + ((size_t) l * m + r0) * D;
+                        const float * s = k.fs + ((size_t) l * m + r0) * (D / 32);
+                        gemv(st, q, s, k.L[l].kc, k.ckf, n);
+                        gemv(st, q, s, k.L[l].vc, k.cvf, n);
+                        k_ds_hnorm_rope<<<dim3(DS_NKVL, n), 128, 0, st>>>(k.ckf, k.L[l].kcn, DS_NKVL, k.ckf, k.L[l].kcn, 0, p0 + r0, DS_EPS);
+                        k_ds_store<<<(n * DS_KVL + 255) / 256, 256, 0, st>>>(k.ckf, k.cvf, k.ck[l], k.cv[l], p0 + r0, n);
+                    }
                 }
             }
             if (c != 0) ICHECK(hipEventRecord(k.ev, st));
@@ -933,34 +1064,33 @@ struct ink2_dspark {
             const int lo = l == 1 ? 0 : std::max(0, a - WIN);      // layers 0 / 2: sliding window
             each([&](int, card & k, hipStream_t st) {
                 const layer & y = k.L[l];
-                gemv(st, k.aq, k.as, y.q, k.Q, 8); gemv(st, k.aq, k.as, y.k, k.Kb, 8); gemv(st, k.aq, k.as, y.v, k.Vb, 8);
+                gemv_batch8(st, k.aq, k.as, D, {{&y.q, k.Q}, {&y.k, k.Kb}, {&y.v, k.Vb}});
                 k_ds_hnorm_rope<<<dim3(DS_NQL + DS_NKVL, DS_BS), 128, 0, st>>>(k.Q, y.qn, DS_NQL, k.Kb, y.kn, DS_NKVL, a, DS_EPS);
                 // the cache keys split into nsp tile-aligned chunks, so the grid keeps
                 // DS_NKVL * nsp blocks busy at every context length
                 const int nc = a - lo, cks = std::max(DS_TILE, ((nc + DS_NSPL - 1) / DS_NSPL + DS_TILE - 1) / DS_TILE * DS_TILE);
                 const int nsp = std::max(1, (nc + cks - 1) / cks);
                 k_ds_attn<<<dim3(DS_NKVL, nsp), DS_ATT_T, 0, st>>>(k.Q, k.ck[l], k.cv[l], k.Kb, k.Vb, lo, a, nsp, cks, k.part);
-                k_ds_attn_merge<<<dim3(DS_NQL, DS_BS), 128, 0, st>>>(k.part, k.O, nsp);
-                k_ds_quant<<<DS_BS, 256, 0, st>>>(k.O, nullptr, DS_QL, k.aq, k.as, nullptr, DS_EPS);
+                k_ds_attn_merge_quant<<<dim3(DS_NQL, DS_BS), 128, 0, st>>>(k.part, k.aq, k.as, nsp);
                 gemv(st, k.aq, k.as, y.o, k.Y, 8);
             });
             int s = exchange();
             each([&](int c, card & k, hipStream_t st) {
                 const layer & y = k.L[l];
                 k_ds_add_quant<<<DS_BS, 256, 0, st>>>(k.X, parts(c, s), y.fn, D, k.aq, k.as, DS_EPS);
-                gemv(st, k.aq, k.as, y.gate, k.G, 8); gemv(st, k.aq, k.as, y.up, k.U, 8);
+                gemv_batch8(st, k.aq, k.as, D, {{&y.gate, k.G}, {&y.up, k.U}});
                 k_ds_swiglu_quant<<<dim3(DS_FFL / 256, DS_BS), 256, 0, st>>>(k.G, k.U, DS_FFL, k.aq, k.as);
                 gemv(st, k.aq, k.as, y.down, k.Y, 8);
             });
             s = exchange();
             // the residual add of the two partials is fused into the next quantization, the
-            // next layer's attention norm. After the last layer it takes hidden rows 1 .. 7
+            // next layer's attention norm. After the last layer it takes hidden rows 1 .. nd
             // instead: f32 into hid for card 0's Markov input, int8 for the base logits.
             each([&](int c, card & k, hipStream_t st) {
                 if (l + 1 < DS_NL) k_ds_add_quant<<<DS_BS, 256, 0, st>>>(k.X, parts(c, s), k.L[l + 1].an, D, k.aq, k.as, DS_EPS);
                 else {
-                    k_ds_hidden<<<DS_BS - 1, 256, 0, st>>>(k.X, parts(c, s), k.onorm, D, hq[c], hs[c], k.hid, DS_EPS);
-                    gemv(st, hq[c], hs[c], E->C[c].head, base[c], 7);
+                    k_ds_hidden<<<nd, 256, 0, st>>>(k.X, parts(c, s), k.onorm, D, hq[c], hs[c], k.hid, DS_EPS);
+                    gemv(st, hq[c], hs[c], E->C[c].head, base[c], nd);
                 }
             });
         }
@@ -1001,51 +1131,52 @@ struct ink2_dspark {
             }
             ICHECK(hipSetDevice(qz_dev_of(0)));
         }
-        if (sa) {   // each card's per-row (max, sum) of its share, merged before the host
-            for (int c = 0; c < QZ_NC; c++) {
-                ICHECK(hipSetDevice(qz_dev_of(c)));
-                k_ds_lse_merge<<<DS_BS - 1, 64, 0, E->C[c].st>>>(lses[c], nb[c], lsem[c]);
-            }
-            ICHECK(hipSetDevice(qz_dev_of(0)));
-        }
         k_ds_last<<<1, 64, 0, st>>>(best[0], xbest[0], fl[0], seq, errd[0], out_d, nd - 1);
         ICHECK(hipMemcpyAsync(out_h, out_d, 8 * sizeof(int), hipMemcpyDeviceToHost, st));
-        ICHECK(hipStreamSynchronize(st));
-        for (int i = 0; i < nd; i++) out[i] = out_h[i];
-        for (int c = 0; c < QZ_NC; c++) {                  // either card's wait may have given up
+        // each card's per-row (max, sum) of its share, and the other cards' wait errors, copied
+        // async before the single sync per card (card 0's error is out_h[7], from k_ds_last)
+        for (int c = 0; c < QZ_NC; c++) {
             ICHECK(hipSetDevice(qz_dev_of(c)));
-            ICHECK(hipStreamSynchronize(E->C[c].st));
-            ICHECK(hipMemcpy(&out_h[7], errd[c], sizeof(int), hipMemcpyDeviceToHost));
-            if (out_h[7]) { fprintf(stderr, "dspark: the Markov chain's cross-card wait timed out (step %u, card %d)\n", seq, c), exit(1); }
+            hipStream_t cs = E->C[c].st;
+            if (sa) {
+                k_ds_lse_merge<<<nd, 64, 0, cs>>>(lses[c], nb[c], lsem[c]);
+                ICHECK(hipMemcpyAsync(lseh[c], lsem[c], (size_t) nd * 2 * sizeof(float), hipMemcpyDeviceToHost, cs));
+            }
+            if (c) ICHECK(hipMemcpyAsync(&out_h[7 + c], errd[c], sizeof(int), hipMemcpyDeviceToHost, cs));
         }
+        for (int c = 0; c < QZ_NC; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(E->C[c].st)); }
+        ICHECK(hipSetDevice(qz_dev_of(0)));
+        for (int c = 0; c < QZ_NC; c++)
+            if (out_h[7 + c]) { fprintf(stderr, "dspark: the Markov chain's cross-card wait timed out (step %u, card %d)\n", seq, c); exit(1); }
+        for (int i = 0; i < nd; i++) out[i] = out_h[i];
     }
     // ---- sampled rounds, after the verify
     // The drafter's logit of the target's candidate ids: ids is the host's [DS_BS][DS_QID]
     // list (-1 padded, row r's own candidates in its slots), lg the host's logits in the
     // same layout and lse the per-row logsumexp of the whole vocab. Each card evaluates
     // the ids it owns.
-    void qlog(const int * ids, float * lg, float * lse) {
-        memcpy(qid_h, ids, DS_BS * DS_QID * sizeof(int));
+    void qlog(const int * ids, float * lg, float * lse, int nd = DS_BS - 1) {
+        const size_t nq = (size_t) nd * DS_QID;
+        memcpy(qid_h, ids, nq * sizeof(int));
         for (int c = 0; c < QZ_NC; c++) {
             const ink2_card & T = E->C[c];
             ICHECK(hipSetDevice(qz_dev_of(c)));
             hipStream_t st = E->C[c].st;
-            ICHECK(hipMemcpyAsync(qid_d[c], qid_h, DS_BS * DS_QID * sizeof(int), hipMemcpyHostToDevice, st));
-            k_ds_qids<<<dim3(DS_QID, DS_BS - 1), 64, 0, st>>>(base[c], T.head.N, fold[c], nhp[c], T.nvalid, T.id0, qid_d[c],
-                                                             lat1[c], qs_d[c]);
-            ICHECK(hipMemcpyAsync(qs_h[c], qs_d[c], DS_BS * DS_QID * sizeof(float), hipMemcpyDeviceToHost, st));
-            ICHECK(hipMemcpyAsync(lseh[c], lsem[c], DS_BS * 2 * sizeof(float), hipMemcpyDeviceToHost, st));
+            ICHECK(hipMemcpyAsync(qid_d[c], qid_h, nq * sizeof(int), hipMemcpyHostToDevice, st));
+            k_ds_qids<<<dim3(DS_QID, nd), 64, 0, st>>>(base[c], T.head.N, fold[c], nhp[c], T.nvalid, T.id0, qid_d[c],
+                                                       lat1[c], qs_d[c]);
+            ICHECK(hipMemcpyAsync(qs_h[c], qs_d[c], nq * sizeof(float), hipMemcpyDeviceToHost, st));
         }
         for (int c = 0; c < QZ_NC; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(E->C[c].st)); }
         ICHECK(hipSetDevice(qz_dev_of(0)));
-        for (int r = 0; r < DS_BS - 1; r++)            // an id's logit sits on the card that owns it
+        for (int r = 0; r < nd; r++)            // an id's logit sits on the card that owns it
             for (int j = 0; j < DS_QID; j++) {
                 const int id = ids[r * DS_QID + j];
                 int o = 0;
                 for (int c = 1; c < QZ_NC; c++) if (id >= E->C[c].id0) o = c;
                 lg[r * DS_QID + j] = qs_h[o][r * DS_QID + j];
             }
-        for (int r = 0; r < DS_BS - 1; r++) {          // logaddexp of the cards' shares, in card order
+        for (int r = 0; r < nd; r++) {          // logaddexp of the cards' shares, in card order
             float m = lseh[0][2 * r];
             for (int c = 1; c < QZ_NC; c++) m = fmaxf(m, lseh[c][2 * r]);
             float t = lseh[0][2 * r + 1] * expf(lseh[0][2 * r] - m);

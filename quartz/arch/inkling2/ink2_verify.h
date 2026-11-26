@@ -111,40 +111,40 @@ VR_NI void v_xconv_b0(const float * own0, const qz_xinbox<QZ_NC> & peer0, const 
 // d_head_post with the verify K / V conv, whose window runs over the rows' raw projections
 // and never writes the history. v_gsum2 is bsum<1>(x, red, 2) per 128-thread group, each on
 // its own LDS pair, for the block's 4 groups at once.
-VR_NI float v_gsum2(float x, float * red, int grp) {
+VR_NI float v_gsum2(float x, float * red, int grp, bool act) {
     x = qz_wsum_dpp(x);
     __syncthreads();
-    if ((threadIdx.x & 63) == 0) red[grp * 2 + ((threadIdx.x >> 6) & 1)] = x;
+    if (act && (threadIdx.x & 63) == 0) red[grp * 2 + ((threadIdx.x >> 6) & 1)] = x;
     __syncthreads();
     float s = 0.f;
     for (int i = 0; i < 2; i++) s += red[grp * 2 + i];
     return s;
 }
-VR_NI void d_head_post_v(const hpost & a, int b, int t, bool act, int dmax, int r, float * uh, int rsf, const float * hb, int grp) {
+VR_NI void d_head_post_v(const hpost & a, int b, int t, bool act, int dmax, int r, float * uh, int rsf, const float * hb,
+                         int grp, int tb_t, int tb_st) {
     __shared__ float red[4 * 2];
     __shared__ float rvs[4][DREL];
     float * rv = rvs[grp];
     if (b < HQL) {
         const int h = b, i = h * HD + t;
         float x = act ? a.qr[i] * a.qclip[i] : 0.f;
-        float n2[1] = {v_gsum2(x * x, red, grp)};
+        float n2[1] = {v_gsum2(x * x, red, grp, act)};
         const float nr = sqrtf(n2[0]) + 1e-6f;
         x *= fminf(fmaxf(a.qk_clip / nr, 0.f), 1.f);
         if (act) a.qh[i] = __float2half(x * a.tau * FL_QSC);
-        float r_ = t < DREL ? a.rr[h * DREL + t] * a.rclip[h * DREL + t] : 0.f;
-        float r2[1] = {v_gsum2(r_ * r_, red, grp)};
+        float r_ = (act && t < DREL) ? a.rr[h * DREL + t] * a.rclip[h * DREL + t] : 0.f;
+        float r2[1] = {v_gsum2(r_ * r_, red, grp, act)};
         const float rn = sqrtf(r2[0]) + 1e-6f;
-        if (t < DREL) rv[t] = r_ * fminf(fmaxf(a.rel_clip / rn, 0.f), 1.f) * a.tau;
+        if (act && t < DREL) rv[t] = r_ * fminf(fmaxf(a.rel_clip / rn, 0.f), 1.f) * a.tau;
         __syncthreads();
         const float sink = a.sk[h];
-        if (act)
-            for (int d = t; d < dmax; d += 128) {
-                float s = 0.f;
-                if (d < REL_EXT)
-                    #pragma unroll
-                    for (int k = 0; k < DREL; k++) s += a.relb[d * DREL + k] * rv[k];
-                a.tb[h * TBW + d] = s - sink;
-            }
+        for (int d = tb_t; d < dmax; d += tb_st) {
+            float s = 0.f;
+            if (d < REL_EXT)
+                #pragma unroll
+                for (int k = 0; k < DREL; k++) s += a.relb[d * DREL + k] * rv[k];
+            a.tb[h * TBW + d] = s - sink;
+        }
         __syncthreads();
         return;
     }
@@ -174,7 +174,7 @@ VR_NI void d_head_post_v(const hpost & a, int b, int t, bool act, int dmax, int 
         qz_gp(uh)[((size_t) (slot * VR + r)) * CHL + (isk ? H_K : H_V) + ch] = u;
         y = (u + o) * (dyn ? 1.f / sqrtf(2.f * NCONV + 1.f) : 1.f / sqrtf((float) NCONV + 1.f));
     }
-    float n2[1] = {v_gsum2(y * y, red, grp)};
+    float n2[1] = {v_gsum2(y * y, red, grp, act)};
     if (!act) return;
     if (isk) {
         const float nr = sqrtf(n2[0]) + 1e-6f;
@@ -185,11 +185,8 @@ VR_NI void d_head_post_v(const hpost & a, int b, int t, bool act, int dmax, int 
         a.vc[ch] = __float2half(y);
     }
 }
-// c_head_post with the verify window
-// act false: a padding group (TP4's 6 q / 2 k / 2 v units per card fill blocks of 4 groups
-// of one kind), which runs the block's syncs and writes nothing.
-template <bool PAD = false>
-VR_NI void v_head_post(CK hpost * e, int pos, float tau, int v, int tid, int r, float * uh, int rsf, const float * hb, bool act = true) {
+// c_head_post with the verify window (nper = 1, 2, or 4 units per 512-thread block)
+VR_NI void v_head_post(CK hpost * e, int pos, float tau, int v, int tid, int r, float * uh, int rsf, const float * hb, int nper) {
     asm volatile ("" : "+v"(tid));
     hpost h = *e;
     const int row = e->dk ? pos : pos % PF_RING;          // dk: full layers only
@@ -199,7 +196,8 @@ VR_NI void v_head_post(CK hpost * e, int pos, float tau, int v, int tid, int r, 
     h.hist = qz_gp(h.hist); h.qh = qz_gp(h.qh); h.tb = qz_gp(h.tb);
     h.kc = qz_gp(h.kc + (size_t) row * KVL); h.vc = qz_gp(h.vc + (size_t) row * KVL);
     h.tau = e->dk ? tau : 1.f;
-    d_head_post_v(h, v, tid & 127, PAD ? act : true, min(TBW, pos + 1), r, uh, rsf, hb, tid >> 7);
+    const int tb_st = 512 / nper, grp = tid / tb_st, tb_t = tid % tb_st;
+    d_head_post_v(h, v, tb_t & 127, tb_t < 128, min(TBW, pos + 1), r, uh, rsf, hb, grp, tb_t, tb_st);
 }
 
 
@@ -326,6 +324,8 @@ template <int T, int S, int RS = 0> VR_NI void v_core_acc(
 // weights, so the next pair loads while v_wdot computes this one. Lane L sums its unit L.
 // The 8 tail units 64 .. 71 run one row per 8 lanes and return by shuffles, d * sw and sa
 // apart, so the owner lane fuses the add as the plain walk does.
+// a K = D row pair for T rows (full double-buffered weight load for both main 64 units and
+// 8 tail units). v_wdot_r1 handles single-row experts (cnt == 1) with 2 VGPRs and 1 shuffle.
 struct v_wbuf { qz_v4u w0[2], w1[2], t0[2], t1[2]; float sw[2], tw[2]; };
 VR_NI void v_wload(v_wbuf & b, const char * wv, const __half * ws, size_t row0, size_t row1, int lane) {
     constexpr int NU = D / 32;
@@ -379,7 +379,48 @@ template <int T = VR> VR_NI float v_wdot(const v_wbuf & b, const unsigned char *
     }
     constexpr int NV = T * 2;
     float (&fv)[NV] = *(float (*)[NV]) &acc[0][0];
-    return v_tsum<NV>(fv, lane);                                            // value (row, gate|up) = v_tsum_k<NV>(lane)
+    return v_tsum<NV>(fv, lane);
+}
+VR_NI float v_wdot_r4(const v_wbuf & b, const unsigned char * la, const float * ls,
+                      int r0, int r1, int r2, int r3, int lane, float (&acc)[4][2]) {
+    constexpr int NU = D / 32;
+    #pragma unroll
+    for (int t = 0; t < 4; t++) {
+        const int r = t == 0 ? r0 : t == 1 ? r1 : t == 2 ? r2 : r3;
+        const uint4 a0 = *(const uint4 *) (la + r * D + lane * 32), a1 = *(const uint4 *) (la + r * D + lane * 32 + 16);
+        const float sa = ls[r * NU + lane];
+        #pragma unroll
+        for (int s = 0; s < 2; s++) {
+            int d = 0;
+            DOT4(d, b.w0[s].x, a0.x); DOT4(d, b.w0[s].y, a0.y); DOT4(d, b.w0[s].z, a0.z); DOT4(d, b.w0[s].w, a0.w);
+            DOT4(d, b.w1[s].x, a1.x); DOT4(d, b.w1[s].y, a1.y); DOT4(d, b.w1[s].z, a1.z); DOT4(d, b.w1[s].w, a1.w);
+            acc[t][s] = 0.f;
+            acc[t][s] += (float) d * b.sw[s] * sa;
+        }
+    }
+    const int tt = min(lane >> 3, 3), ut = 64 + (lane & 7);
+    const int tr = tt == 0 ? r0 : tt == 1 ? r1 : tt == 2 ? r2 : r3;
+    const uint4 a0 = *(const uint4 *) (la + tr * D + ut * 32), a1 = *(const uint4 *) (la + tr * D + ut * 32 + 16);
+    const float sat = ls[tr * NU + ut];
+    float q[2];
+    #pragma unroll
+    for (int s = 0; s < 2; s++) {
+        int d = 0;
+        DOT4(d, b.t0[s].x, a0.x); DOT4(d, b.t0[s].y, a0.y); DOT4(d, b.t0[s].z, a0.z); DOT4(d, b.t0[s].w, a0.w);
+        DOT4(d, b.t1[s].x, a1.x); DOT4(d, b.t1[s].y, a1.y); DOT4(d, b.t1[s].z, a1.z); DOT4(d, b.t1[s].w, a1.w);
+        q[s] = (float) d * b.tw[s];
+    }
+    #pragma unroll
+    for (int t = 0; t < 4; t++) {
+        const float st = __shfl(sat, t * 8 + (lane & 7), 64);
+        #pragma unroll
+        for (int s = 0; s < 2; s++) {
+            const float v = __shfl(q[s], t * 8 + (lane & 7), 64);
+            if (lane < 8) acc[t][s] += v * st;
+        }
+    }
+    float (&fv)[8] = *(float (*)[8]) &acc[0][0];
+    return v_tsum<8>(fv, lane);
 }
 
 
@@ -454,11 +495,11 @@ VR_NI void v_pick_w(const float * H0, int rsf, float scale, int * sids, float * 
     __syncthreads();
 }
 
-// The experts the active rows picked, each once: dex[0 .. nd-1] ascending, dmk[u] the rows
-// that picked dex[u] as bit r. Every block builds it identically, after v_pick_all.
+// The experts the active rows picked, grouped by popcount descending (buckets >=4, 3, 2, 1)
+// so v_down_dd packs experts with similar row counts into the same wave.
 struct vdist { int nd; int dex[VR * NE_USED]; unsigned dmk[VR * NE_USED]; };
 VR_NI void v_distinct(const int * sids, vdist & dd, int tid, int nr) {
-    __shared__ int wc[2];
+    __shared__ int bc[4][2], bo[4];
     unsigned m = 0;
     const int lane = tid & 63, wave = tid >> 6;
     if (tid < NE) {
@@ -467,14 +508,26 @@ VR_NI void v_distinct(const int * sids, vdist & dd, int tid, int nr) {
             #pragma unroll
             for (int k = 0; k < NE_USED; k++) m |= (r < nr && sids[r * NE_USED + k] == tid ? 1u : 0u) << r;
     }
-    const unsigned long long b = __ballot(m != 0);
-    if (tid < NE && lane == 0) wc[wave] = __popcll(b);
+    const int pc = __popc(m);
+    const int bkt = pc >= 4 ? 0 : (pc == 3 ? 1 : (pc == 2 ? 2 : (pc == 1 ? 3 : -1)));
+    unsigned long long bm[4];
+    #pragma unroll
+    for (int b = 0; b < 4; b++) {
+        bm[b] = __ballot(tid < NE && bkt == b);
+        if (tid < NE && lane == 0) bc[b][wave] = __popcll(bm[b]);
+    }
     __syncthreads();
-    if (tid < NE && m) {
-        const int idx = __popcll(b & ((1ull << lane) - 1)) + (wave ? wc[0] : 0);
+    if (tid == 0) {
+        int off = 0;
+        #pragma unroll
+        for (int b = 0; b < 4; b++) { bo[b] = off; off += bc[b][0] + bc[b][1]; }
+        dd.nd = off;
+    }
+    __syncthreads();
+    if (tid < NE && bkt >= 0) {
+        const int idx = bo[bkt] + (wave ? bc[bkt][0] : 0) + __popcll(bm[bkt] & ((1ull << lane) - 1));
         dd.dex[idx] = tid; dd.dmk[idx] = m;
     }
-    if (tid == 0) dd.nd = wc[0] + wc[1];
     __syncthreads();
 }
 // row r's slot of expert e, which it picked
@@ -549,6 +602,82 @@ template <int T = VR> VR_NI void v_up_dd(const char * wv, const __half * ws, con
             }
         }
         __builtin_amdgcn_wave_barrier();                                    // the tile is rewritten by the next group
+    }
+}
+// For nr > 4, pack each expert's picking rows in groups of up to 4 and run v_wdot_r4
+// instead of computing all 8 rows: >95% of experts have <= 4 picking rows, so they stay
+// memory-bandwidth-bound at T=4 cost while the rare >4-row expert runs a second pass.
+VR_NI void v_up_dd_r4(const char * wv, const __half * ws, const int * sids, const vdist & dd,
+                      const unsigned char * av0, const float * as0, float beta, float lb,
+                      unsigned char * hq0, float * hs0, int tid, int rs, int rsf, int nr) {
+    asm volatile ("" : "+v"(tid));
+    av0 = qz_gp(av0); as0 = qz_gp(as0); hq0 = qz_gp(hq0); hs0 = qz_gp(hs0);
+    const int wave = tid >> 6, lane = tid & 63, nw = gridDim.x * 8;
+    unsigned char * la = (unsigned char *) cyc_lds;                       // [VR][D]
+    float * ls = cyc_lds + VR * D / 4;                                     // [VR][D / 32]
+    __syncthreads();
+    for (int i = tid; i < nr * D / 16; i += 512) {
+        const int r = i / (D / 16), c = i % (D / 16);
+        ((uint4 *) la)[i] = *(const uint4 *) (av0 + (size_t) r * rs + c * 16);
+    }
+    for (int i = tid; i < nr * D / 32; i += 512) {
+        const int r = i / (D / 32), c = i % (D / 32);
+        ls[i] = as0[(size_t) r * rsf + c];
+    }
+    __syncthreads();
+    float * lq = ls + VR * D / 32 + wave * VR * 32;                        // [VR][32] per wave
+    constexpr int NG = FFL / 32, LV = 64 / 8;
+    const int kv = v_tsum_k<8>(lane), vr = kv >> 1, vs = kv & 1;
+    const bool wl_base = (lane & (LV - 1)) == 0 && vs == 0;
+    const int tot = dd.nd * NG;
+    #pragma unroll 1
+    for (int gw = blockIdx.x * 8 + wave; gw < tot; gw += nw) {
+        // Shift task order when tot > nw so multi-pass (pc > 4) experts at u = 0.. land
+        // on single-task waves [tot - nw, nw) instead of two-task waves [0, tot - nw).
+        const int idx = tot > nw ? (gw + nw) % tot : gw;
+        const int u = idx / NG, g = idx % NG;
+        const int e = __builtin_amdgcn_readfirstlane(dd.dex[u]);
+        const unsigned mk = __builtin_amdgcn_readfirstlane(dd.dmk[u]);
+        const size_t r0 = (size_t) e * GUL + (size_t) g * 64;
+        unsigned rem_mk = mk;
+        #pragma unroll 1
+        do {
+            int p0 = 0, p1 = 0, p2 = 0, p3 = 0, n1 = 0;
+            if (rem_mk) { p0 = __builtin_amdgcn_readfirstlane(__ffs(rem_mk) - 1); rem_mk &= rem_mk - 1; n1 = 1; }
+            if (rem_mk) { p1 = __builtin_amdgcn_readfirstlane(__ffs(rem_mk) - 1); rem_mk &= rem_mk - 1; n1 = 2; }
+            if (rem_mk) { p2 = __builtin_amdgcn_readfirstlane(__ffs(rem_mk) - 1); rem_mk &= rem_mk - 1; n1 = 3; }
+            if (rem_mk) { p3 = __builtin_amdgcn_readfirstlane(__ffs(rem_mk) - 1); rem_mk &= rem_mk - 1; n1 = 4; }
+            const bool wl1 = wl_base && vr < n1;
+            const int wr1 = vr == 0 ? p0 : vr == 1 ? p1 : vr == 2 ? p2 : p3;
+            v_wbuf A, B;
+            float acc[4][2];
+            v_wload(A, wv, ws, r0, r0 + 32, lane);
+            #pragma unroll 1
+            for (int a = 0; a < 32; a += 2) {
+                v_wload(B, wv, ws, r0 + a + 1, r0 + a + 33, lane);
+                float val = v_wdot_r4(A, la, ls, p0, p1, p2, p3, lane, acc), upv = __shfl_down(val, LV, 64);
+                if (wl1) lq[wr1 * 32 + a] = situ_v(val, upv, beta, lb);
+                v_wload(A, wv, ws, r0 + min(a + 2, 31), r0 + min(a + 2, 31) + 32, lane);
+                val = v_wdot_r4(B, la, ls, p0, p1, p2, p3, lane, acc); upv = __shfl_down(val, LV, 64);
+                if (wl1) lq[wr1 * 32 + a + 1] = situ_v(val, upv, beta, lb);
+            }
+        } while (rem_mk);
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+        unsigned rem = mk;
+        while (rem) {
+            const int ra = __ffs(rem) - 1;
+            rem &= rem - 1;
+            const int rb = rem ? __ffs(rem) - 1 : -1;
+            if (rb >= 0) rem &= rem - 1;
+            const int r = (lane >> 5) ? rb : ra;
+            if (r >= 0) {
+                const int k = v_slot(sids, r, e);
+                quant32(lq[r * 32 + (lane & 31)], hq0 + (size_t) r * rs + k * FFL, hs0 + (size_t) r * rsf + k * (FFL / 32), g * 32 + (lane & 31));
+            }
+        }
+        __builtin_amdgcn_wave_barrier();
     }
 }
 // the down rows over the distinct experts, c_moe_down_q's quads and per-(row, slot) values.
@@ -665,6 +794,88 @@ VR_NI void v_down_dd(const char * wv, const __half * ws, const int * sids, const
     }
 }
 
+// ga GEMVs (K = D = 2304) for T rows: stages each activation plane into LDS once when
+// the job's input pointer changes, so waves read activations from LDS instead of global.
+template <int S, int T = VR> VR_NI void v_ga_gemv(CK gjobs * J, int nga, int rs, int rsf, int tid) {
+    asm volatile ("" : "+v"(tid));
+    unsigned char * la = (unsigned char *) cyc_lds;                      // [T][D]
+    float * ls = (float *) (la + T * D);                                 // [T][D / 32]
+    const unsigned char * cur_av = nullptr;
+    const int wave = tid >> 6, lane = tid & 63, nb = gridDim.x;
+    constexpr int NV = T * S;
+    const int kv = v_tsum_k<NV>(lane), vt = kv / S, vs = kv % S;
+    const bool wl = (lane & (64 / NV - 1)) == 0;
+    for (int hb = blockIdx.x; hb < (4 / S) * nga; hb += nb) {
+        const int b = hb / (4 / S), half = hb % (4 / S);
+        int k = 0;
+        while (k + 1 < J->n && b >= J->j[k].g1) k++;
+        CK gjob * j = &J->j[k];
+        if (j->av != cur_av) {
+            cur_av = j->av;
+            __syncthreads();
+            for (int i = tid; i < T * D / 16; i += 512) {
+                const int r = i / (D / 16), c = i % (D / 16);
+                ((uint4 *) la)[i] = *(const uint4 *) (qz_gp(j->av) + (size_t) r * rs + c * 16);
+            }
+            for (int i = tid; i < T * (D / 32); i += 512) {
+                const int r = i / (D / 32), c = i % (D / 32);
+                ls[i] = qz_gp(j->as)[(size_t) r * rsf + c];
+            }
+            __syncthreads();
+        }
+        const int g = b - (k ? J->j[k - 1].g1 : 0);
+        const int r0 = g * 32 + half * 8 * S + wave * S;
+        const int N = j->N;
+        float * y = qz_gp(j->y);
+        float acc[T][S];
+        v_core_acc<T, S>(la, ls, D, D / 32, D / 32, j->wv, j->ws, D, D / 32, N, r0, lane, acc);
+        float (&fv)[NV] = *(float (*)[NV]) &acc[0][0];
+        const float val = v_tsum<NV>(fv, lane);
+        if (wl && r0 + vs < N) y[(size_t) vt * rsf + r0 + vs] = val;
+    }
+    __syncthreads();
+}
+// attn_output GEMV for T rows (N = D = 2304, K = QL = 1536): stages T activation rows
+// in LDS once per block, balances 576 quads (2 x S=2 pairs per quad, low VGPRs) evenly
+// across all blocks, and pushes coalesced float4 stores to both PART0 and the peer inboxes (yp0).
+template <int T> VR_NI void v_go_gemv(CK gjob * j, int rs, int rsf, const qz_xpush<QZ_NC> & yp0, int tid) {
+    asm volatile ("" : "+v"(tid));
+    unsigned char * la = (unsigned char *) cyc_lds;                      // [T][QL]
+    float * ls = (float *) (la + T * QL);                                // [T][QL / 32]
+    float * tile = ls + T * (QL / 32);                                   // [T][40]
+    __syncthreads();
+    for (int i = tid; i < T * QL / 16; i += 512) {
+        const int r = i / (QL / 16), c = i % (QL / 16);
+        ((uint4 *) la)[i] = *(const uint4 *) (qz_gp(j->av) + (size_t) r * rs + c * 16);
+    }
+    for (int i = tid; i < T * (QL / 32); i += 512) {
+        const int r = i / (QL / 32), c = i % (QL / 32);
+        ls[i] = qz_gp(j->as)[(size_t) r * rsf + c];
+    }
+    __syncthreads();
+    constexpr int NQ = D / 4;
+    const int nb = gridDim.x, wave = tid >> 6, lane = tid & 63;
+    const int q0 = blockIdx.x * NQ / nb, q1 = (blockIdx.x + 1) * NQ / nb, nq = q1 - q0;
+    constexpr int NV = T * 2;
+    const int kv = v_tsum_k<NV>(lane), vt = kv >> 1, vs = kv & 1;
+    const bool wl = (lane & (64 / NV - 1)) == 0;
+    for (int p = wave; p < 2 * nq; p += 8) {
+        float acc[T][2];
+        v_core_acc<T, 2>(la, ls, QL, QL / 32, QL / 32, j->wv, j->ws, QL, QL / 32, D, q0 * 4 + p * 2, lane, acc);
+        float (&fv)[NV] = *(float (*)[NV]) &acc[0][0];
+        const float val = v_tsum<NV>(fv, lane);
+        if (wl) tile[vt * nq * 4 + p * 2 + vs] = val;
+    }
+    __syncthreads();
+    for (int i = tid; i < T * nq; i += 512) {
+        const int t = i / nq, q = i % nq;
+        const float4 v = *(const float4 *) (tile + t * nq * 4 + q * 4);
+        const int r = (q0 + q) * 4;
+        *(float4 *) (qz_gp(j->y) + (size_t) t * rsf + r) = v;
+        yp0.put4((size_t) t * D + r, v);
+    }
+    __syncthreads();
+}
 // c_gemv2 over T rows at once: activation row t at av + t rs, output at y + t rsf,
 // yp0 the peers' inbox rows at stride D. Weights are read once, and each row's value is
 // c_gemv2's, since qz_gemv_core's per-row order does not depend on T.
@@ -715,10 +926,15 @@ template <int NJ> VR_NI void v_ctrl_down(CK cjob * cj, int rsf, int tid, int nr)
         float wa[MR][NV], wb[MR][NV];
         #pragma unroll
         for (int m = 0; m < MR; m++) {
-            const int r = min(r0 + bpj * (h + 2 * m), GRANK - 1);
-            const float * w = wd + (size_t) r * 2 * D;
-            #pragma unroll
-            for (int k = 0; k < NV; k++) { wa[m][k] = w[t + 256 * k]; wb[m][k] = w[D + t + 256 * k]; }
+            const int r = r0 + bpj * (h + 2 * m);
+            if (r < GRANK) {
+                const float * w = wd + (size_t) r * 2 * D;
+                #pragma unroll
+                for (int k = 0; k < NV; k++) { wa[m][k] = w[t + 256 * k]; wb[m][k] = w[D + t + 256 * k]; }
+            } else {
+                #pragma unroll
+                for (int k = 0; k < NV; k++) { wa[m][k] = 0.f; wb[m][k] = 0.f; }
+            }
         }
         #pragma unroll 1
         for (int row = 0; row < nr; row++) {   // the active rows
@@ -750,52 +966,98 @@ template <int NJ> VR_NI void v_ctrl_down(CK cjob * cj, int rsf, int tid, int nr)
     }
     __syncthreads();
 }
-// c_ctrl_up_all over T rows. Each weight chunk loads once, the T rows' sums in
-// c_ctrl_up_all's k order. g and the forget sums of all rows sit in dynamic LDS.
-template <int NJ, int T = VR> VR_NI void v_ctrl_up(CK cjob * cj, int rsf, int tid) {
+// Fused v_ctrl_up + rmsnorm + quant32 over NJ jobs and T rows, partitioned on 32-element
+// groups so every block keeps its T outputs in registers across one grid barrier (for the
+// global sum of squares) and immediately normalizes and quantizes without a separate c_norm.
+template <int NJ, int T = VR> VR_NI void v_ctrl_up_norm(CK cjob * cj, CK njob * nj, float eps,
+                                                        float * ss_buf, int rs, int rsf,
+                                                        unsigned int * vbst, int & kb, int tid, int nr) {
     asm volatile ("" : "+v"(tid));
     float * g = cyc_lds;                                   // [T][NJ][GRANK]
     float * sf = cyc_lds + T * NJ * GRANK;                 // [T][256]
+    float * gs = sf + T * 256;                             // [T][8]
+    float * rsv = gs + T * 8;                              // [T][NJ]
+    float * sbl = rsv + T * NJ;                            // [T * NJ][64]
     __syncthreads();
     for (int i = tid; i < T * NJ * GRANK; i += 512) {
         const int row = i / (NJ * GRANK), jj = (i / GRANK) % NJ, k = i % GRANK;
         g[i] = qz_gp(cj[jj].g)[(size_t) row * rsf + k];
     }
     __syncthreads();
-    constexpr int NR = NJ * D, KC = 32;
-    const int r0 = blockIdx.x * NR / gridDim.x, r1 = (blockIdx.x + 1) * NR / gridDim.x;
-    for (int c0 = r0; c0 < r1; c0 += 256) {
-        const int n = min(256, r1 - c0), which = tid >= n, q = tid - (which ? n : 0);
-        const int r = c0 + min(q, n - 1), j = r / D, i = r % D;
-        float a[T];
+    constexpr int NG = D / 32, NTG = NJ * NG, KC = 32;
+    const int nb = gridDim.x;
+    const int g0 = blockIdx.x * NTG / nb, g1 = (blockIdx.x + 1) * NTG / nb;
+    const int ng = g1 - g0, n = ng * 32;
+    const int which = tid >= n, q = tid - (which ? n : 0);
+    const int grp = g0 + (min(q, max(n - 1, 0)) >> 5), j = grp / NG, i = (grp % NG) * 32 + (q & 31);
+    float a[T];
+    #pragma unroll
+    for (int row = 0; row < T; row++) a[row] = 0.f;
+    if (tid < 2 * n) {
+        const float * w = qz_gp(which ? cj[j].wft : cj[j].wgt) + i;
+        #pragma unroll 1
+        for (int k0 = 0; k0 < GRANK; k0 += KC) {
+            float v[KC];
+            #pragma unroll
+            for (int k = 0; k < KC; k++) v[k] = w[(size_t) (k0 + k) * D];
+            #pragma unroll
+            for (int row = 0; row < T; row++)
+                #pragma unroll
+                for (int k = 0; k < KC; k++) a[row] += g[(row * NJ + j) * GRANK + k0 + k] * v[k];
+        }
+        if (which)
+            #pragma unroll
+            for (int row = 0; row < T; row++) sf[row * 256 + q] = a[row];
+    }
+    __syncthreads();
+    float val[T];
+    #pragma unroll
+    for (int row = 0; row < T; row++) {
+        val[row] = 0.f;
+        if (tid < n && row < nr) {
+            const size_t o = (size_t) row * rsf;
+            const float x = qz_gp(cj[j].cur)[o + i], fo = sf[row * 256 + q], ga = a[row];
+            val[row] = (x - tanhf(fo) * x) + tanhf(ga) * qz_gp(cj[j].msg)[o + i];
+        }
+        float v2 = val[row] * val[row];
         #pragma unroll
-        for (int row = 0; row < T; row++) a[row] = 0.f;
-        if (tid < 2 * n) {
-            const float * w = qz_gp(which ? cj[j].wft : cj[j].wgt) + i;
-            #pragma unroll 1
-            for (int k0 = 0; k0 < GRANK; k0 += KC) {
-                float v[KC];
-                #pragma unroll
-                for (int k = 0; k < KC; k++) v[k] = w[(size_t) (k0 + k) * D];
-                #pragma unroll
-                for (int row = 0; row < T; row++)
-                    #pragma unroll
-                    for (int k = 0; k < KC; k++) a[row] += g[(row * NJ + j) * GRANK + k0 + k] * v[k];
-            }
-            if (which)
-                #pragma unroll
-                for (int row = 0; row < T; row++) sf[row * 256 + q] = a[row];
+        for (int off = 16; off > 0; off >>= 1) v2 += __shfl_xor(v2, off, 32);
+        if (tid < n && (tid & 31) == 0) gs[row * 8 + (tid >> 5)] = v2;
+    }
+    __syncthreads();
+    if (tid < T * NJ) {
+        const int row = tid / NJ, jj = tid % NJ;
+        if (row < nr) {
+            float s = 0.f;
+            for (int u = 0; u < ng; u++) if ((g0 + u) / NG == jj) s += gs[row * 8 + u];
+            qz_gp(ss_buf)[tid * nb + blockIdx.x] = s;
         }
-        __syncthreads();
-        if (tid < n) {
-            #pragma unroll 1
-            for (int row = 0; row < T; row++) {
-                const size_t o = (size_t) row * rsf;
-                const float x = qz_gp(cj[j].cur)[o + i], fo = sf[row * 256 + q], ga = a[row];
-                qz_gp(cj[j].out)[o + i] = (x - tanhf(fo) * x) + tanhf(ga) * qz_gp(cj[j].msg)[o + i];
+    }
+    cyc_barrier(vbst, ++kb);
+    {
+        const int wave = tid >> 6, lane = tid & 63;
+        for (int p = wave; p < T * NJ; p += 8)
+            if (lane < nb) sbl[p * 64 + lane] = qz_gp(ss_buf)[p * nb + lane];
+    }
+    __syncthreads();
+    if (tid < T * NJ) {
+        float tot = 0.f;
+        const float * sb = sbl + tid * 64;
+        for (int b = 0; b < nb; b++) tot += sb[b];
+        rsv[tid] = rsqrtf(tot / D + eps);
+    }
+    __syncthreads();
+    if (tid < n) {
+        CK njob * njj = nj + j;
+        const float wv = qz_gp(njj->w)[i];
+        #pragma unroll
+        for (int row = 0; row < T; row++) {
+            if (row < nr) {
+                const float yv = val[row] * rsv[row * NJ + j] * wv;
+                if (njj->y) qz_gp(njj->y)[(size_t) row * rsf + i] = yv;
+                quant32(yv, qz_gp(njj->q) + (size_t) row * rs, qz_gp(njj->qs) + (size_t) row * rsf, i);
             }
         }
-        __syncthreads();
     }
 }
 
@@ -918,33 +1180,21 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         if (msg) {
             v_ctrl_down<3>(e0->ca.j, rsf, tid, nr);
             cyc_barrier(vbst, ++kb);
-            v_by_rows(nr, [&](auto t) { v_ctrl_up<3, decltype(t)::value>(e0->ca.j, rsf, tid); });
-            cyc_barrier(vbst, ++kb);
-            for (int v = blockIdx.x; v < nr * nna; v += nb) {
-                const int r = v / nna, j = v % nna;
-                c_norm(&VROW(Av.tab, r, ai)->na.j[j], Av.eps, tid);
-            }
+            v_by_rows(nr, [&](auto t) { v_ctrl_up_norm<3, decltype(t)::value>(e0->ca.j, e0->na.j, Av.eps, Av.H, rs, rsf, vbst, kb, tid, nr); });
             cyc_barrier(vbst, ++kb);
         }
         // ---- attention: the qkv GEMVs, the head posts with the cache rows, the attention
-        v_by_rows(nr, [&](auto t) {
-            for (int v = blockIdx.x; v < 4 / VG_S * e0->nga; v += nb) v_gemv<VG_S, decltype(t)::value>(&e0->ga, v, rs, rsf, qz_xpush<QZ_NC>{});
-        });
+        v_by_rows(nr, [&](auto t) { v_ga_gemv<VG_S, decltype(t)::value>(&e0->ga, e0->nga, rs, rsf, tid); });
         cyc_barrier(vbst, ++kb);
-        // a block's 4 units (128 threads each) are of one kind (q / k / v): their sync counts differ
-        if constexpr (HQL % 4 == 0 && HKVL % 4 == 0) {
-            for (int v = blockIdx.x; v < nr * (HQL + 2 * HKVL) / 4; v += nb) {
-                const int nu = (HQL + 2 * HKVL) / 4, r = v / nu, u = (v % nu) * 4 + (tid >> 7);
-                v_head_post(&VROW(Av.tab, r, ai)->hp, pos + r, tv.tau[r], u, tid, r, Vq->uh, rsf, Vq->hist);
-            }
-        } else {   // each kind rounded up to whole blocks, the spare groups padding
-            constexpr int QB = (HQL + 3) / 4, KB = (HKVL + 3) / 4, nu = QB + 2 * KB;
+        {
+            // a block's nper units are of one kind (q / k / v): TP4's 6 q / 2 k / 2 v units allow 2
+            constexpr int NPMAX = HQL % 4 == 0 && HKVL % 4 == 0 ? 4 : HQL % 2 == 0 && HKVL % 2 == 0 ? 2 : 1;
+            int nper = nr <= 2 ? 1 : (nr <= 4 ? 2 : 4);
+            if constexpr (NPMAX < 4) nper = min(nper, NPMAX);
+            const int nu = (HQL + 2 * HKVL) / nper, tb_st = 512 / nper;
             for (int v = blockIdx.x; v < nr * nu; v += nb) {
-                const int r = v / nu, j = v % nu, g = tid >> 7;
-                const int base = j < QB ? 0 : j < QB + KB ? HQL : HQL + HKVL;
-                const int lim = j < QB ? HQL : HKVL, k = (j < QB ? j : j < QB + KB ? j - QB : j - QB - KB) * 4 + g;
-                v_head_post<true>(&VROW(Av.tab, r, ai)->hp, pos + r, tv.tau[r], base + min(k, lim - 1), tid, r, Vq->uh, rsf,
-                                  Vq->hist, k < lim);
+                const int r = v / nu, u = (v % nu) * nper + (tid / tb_st);
+                v_head_post(&VROW(Av.tab, r, ai)->hp, pos + r, tv.tau[r], u, tid, r, Vq->uh, rsf, Vq->hist, nper);
             }
         }
         cyc_barrier(vbst, ++kb);
@@ -954,8 +1204,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         cyc_barrier(vbst, ++kb);
         ++xs;
         v_by_rows(nr, [&](auto t) {
-            for (int v = blockIdx.x; v < 4 / VG_S * e0->ngo; v += nb)
-                v_gemv<VG_S, decltype(t)::value>(&e0->go, v, rs, rsf, INK_XDST(Av, 2 * D + (size_t) (xs & 1) * VR * D));
+            v_go_gemv<decltype(t)::value>(&e0->go.j[0], rs, rsf, INK_XDST(Av, 2 * D + (size_t) (xs & 1) * VR * D), tid);
         });
         __threadfence_system();
         cyc_barrier(vbst, ++kb);
@@ -972,9 +1221,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         if (msg) {
             v_ctrl_down<1>(e0->cb.j, rsf, tid, nr);
             cyc_barrier(vbst, ++kb);
-            v_by_rows(nr, [&](auto t) { v_ctrl_up<1, decltype(t)::value>(e0->cb.j, rsf, tid); });
-            cyc_barrier(vbst, ++kb);
-            if (blockIdx.x < (unsigned) nr) c_norm(&VROW(Av.tab, blockIdx.x, ai)->nb.j[0], Av.eps, tid);
+            v_by_rows(nr, [&](auto t) { v_ctrl_up_norm<1, decltype(t)::value>(e0->cb.j, e0->nb.j, Av.eps, Av.H, rs, rsf, vbst, kb, tid, nr); });
             cyc_barrier(vbst, ++kb);
         }
         // ---- the experts: the router, the pick, gate | up + SITU, the down sum
@@ -989,7 +1236,8 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
             ((float *) ((char *) Av.WTS + (size_t) r * rs))[k] = swts[tid];
         }
         v_distinct(sids, dd, tid, nr);
-        v_by_rows(nr, [&](auto t) { v_up_dd<decltype(t)::value>(e0->guv, e0->gus, sids, dd, Av.aq3, Av.as3, Av.beta, Av.lb, Av.hq, Av.hs, tid, rs, rsf, nr); });
+        if (nr <= 2) v_up_dd<2>(e0->guv, e0->gus, sids, dd, Av.aq3, Av.as3, Av.beta, Av.lb, Av.hq, Av.hs, tid, rs, rsf, nr);
+        else v_up_dd_r4(e0->guv, e0->gus, sids, dd, Av.aq3, Av.as3, Av.beta, Av.lb, Av.hq, Av.hs, tid, rs, rsf, nr);
         cyc_barrier(vbst, ++kb);
         ++xs;
         v_down_dd(e0->dnv, e0->dns, sids, swts, dd, Av.hq, Av.hs, Av.PART1, INK_XDST(Av, 2 * D + (size_t) (xs & 1) * VR * D),
@@ -1030,13 +1278,24 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         v_by_rows(nr, [&](auto tc) {   // the T-row head GEMV, c_head_gemv's rows and values, softcap on rows < nvalid
             constexpr int T = decltype(tc)::value;
             const int N = Vp->A.hg.N, NV = Vp->A.nvalid;
-            const int rsf_ = rsf;
+            unsigned char * la = (unsigned char *) cyc_lds;
+            float * ls = (float *) (la + T * D);
+            __syncthreads();
+            for (int i = tid_k; i < T * D / 16; i += 512) {
+                const int r = i / (D / 16), c = i % (D / 16);
+                ((uint4 *) la)[i] = *(const uint4 *) (qz_gp(Vp->A.hg.av) + (size_t) r * rs + c * 16);
+            }
+            for (int i = tid_k; i < T * (D / 32); i += 512) {
+                const int r = i / (D / 32), c = i % (D / 32);
+                ls[i] = qz_gp(Vp->A.hg.as)[(size_t) r * rsf + c];
+            }
+            __syncthreads();
             constexpr int S_ = 4;
             for (int gg = blockIdx.x; gg * (8 * S_) < N; gg += nb) {
                 const int r0 = gg * (8 * S_) + wave * S_;
                 float acc[T][S_];
-                v_core_acc<T, S_>(Vp->A.hg.av, Vp->A.hg.as, (int) rs, rsf_, Vp->A.hg.K / 32,
-                                  Vp->A.hg.wv, Vp->A.hg.ws, Vp->A.hg.K, Vp->A.hg.K / 32, N, r0, lane, acc);
+                v_core_acc<T, S_>(la, ls, D, D / 32, D / 32,
+                                  Vp->A.hg.wv, Vp->A.hg.ws, D, D / 32, N, r0, lane, acc);
                 constexpr int NVv = T * S_;
                 float (&fv)[NVv] = *(float (*)[NVv]) &acc[0][0];
                 const float val = v_tsum<NVv>(fv, lane);

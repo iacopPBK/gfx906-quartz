@@ -3,11 +3,11 @@
 <text x="30" y="58" font-size="12" fill="#8b949e">tok/s, higher is better; DSpark samples by speculative sampling (same distribution as plain)</text>
 <text x="30" y="96" font-size="14" font-weight="600" fill="#e6edf3">Prefill, pp2048</text>
 <text x="30" y="125" font-size="12" fill="#e6edf3">0 ctx</text>
-<rect x="150" y="112" width="439.6" height="18" rx="3" fill="#3b82f6"/>
-<text x="597.6" y="125" font-size="12" fill="#e6edf3">1884  <tspan fill="#8b949e">quartz</tspan></text>
+<rect x="150" y="112" width="485.2" height="18" rx="3" fill="#3b82f6"/>
+<text x="643.2" y="125" font-size="12" fill="#e6edf3">2426  <tspan fill="#8b949e">quartz</tspan></text>
 <text x="30" y="161" font-size="12" fill="#e6edf3">16k ctx</text>
-<rect x="150" y="148" width="322.2" height="18" rx="3" fill="#3b82f6"/>
-<text x="480.2" y="161" font-size="12" fill="#e6edf3">1381  <tspan fill="#8b949e">quartz</tspan></text>
+<rect x="150" y="148" width="325.6" height="18" rx="3" fill="#3b82f6"/>
+<text x="483.6" y="161" font-size="12" fill="#e6edf3">1628  <tspan fill="#8b949e">quartz</tspan></text>
 <text x="30" y="206" font-size="14" font-weight="600" fill="#e6edf3">Decode, 400 tokens, sampled</text>
 <rect x="520" y="194" width="12" height="12" rx="2" fill="#6e7681"/><text x="538" y="205" font-size="12" fill="#e6edf3">Plain</text>
 <rect x="610" y="194" width="12" height="12" rx="2" fill="#8b5cf6"/><text x="628" y="205" font-size="12" fill="#e6edf3">DSpark</text>
@@ -117,6 +117,6 @@
 <rect x="476.7" y="916" width="27.3" height="16" fill="#8b5cf6"/>
 <rect x="504.0" y="916" width="4.5" height="16" fill="#6e7681"/>
 <text x="700.0" y="928" font-size="12" fill="#e6edf3">22.2 <tspan fill="#8b949e">/ 34.3 GB</tspan></text>
-<text x="30" y="966" font-size="11" fill="#8b949e">Decode 2026-11-25, prefill 2026-11-24 (median of 3). Decode: T 1.0, top-k 20, top-p 0.95, seed 7, thinking off. Same prompts as Qwen3.8-27B.</text>
+<text x="30" y="966" font-size="11" fill="#8b949e">Decode 2026-11-25, prefill 2026-11-26 (median of 3). Decode: T 1.0, top-k 20, top-p 0.95, seed 7, thinking off. Same prompts as Qwen3.8-27B.</text>
 <text x="30" y="984" font-size="11" fill="#8b949e">VRAM: the server's per-card ledger, 2026-11-24.</text>
 </svg>
