@@ -494,6 +494,7 @@ struct qz_prefill {
         size_t scr = 0;                                  // bytes carved from the engine's scratch; 0 means own buffers
         hipEvent_t ev = nullptr, ev_aux = nullptr, evp[4] = {};
         hipStream_t aux = nullptr;
+        hipStream_t cps = nullptr;                       // the partial copies to the peers at more than two cards (p2p)
     } c[QZ_NC];
 
     // the per-card buffers of init(max_rows): (pointer, bytes) for M rows.
@@ -544,6 +545,7 @@ struct qz_prefill {
             CHECK(hipEventCreateWithFlags(&k.ev_aux, hipEventDisableTiming));
             for (int j = 0; j < 4; j++) CHECK(hipEventCreateWithFlags(&k.evp[j], hipEventDisableTiming));
             CHECK(qz_card_stream(i, &k.aux));
+            if (QZ_NC > 2) CHECK(qz_card_stream(i, &k.cps));
             CHECK(hipEventRecord(k.ev_aux, k.aux));
         }
         CHECK(hipSetDevice(qz_dev_of(0)));
@@ -556,11 +558,17 @@ struct qz_prefill {
     half hv[2];
     int nh = 1;
     int hset[2] = {0, 0}, hpn[2] = {0, 0};          // per half: the partial set in use (hset) and a pending sum flag (hpn)
-    hipEvent_t evx[QZ_NC][2] = {}, evh[QZ_NC][4] = {}, evc[QZ_NC][2] = {};
+    hipEvent_t evx[QZ_NC][2] = {}, evh[QZ_NC][4] = {}, evc[QZ_NC][2] = {}, evq[QZ_NC][2] = {};
                                                     // [card][half]: a partial is written. [card][kind]: half 0's conv, scan or kv is done, or the join.
                                                     // evc[card][half]: the copy of the peer's partial into that card has landed (host mode)
 
     hipStream_t hs(qz_engine & e, int i, int h) { return h == 0 ? e.C[i].st : c[i].aux; }
+    // More than two cards over p2p: each card's partials go out on its own copy stream, one
+    // peer at a time in the same order on every card (peer k = 1, 2, 3: a ring, the pairs,
+    // the reverse ring). One GPU writing to several peers at once collapses P2P on some
+    // hosts, and a copy on the half's own stream stalls that half. evq[card][half]: the
+    // card's copies of the half have landed in every peer.
+    static bool xq() { return QZ_NC > 2 && qz_link == QZ_LINK_P2P; }
 
     // C = A x W over the half's token tiles. A is the grouped int8 input, aq by default.
     void gemm(qz_engine & e, int i, int h, const char * W, const __half * sw, int N, int K, float * C, int ldc,
@@ -590,7 +598,19 @@ struct qz_prefill {
                                xc ? (unsigned short *) nullptr : (unsigned short *) c[(i + 1) % QZ_NC].pr[s_][0]);
             CHECK(hipEventRecord(evx[i][h], hs(e, i, h)));
         }
-        if (xc) {
+        if (xc && xq()) {
+            const size_t off = (size_t) H.r0 * PF_D * 2, nb = (size_t) (H.rp - H.r0) * PF_D * 2;
+            for (int i = 0; i < QZ_NC; i++) {
+                CHECK(hipSetDevice(qz_dev_of(i)));
+                CHECK(hipStreamWaitEvent(c[i].cps, evx[i][h], 0));
+                for (int k = 1; k < QZ_NC; k++) {
+                    const int p = (i + k) % QZ_NC;
+                    CHECK(hipMemcpyPeerAsync((char *) c[p].pr[s_][QZ_NC - 1 - k] + off, qz_dev_of(p),
+                                             (const char *) c[i].pl[s_] + off, qz_dev_of(i), nb, c[i].cps));
+                }
+                CHECK(hipEventRecord(evq[i][h], c[i].cps));
+            }
+        } else if (xc) {
             // the rows this half's GEMM wrote, into each peer's pr slot: the source is this
             // card's stream, the destination the peer's, and evc says they have landed
             const size_t off = (size_t) H.r0 * PF_D * 2, nb = (size_t) (H.rp - H.r0) * PF_D * 2;
@@ -616,7 +636,9 @@ struct qz_prefill {
         const int r1 = rows_end >= 0 ? rows_end : H.rp;
         if (hpn[h]) {
             for (int j = 1; j < QZ_NC; j++) CHECK(hipStreamWaitEvent(st, evx[(i + j) % QZ_NC][h], 0));
-            if (qz_link == QZ_LINK_HOST || QZ_NC > 2)   // the peers' partials arrived by copy
+            if (xq())                                    // the peers' copies into this card
+                for (int j = 1; j < QZ_NC; j++) CHECK(hipStreamWaitEvent(st, evq[(i + j) % QZ_NC][h], 0));
+            else if (qz_link == QZ_LINK_HOST || QZ_NC > 2)   // the peers' partials arrived by copy
                 CHECK(hipStreamWaitEvent(st, evc[i][h], 0));
             const int s_ = hset[h];
             const unsigned short * pp[QZ_NC];            // the partials in card order
@@ -746,6 +768,7 @@ struct qz_prefill {
                 for (int h = 0; h < 2; h++) CHECK(hipEventCreateWithFlags(&evx[i][h], hipEventDisableTiming));
                 for (int j = 0; j < 4; j++) CHECK(hipEventCreateWithFlags(&evh[i][j], hipEventDisableTiming));
                 for (int h = 0; h < 2; h++) CHECK(hipEventCreateWithFlags(&evc[i][h], hipEventDisableTiming));
+                for (int h = 0; h < 2; h++) CHECK(hipEventCreateWithFlags(&evq[i][h], hipEventDisableTiming));
             }
             // in the shared scratch the buffers still hold the decode's partials, so zero
             // them like fresh buffers. Rows past n are padding the kernels skip.
