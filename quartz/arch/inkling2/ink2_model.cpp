@@ -261,29 +261,38 @@ struct ink2_ctx : qz_ctx {
         // requests. Without one, rounds under sw_lo tokens count as slow. Both paths
         // give the same tokens, and the plain path fills the drafter's context.
         static const bool sw_on = [] { const char * v = getenv("QZ_NO_SWITCH"); return !(v && *v && strcmp(v, "0") != 0); }();
-        static const float sw_lo = getenv("QZ_SW_LO") ? (float) atof(getenv("QZ_SW_LO")) : 2.7f;
-        static const int sw_win = getenv("QZ_SW_WIN") ? atoi(getenv("QZ_SW_WIN")) : 16;
+        static const float sw_lo = getenv("QZ_SW_LO") ? (float) atof(getenv("QZ_SW_LO")) : 2.2f;
+        static const int sw_win = getenv("QZ_SW_WIN") ? atoi(getenv("QZ_SW_WIN")) : 24;
         static double step_ms = 0.0;                            // plain step time (EMA) at step_pos
         static int step_pos = -(1 << 30);
         constexpr int SW_MEAS = 6, SW_REMEAS = 2048, SW_PROBE = 64, SW_CAP = 2048;
-        constexpr double SW_MARGIN = 0.85;                      // plain mode below 85% of the plain step's rate
+        constexpr double SW_MARGIN = 0.82;                      // plain mode below 82% of the plain step's rate
         bool spec = true, meas = false;
         int plain_left = 0, probe = SW_PROBE, seg = 0, nsw = 0, ntok_plain = 0;
+        double meas_buf[SW_MEAS] = {};
+        int meas_n = 0;
         // Adaptive verify width. A round of n rows (the anchor and n - 1 drafts) emits
         // E(n) = (1 - a^n) / (1 - a) tokens for a per-draft acceptance a, in the round time
         // t(n), so the policy takes the n with the best E(n) / t(n). a is the accepted share
         // of the last 32 rounds' tested drafts (a rejection is one more test, the drafts
         // after it are untested), clamped to [0.05, 0.98]. t(n) is a per-n EMA of the round's
-        // wall time, seeded from t(8) * (0.45 + 0.55 n / 8) until n has samples; the table is
-        // kept across requests like the plain step's timing. Every 64th round takes the best
-        // n + 1 instead, to refresh its estimate. QZ_DS_ROWS=2..8 fixes n (read per call).
+        // wall time, seeded from the measured piecewise ratio table RT_SEED (matching the
+        // T=2 / T=4 / T=8 verify kernel tiers) until n has samples; the table is kept across
+        // requests and reset when pos moves more than SW_REMEAS. Every 64th round probes an
+        // adjacent verify tier to refresh its estimate. QZ_DS_ROWS=2..8 fixes n (read per call).
         const char * e_rows = getenv("QZ_DS_ROWS");
         const int rows_fixed = e_rows && *e_rows ? atoi(e_rows) : 0;
+        static constexpr double RT_SEED[VR + 1] = { 0.0, 0.0, 0.50, 0.58, 0.63, 0.82, 0.89, 0.95, 1.00 };
         static double rt_ms[VR + 1] = {0};               // per n round time (ms), across requests
         static int rt_n[VR + 1] = {0};                   // its samples
+        static int rt_pos = -(1 << 30);                  // position of the current rt_ms table
+        if (std::abs(pos - rt_pos) > SW_REMEAS) {
+            for (int n = 0; n <= VR; n++) { rt_ms[n] = 0.0; rt_n[n] = 0; }
+            rt_pos = pos;
+        }
         int rq_a[32], rq_t[32];                          // the last rounds' accepted / tested drafts
         int rq_len = 0, rq_h = 0, rq_sa = 0, rq_st = 0;
-        int last_nr = VR, nr_hist[VR + 1] = {0};
+        int last_nr = 4, nr_hist[VR + 1] = {0};
         double last_ms = 0.0;
         long nround = 0, probe_at = 64;
         auto a_est = [&]() -> double {
@@ -293,12 +302,16 @@ struct ink2_ctx : qz_ctx {
         };
         auto t_est = [&](int n) -> double {
             if (rt_n[n]) return rt_ms[n];
-            const double t8 = rt_n[VR] ? rt_ms[VR] : last_ms / (0.45 + 0.55 * last_nr / (double) VR);
-            return t8 * (0.45 + 0.55 * n / (double) VR);
+            double t8 = 0.0;
+            if (rt_n[last_nr]) t8 = rt_ms[last_nr] / RT_SEED[last_nr];
+            else if (rt_n[4])  t8 = rt_ms[4] / RT_SEED[4];
+            else if (rt_n[VR]) t8 = rt_ms[VR];
+            else               t8 = last_ms / RT_SEED[last_nr];
+            return t8 * RT_SEED[n];
         };
         auto pick_rows = [&]() -> int {
             if (rows_fixed >= 2) return rows_fixed > VR ? VR : rows_fixed;
-            if (!rt_n[VR] && last_ms <= 0.0) return VR;  // the first round: measure t(8)
+            if (last_ms <= 0.0 && !rt_n[4] && !rt_n[VR]) return 4; // first round: measure T=4 tier
             const double a = a_est(), d = 1.0 - a;
             int bn = 2;
             double bv = -1.0;
@@ -306,27 +319,45 @@ struct ink2_ctx : qz_ctx {
                 const double v = (1.0 - std::pow(a, n)) / d / t_est(n);
                 if (v > bv) { bv = v; bn = n; }
             }
-            return nround >= probe_at && bn < VR ? bn + 1 : bn;
+            if (nround >= probe_at) {
+                if (bn == 2) return 4;
+                if (bn <= 4) return a >= 0.70 ? VR : 2;
+                return bn < VR ? VR : 4;
+            }
+            return bn;
         };
         auto note_round = [&](int nr, int acc, int tst, double ms) {
-            rt_ms[nr] = rt_n[nr] ? 0.75 * rt_ms[nr] + 0.25 * ms : ms;
+            if (rt_n[nr] == 0)      rt_ms[nr] = ms;
+            else if (rt_n[nr] == 1) rt_ms[nr] = ms;      // drop any cold first-round spike
+            else                    rt_ms[nr] = 0.75 * rt_ms[nr] + 0.25 * std::min(ms, 1.5 * rt_ms[nr]);
             rt_n[nr]++;
+            rt_pos = pos;
             last_ms = ms; last_nr = nr;
             nr_hist[nr]++;
             if (rq_len == 32) { rq_sa -= rq_a[rq_h]; rq_st -= rq_t[rq_h]; } else rq_len++;
             rq_a[rq_h] = acc; rq_t[rq_h] = tst; rq_sa += acc; rq_st += tst;
             rq_h = (rq_h + 1) & 31;
-            if (++nround >= probe_at) probe_at = nround + 64;
+            if (nround++ >= probe_at) probe_at = nround + 64;
         };
         std::deque<std::pair<int, double>> wq;                  // (tokens, ms) per round in the window
         int wtok = 0; double wms = 0.0;
-        int last_kind = 0, last_n = 0;                          // the previous iteration: 1 plain, 2 a round of last_n tokens
+        int last_kind = 0, last_n = 0;                          // previous iter: 1 plain, 2 round, 3 meas plain
         auto tlast = clk::now();
         while (st.n_gen < max_new) {
             if (sw_on && dsr && last_kind) {                    // the previous iteration's wall time
                 const double ms = std::chrono::duration<double, std::milli>(clk::now() - tlast).count();
-                if (last_kind == 1) { step_ms = step_ms > 0 ? 0.8 * step_ms + 0.2 * ms : ms; step_pos = pos; }
-                else {
+                if (last_kind == 3) {
+                    if (meas_n < SW_MEAS) meas_buf[meas_n++] = ms;
+                    if (meas_n == SW_MEAS) {
+                        std::sort(meas_buf + 1, meas_buf + SW_MEAS);
+                        step_ms = meas_buf[1 + (SW_MEAS - 1) / 2];
+                        step_pos = pos;
+                        meas_n = 0;
+                    }
+                } else if (last_kind == 1) {
+                    step_ms = step_ms > 0 ? 0.8 * step_ms + 0.2 * std::min(ms, 1.5 * step_ms) : ms;
+                    step_pos = pos;
+                } else {
                     wq.push_back({last_n, ms}); wtok += last_n; wms += ms; seg += last_n;
                     while (wtok - wq.front().first >= sw_win) { wtok -= wq.front().first; wms -= wq.front().second; wq.pop_front(); }
                     if (seg >= sw_win) {
@@ -340,7 +371,7 @@ struct ink2_ctx : qz_ctx {
                 }
             }
             if (sw_on && dsr && spec && std::abs(pos - step_pos) > SW_REMEAS && pos + VR <= E.ctx) {
-                spec = false; meas = true; plain_left = SW_MEAS;    // time the plain step here
+                spec = false; meas = true; plain_left = SW_MEAS; meas_n = 0; // time the plain step here
             }
             tlast = clk::now();
             last_kind = 0;
@@ -354,7 +385,7 @@ struct ink2_ctx : qz_ctx {
                 if (ds_on) DS.fill(DS.tap, 4 * D, pos - 1, 1);
                 st.decode_cycles++; st.decode_tok++;
                 if (dsr && !spec) {
-                    last_kind = 1; ntok_plain++;
+                    last_kind = meas ? 3 : 1; ntok_plain++;
                     if (--plain_left <= 0) {                    // back to the rounds; a timing keeps the window
                         if (!meas) { seg = 0; wq.clear(); wtok = 0; wms = 0.0; nsw++; }
                         spec = true; meas = false;

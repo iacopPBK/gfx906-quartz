@@ -37,7 +37,7 @@ Every flag and environment variable, with its default.
 | `QZ_TRACE` | unset | Directory for one JSON file per request, read with `quartz/server/quartz_trace.py` |
 | `QZ_NO_SWITCH` | unset | `1` keeps the drafter for the whole answer. By default, with `--dspine`, Qwen switches between DSpine and MTP on acceptance, and Inkling between DSpark rounds and single steps on measured speed |
 | `QZ_SW_LO`, `QZ_SW_HI`, `QZ_SW_WIN` | Qwen: `3.8`, `3.4`, `128` | Leave DSpine below `lo`, leave MTP at or above `hi` tokens per round, averaged over `win` tokens. Each threshold is on its drafter's own scale, so `lo > hi` is intended |
-| `QZ_SW_LO`, `QZ_SW_WIN` | Inkling: `2.7`, `16` | DSpark rounds are timed over `win` tokens against the single step. Before the single step has been timed, decode leaves the rounds below `lo` tokens per round |
+| `QZ_SW_LO`, `QZ_SW_WIN` | Inkling: `2.2`, `24` | DSpark rounds are timed over `win` tokens against the single step. Before the single step has been timed, decode leaves the rounds below `lo` tokens per round |
 | `QZ_DS_ROWS` | unset | Inkling: `2`..`8` fixes the DSpark round's rows, the anchor and its drafts. Unset, each round picks its width from the recent acceptance and the measured round times |
 | `QZ_IMG_MIN_TOKENS`, `QZ_IMG_MAX_TOKENS` | `8`, `4096` | Fewest and most tokens an image resizes to; each token takes a context row. Inkling reads only the maximum |
 | `QZ_START_RETRIES` | `3` | Start attempts when the server crashes or hangs before it is ready; `0` runs without the supervisor. A peer check that hangs is its own case: one restart with `QZ_LINK=host`, in the default mode only |
