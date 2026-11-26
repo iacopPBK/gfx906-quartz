@@ -235,6 +235,7 @@ struct ink2_engine {
         ICHECK(hipMemset(A.gcnt, 0, NE_USED * FFL / 32 * sizeof(int)));
         A.route_scale = hp.route_scale; A.beta = hp.situ_beta; A.lb = hp.situ_lin_beta;
         A.xin_mine = K.x.xin; A.xflag_mine = K.x.xflag; A.xseq = K.x.xseq; A.xerr = K.x.xerr;
+        A.card = c; A.xin_slot = K.x.xin_slot;
         tkh[c].resize((size_t) QZ_TOPK_NB * QZ_TOPK);
         ICHECK(hipHostMalloc((void **) &tkp[c], ((size_t) QZ_TOPK_NB * QZ_TOPK + 4) * sizeof(float2), 0));
         vtkh[c].resize((size_t) VR * QZ_TOPK_NB * QZ_TOPK);

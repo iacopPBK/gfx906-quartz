@@ -71,7 +71,14 @@ struct cyc_args {
     float * xin_mine, * xin_px[QZ_NC - 1];
     unsigned int * xflag_mine, * xflag_px[QZ_NC - 1], * xseq;
     int * xerr;
+    int card;                     // 0 .. QZ_NC - 1, the card-order sums
+    size_t xin_slot;              // inbox slot stride in floats (qz_xbufs)
 };
+
+// the exchange handles at inbox offset off (kernels/xchg.h): this card's pushes, and its
+// inbox to sum from
+#define INK_XDST(A, off) ({ qz_xpush<QZ_NC> d_; _Pragma("unroll") for (int k_ = 0; k_ < QZ_NC - 1; k_++) d_.p[k_] = (A).xin_px[k_] + (off); d_; })
+#define INK_XSRC(A, off) (qz_xinbox<QZ_NC>{ (A).xin_mine + (off), (A).xin_slot, (A).card })
 
 // The card's partial is in the peer inbox: pushed, fenced, grid barrier passed. The
 // calling block raises its flag (block 0 only) and waits for the peer's.
@@ -208,7 +215,7 @@ CYC_NI void c_norm(CK njob * j, float eps, int tid) {
 }
 // Half a 32-row virtual block: 16 rows, S = 2 per wave, same rows and per-row code as
 // d_gemv, split finer so a small job list balances over the grid.
-CYC_NI void c_gemv2(CK gjobs * J, int hb, float * yp) {
+CYC_NI void c_gemv2(CK gjobs * J, int hb, const qz_xpush<QZ_NC> & yp) {
     const int wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
     const int b = hb >> 1, half = hb & 1;
     int k = 0;
@@ -222,7 +229,7 @@ CYC_NI void c_gemv2(CK gjobs * J, int hb, float * yp) {
     qz_gemv_rows_t<1, 2>(qz_gp(j->av), qz_gp(j->as), j->K, j->wv, j->ws, N, r0, lane, acc);
     if (lane == 0)
         #pragma unroll
-        for (int s = 0; s < 2; s++) if (r0 + s < N) { y[r0 + s] = acc[0][s]; if (yp) qz_gp(yp)[r0 + s] = acc[0][s]; }
+        for (int s = 0; s < 2; s++) if (r0 + s < N) { y[r0 + s] = acc[0][s]; if (yp) yp.put(r0 + s, acc[0][s]); }
 }
 // The vocab GEMV: 32-row units spread over the grid, as d_gemv's rows. Rows < nv are
 // stored with the softcap applied.
@@ -282,15 +289,15 @@ CYC_NI void cg_sync(const cgrp & g, unsigned int e) {
 }
 // d_xconv_blk's values on the owned columns, thread q = tid and tid + 512. With tap, it
 // also takes the new x: the DSpark feature, the residual entering the next application.
-CYC_NI void c_cxconv(const float * own, const float * peer, const float * w, float * hs, float * x, float * blk, int cw, int tid,
+CYC_NI void c_cxconv(const float * own, const qz_xinbox<QZ_NC> & peer, const float * w, float * hs, float * x, float * blk, int cw, int tid,
                      float * tap = nullptr) {
-    own = qz_gp(own); peer = qz_gp(peer); w = qz_gp(w); hs = qz_gp(hs); x = qz_gp(x); blk = blk ? qz_gp(blk) : nullptr; tap = tap ? qz_gp(tap) : nullptr;
+    own = qz_gp(own); w = qz_gp(w); hs = qz_gp(hs); x = qz_gp(x); blk = blk ? qz_gp(blk) : nullptr; tap = tap ? qz_gp(tap) : nullptr;
     #pragma unroll
     for (int m = 0; m < 2; m++) {
         const int q = tid + 512 * m;
         if (m == 0 || q < CQ) {
             const int i = ccol(cw, q);
-            const float u = own[i] + __builtin_nontemporal_load(peer + i);
+            const float u = peer.add(own[i], i);
             const float h0 = hs[i], h1 = hs[CHL + i], h2 = hs[2 * CHL + i];
             const float4 wi = *(const float4 *) (w + (size_t) i * NCONV);
             const float xv = x[i];
@@ -504,8 +511,8 @@ CYC_NI void c_attn(CK attn_args * e, int pos, int v, int tid) {
     t.pos = pos;
     fl_attn_plain(t, v / ATT_SPL, v % ATT_SPL, tid, cyc_lds);   // the mix states are dead here
 }
-CYC_NI void c_xconv_b0(const float * own, const float * peer, const float * w, float * hs, float * x, float * blk, int tid) {
-    d_xconv_blk<512>(qz_gp(own), qz_gp(peer), qz_gp(w), qz_gp(hs), qz_gp(x), blk ? qz_gp(blk) : nullptr, tid);
+CYC_NI void c_xconv_b0(const float * own, const qz_xinbox<QZ_NC> & peer, const float * w, float * hs, float * x, float * blk, int tid) {
+    d_xconv_blk<512>(qz_gp(own), peer, qz_gp(w), qz_gp(hs), qz_gp(x), blk ? qz_gp(blk) : nullptr, tid);
 }
 CYC_NI void c_router(const float * f, const float * wr, const float * bias, float * ps, int e, int lane) { d_router(qz_gp(f), qz_gp(wr), qz_gp(bias), qz_gp(ps), e, lane); }
 // The router's top NE_USED by rank. Candidate i's place is #{j : s_j > s_i, or s_j == s_i
@@ -581,11 +588,11 @@ CYC_NI void c_up_situ_w(const char * wv, const __half * ws, const int * sids, co
 // same k-order fold of wk * acc from LDS.
 constexpr int MD_Q = 16;                         // quads per LDS chunk
 CYC_NI void c_moe_down_q(const char * wv, const __half * ws, const int * sids, const float * swts,
-                         const unsigned char * aq, const float * as, float * y, float * yp, int tid, float * lacc) {
+                         const unsigned char * aq, const float * as, float * y, const qz_xpush<QZ_NC> & yp, int tid, float * lacc) {
     static_assert(FFL / 32 <= 32, "one unit per lane");
     asm volatile ("" : "+v"(tid));
     constexpr int NU = FFL / 32, NQ = D / 4;
-    y = qz_gp(y); yp = yp ? qz_gp(yp) : nullptr;          // aq / as are LDS pointers
+    y = qz_gp(y);                                        // aq / as are LDS pointers
     const int wave = tid >> 6, lane = tid & 63, h = lane >> 5, l = lane & 31;
     const int q0 = blockIdx.x * NQ / gridDim.x, q1 = (blockIdx.x + 1) * NQ / gridDim.x;
     for (int c0 = q0; c0 < q1; c0 += MD_Q) {
@@ -631,7 +638,7 @@ CYC_NI void c_moe_down_q(const char * wv, const __half * ws, const int * sids, c
             #pragma unroll
             for (int k = 0; k < NE_USED; k++) tot += swts[k] * lacc[(qd * NE_USED + k) * 4 + s];
             y[r] = tot;
-            if (yp) yp[r] = tot;
+            if (yp) yp.put(r, tot);
         }
         __syncthreads();
     }
@@ -677,7 +684,7 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
             if (ai > 0) {
                 CK appk * ep = e - 1;
                 cyc_xwait(A, xs);
-                c_cxconv(A.PART1, A.xin_mine + (size_t) (xs & 1) * D, ep->fconv, ep->hsf, A.X, nullptr, g1.w, tid, e->tap);
+                c_cxconv(A.PART1, INK_XSRC(A, (size_t) (xs & 1) * D), ep->fconv, ep->hsf, A.X, nullptr, g1.w, tid, e->tap);
             }
             if (pre) c_cpre(pre, A.P, A.X, e->pre_out, g1.w, tid);
             if (e->has_res && !msg) {           // the norms' inputs are the mix outputs (nna = mres_m)
@@ -705,20 +712,20 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
             BAR();
         }
         // ---- attention
-        for (int v = blockIdx.x; v < 2 * e->nga; v += nb) c_gemv2(&e->ga, v, nullptr);
+        for (int v = blockIdx.x; v < 2 * e->nga; v += nb) c_gemv2(&e->ga, v, qz_xpush<QZ_NC>{});
         BAR();
         for (int v = blockIdx.x; v < HQL + 2 * HKVL; v += nb) c_head_post(&e->hp, pos, tau, v, tid);
         BAR();
         for (int v = blockIdx.x; v < HKVL * ATT_SPL; v += nb) c_attn(&e->at, pos, v, tid);
         BAR();
         ++xs;
-        for (int v = blockIdx.x; v < 2 * e->ngo; v += nb) c_gemv2(&e->go, v, A.xin_px[0] + (size_t) (xs & 1) * D);
+        for (int v = blockIdx.x; v < 2 * e->ngo; v += nb) c_gemv2(&e->go, v, INK_XDST(A, (size_t) (xs & 1) * D));
         __threadfence_system();
         BAR();
         // ---- P1, chain group 1: the attention sum + conv, the ffn mix (and norm)
         if (blockIdx.x < CG) {
             cyc_xwait(A, xs);
-            c_cxconv(A.PART0, A.xin_mine + (size_t) (xs & 1) * D, e->pconv, e->hsa, A.X, e->blk, g1.w, tid);
+            c_cxconv(A.PART0, INK_XSRC(A, (size_t) (xs & 1) * D), e->pconv, e->hsa, A.X, e->blk, g1.w, tid);
             if (msg) c_cmix<1, false>(&e->mff, e->qff, A.F, nullptr, 0.f, g1, ce1, tid);
             else c_cmix<1, true>(&e->mff, e->qff, A.F, e->nb.j, A.eps, g1, ce1, tid);
         }
@@ -739,7 +746,7 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
         c_up_situ_w(e->guv, e->gus, sids, A.aq3, A.as3, A.beta, A.lb, A.GU, A.gcnt, A.hq, A.hs, tid);
         BAR();
         ++xs;
-        c_moe_down_q(e->dnv, e->dns, sids, swts, qz_gp(A.hq), qz_gp(A.hs), A.PART1, A.xin_px[0] + (size_t) (xs & 1) * D, tid, mdl);
+        c_moe_down_q(e->dnv, e->dns, sids, swts, qz_gp(A.hq), qz_gp(A.hs), A.PART1, INK_XDST(A, (size_t) (xs & 1) * D), tid, mdl);
         __threadfence_system();
         BAR();
     }
@@ -747,7 +754,7 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
         CK cyc_args & A = *(CK cyc_args *) Ag;
         CK appk * ep = (CK appk *) A.tab + napp - 1;
         cyc_xwait(A, xs);
-        c_xconv_b0(A.PART1, A.xin_mine + (size_t) (xs & 1) * D, ep->fconv, ep->hsf, A.X, nullptr, tid_k);
+        c_xconv_b0(A.PART1, INK_XSRC(A, (size_t) (xs & 1) * D), ep->fconv, ep->hsf, A.X, nullptr, tid_k);
         if (tid_k == 0) *Ag->xseq = xs;
     }
     if (head) {

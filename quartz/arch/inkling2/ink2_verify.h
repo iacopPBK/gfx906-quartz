@@ -47,23 +47,23 @@ struct vargs {
 // first, s[3 + k] is row k's conv input u_k. Row r reads h0 = s[r], h1 = s[r + 1] and
 // h2 = s[r + 2], so it needs rows r - 3 .. r - 1 at most. Their u is still in memory, so
 // no row waits: the raw projection for the K and V convs, the TP2 sums for the post convs.
-VR_NI float v_s3(const float * hbase, const float * own0, const float * peer0, int i, int k, int rsf) {
+VR_NI float v_s3(const float * hbase, const float * own0, const qz_xinbox<QZ_NC> & peer0, int i, int k, int rsf) {
     if (k < 3) return hbase[(size_t) k * CHL + i];
     const int q = k - 3;
-    return own0[(size_t) q * rsf + i] + __builtin_nontemporal_load(peer0 + (size_t) q * D + i);
+    return peer0.add(own0[(size_t) q * rsf + i], (size_t) q * D + i);
 }
 
 // c_cxconv with the verify window: no history write, row r's u into its uh row
-VR_NI void v_cxconv(const float * own0, const float * peer0, const float * w, float * hbase, float * x, float * blk, int cw, int tid,
+VR_NI void v_cxconv(const float * own0, const qz_xinbox<QZ_NC> & peer0, const float * w, float * hbase, float * x, float * blk, int cw, int tid,
                     int r, int rsf, float * uhrow, float * tap = nullptr) {
-    own0 = qz_gp(own0); peer0 = qz_gp(peer0); w = qz_gp(w); hbase = qz_gp(hbase);
+    own0 = qz_gp(own0); w = qz_gp(w); hbase = qz_gp(hbase);
     x = qz_gp(x); blk = blk ? qz_gp(blk) : nullptr; tap = tap ? qz_gp(tap) : nullptr; uhrow = qz_gp(uhrow);
     #pragma unroll
     for (int m = 0; m < 2; m++) {
         const int q = tid + 512 * m;
         if (m == 0 || q < CQ) {
             const int i = ccol(cw, q);
-            const float u = own0[(size_t) r * rsf + i] + __builtin_nontemporal_load(peer0 + (size_t) r * D + i);
+            const float u = peer0.add(own0[(size_t) r * rsf + i], (size_t) r * D + i);
             const float h0 = v_s3(hbase, own0, peer0, i, r, rsf), h1 = v_s3(hbase, own0, peer0, i, r + 1, rsf),
                         h2 = v_s3(hbase, own0, peer0, i, r + 2, rsf);
             const float4 wi = *(const float4 *) (w + (size_t) i * NCONV);
@@ -79,16 +79,16 @@ VR_NI void v_cxconv(const float * own0, const float * peer0, const float * w, fl
 }
 
 // d_xconv_blk<512> with the verify window, one block per row for the last ffn sum
-VR_NI void v_xconv_b0(const float * own0, const float * peer0, const float * w, const float * hbase, float * x, float * blk,
+VR_NI void v_xconv_b0(const float * own0, const qz_xinbox<QZ_NC> & peer0, const float * w, const float * hbase, float * x, float * blk,
                       int tid, int r, int rsf, float * uhrow) {
     constexpr int NT = 512, NEL = (D + NT - 1) / NT;
-    own0 = qz_gp(own0); peer0 = qz_gp(peer0); w = qz_gp(w); hbase = qz_gp(hbase); x = qz_gp(x); blk = blk ? qz_gp(blk) : nullptr; uhrow = qz_gp(uhrow);
+    own0 = qz_gp(own0); w = qz_gp(w); hbase = qz_gp(hbase); x = qz_gp(x); blk = blk ? qz_gp(blk) : nullptr; uhrow = qz_gp(uhrow);
     float u[NEL], h0[NEL], h1[NEL], h2[NEL], xv[NEL];
     float4 wi[NEL];
     #pragma unroll
     for (int k = 0; k < NEL; k++) {
         const int i = min(tid + NT * k, D - 1);          // clamped: unconditional loads, guarded stores
-        u[k] = own0[(size_t) r * rsf + i] + __builtin_nontemporal_load(peer0 + (size_t) r * D + i);
+        u[k] = peer0.add(own0[(size_t) r * rsf + i], (size_t) r * D + i);
         h0[k] = v_s3(hbase, own0, peer0, i, r, rsf);
         h1[k] = v_s3(hbase, own0, peer0, i, r + 1, rsf);
         h2[k] = v_s3(hbase, own0, peer0, i, r + 2, rsf);
@@ -555,12 +555,12 @@ template <int T = VR> VR_NI void v_up_dd(const char * wv, const __half * ws, con
 constexpr int VER_LDS = (VR * MD_Q * NE_USED * 4) * 4 + VR * NE_USED * FFL + VR * NE_USED * (FFL / 32) * 4;
 static_assert(VER_LDS >= CYC_LDS, "verify's dynamic LDS covers the decode's");
 VR_NI void v_down_dd(const char * wv, const __half * ws, const int * sids, const float * swts, const vdist & dd,
-                     const unsigned char * aq0, const float * as0, float * y0, float * yp0, int tid, int rs, int rsf, float * lacc,
+                     const unsigned char * aq0, const float * as0, float * y0, const qz_xpush<QZ_NC> & yp0, int tid, int rs, int rsf, float * lacc,
                      int nr) {
     static_assert(FFL / 32 <= 32, "one unit per lane");
     asm volatile ("" : "+v"(tid));
     constexpr int NU = FFL / 32, NQ = D / 4, LR = MD_Q * NE_USED * 4;
-    aq0 = qz_gp(aq0); as0 = qz_gp(as0); y0 = qz_gp(y0); yp0 = qz_gp(yp0);
+    aq0 = qz_gp(aq0); as0 = qz_gp(as0); y0 = qz_gp(y0);
     const int wave = tid >> 6, lane = tid & 63, gq = lane >> 4, l = lane & 15;
     const int q0 = blockIdx.x * NQ / gridDim.x, q1 = (blockIdx.x + 1) * NQ / gridDim.x;
     const int np = (dd.nd + 3) / 4;
@@ -648,16 +648,16 @@ VR_NI void v_down_dd(const char * wv, const __half * ws, const int * sids, const
             #pragma unroll
             for (int k = 0; k < NE_USED; k++) tot += swts[r * NE_USED + k] * lacc[r * LR + (qd * NE_USED + k) * 4 + s];
             y0[(size_t) r * rsf + row] = tot;
-            yp0[(size_t) r * D + row] = tot;
+            yp0.put((size_t) r * D + row, tot);
         }
         __syncthreads();
     }
 }
 
 // c_gemv2 over T rows at once: activation row t at av + t rs, output at y + t rsf,
-// yp0 the peer inbox rows at stride D. Weights are read once, and each row's value is
+// yp0 the peers' inbox rows at stride D. Weights are read once, and each row's value is
 // c_gemv2's, since qz_gemv_core's per-row order does not depend on T.
-template <int S, int T = VR> VR_NI void v_gemv(CK gjobs * J, int hb, int rs, int rsf, float * yp0) {
+template <int S, int T = VR> VR_NI void v_gemv(CK gjobs * J, int hb, int rs, int rsf, const qz_xpush<QZ_NC> & yp0) {
     static_assert(S == 2 || S == 4, "8 S rows per unit, 32 per job block");
     const int wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
     const int b = hb / (4 / S), half = hb % (4 / S);
@@ -686,7 +686,7 @@ template <int S, int T = VR> VR_NI void v_gemv(CK gjobs * J, int hb, int rs, int
         const int tid = threadIdx.x;
         if (tid < T * RU / 4) {
             const int t = tid / (RU / 4), c = tid % (RU / 4);
-            *(float4 *) (qz_gp(yp0) + (size_t) t * D + base + 4 * c) = *(const float4 *) (tile + t * RU + 4 * c);
+            yp0.put4((size_t) t * D + base + 4 * c, *(const float4 *) (tile + t * RU + 4 * c));
         }
     }
 }
@@ -883,7 +883,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
                 CK appk * ep = er - 1;
                 cyc_xwait(Av, xs);
                 const int slot = (int) ((ep->hsf - Vq->hist) / (3 * CHL));
-                v_cxconv(Av.PART1, Av.xin_mine + 2 * D + (size_t) (xs & 1) * VR * D, ep->fconv, ep->hsf, xr, nullptr, cw, tid,
+                v_cxconv(Av.PART1, INK_XSRC(Av, 2 * D + (size_t) (xs & 1) * VR * D), ep->fconv, ep->hsf, xr, nullptr, cw, tid,
                          tr, rsf, Vq->uh + ((size_t) (slot * VR + tr)) * CHL + H_F, er->tap);
             }
             if (pre) c_cpre(pre, pr, xr, er->pre_out, cw, tid);
@@ -917,7 +917,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         }
         // ---- attention: the qkv GEMVs, the head posts with the cache rows, the attention
         v_by_rows(nr, [&](auto t) {
-            for (int v = blockIdx.x; v < 4 / VG_S * e0->nga; v += nb) v_gemv<VG_S, decltype(t)::value>(&e0->ga, v, rs, rsf, nullptr);
+            for (int v = blockIdx.x; v < 4 / VG_S * e0->nga; v += nb) v_gemv<VG_S, decltype(t)::value>(&e0->ga, v, rs, rsf, qz_xpush<QZ_NC>{});
         });
         cyc_barrier(vbst, ++kb);
         static_assert(HQL % 4 == 0 && HKVL % 4 == 0, "a block's 4 units of one kind (q / k / v)");
@@ -933,7 +933,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         ++xs;
         v_by_rows(nr, [&](auto t) {
             for (int v = blockIdx.x; v < 4 / VG_S * e0->ngo; v += nb)
-                v_gemv<VG_S, decltype(t)::value>(&e0->go, v, rs, rsf, Av.xin_px[0] + 2 * D + (size_t) (xs & 1) * VR * D);
+                v_gemv<VG_S, decltype(t)::value>(&e0->go, v, rs, rsf, INK_XDST(Av, 2 * D + (size_t) (xs & 1) * VR * D));
         });
         __threadfence_system();
         cyc_barrier(vbst, ++kb);
@@ -941,7 +941,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         if (chain) {
             cyc_xwait(Av, xs);
             const int slot = (int) ((er->hsa - Vq->hist) / (3 * CHL));
-            v_cxconv(Av.PART0, Av.xin_mine + 2 * D + (size_t) (xs & 1) * VR * D, er->pconv, er->hsa, xr, er->blk, cw, tid,
+            v_cxconv(Av.PART0, INK_XSRC(Av, 2 * D + (size_t) (xs & 1) * VR * D), er->pconv, er->hsa, xr, er->blk, cw, tid,
                      tr, rsf, Vq->uh + ((size_t) (slot * VR + tr)) * CHL + H_A);
             if (msg) c_cmix<1, false>(&er->mff, er->qff, (float *) ((char *) Av.F + (size_t) tr * rs), nullptr, 0.f, g, ce, tid);
             else c_cmix<1, true>(&er->mff, er->qff, (float *) ((char *) Av.F + (size_t) tr * rs), er->nb.j, Av.eps, g, ce, tid);
@@ -970,7 +970,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         v_by_rows(nr, [&](auto t) { v_up_dd<decltype(t)::value>(e0->guv, e0->gus, sids, dd, Av.aq3, Av.as3, Av.beta, Av.lb, Av.hq, Av.hs, tid, rs, rsf, nr); });
         cyc_barrier(vbst, ++kb);
         ++xs;
-        v_down_dd(e0->dnv, e0->dns, sids, swts, dd, Av.hq, Av.hs, Av.PART1, Av.xin_px[0] + 2 * D + (size_t) (xs & 1) * VR * D,
+        v_down_dd(e0->dnv, e0->dns, sids, swts, dd, Av.hq, Av.hs, Av.PART1, INK_XDST(Av, 2 * D + (size_t) (xs & 1) * VR * D),
                   tid, rs, rsf, cyc_lds, nr);
         __threadfence_system();
         cyc_barrier(vbst, ++kb);
@@ -982,7 +982,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         CK appk * ep = (CK appk *) Vp->A.tab + (size_t) r * napp + (napp - 1);
         cyc_xwait(Vp->A, xs);
         const int slot = (int) ((ep->hsf - Vp->hist) / (3 * CHL));
-        v_xconv_b0(Vp->A.PART1, Vp->A.xin_mine + 2 * D + (size_t) (xs & 1) * VR * D, ep->fconv, ep->hsf,
+        v_xconv_b0(Vp->A.PART1, INK_XSRC(Vp->A, 2 * D + (size_t) (xs & 1) * VR * D), ep->fconv, ep->hsf,
                    (float *) ((char *) Vp->A.X + (size_t) r * rs), nullptr, tid_k, r, rsf,
                    Vp->uh + ((size_t) (slot * VR + r)) * CHL + H_F);
         if (blockIdx.x == 0 && tid_k == 0) *Vp->A.xseq = xs;

@@ -159,3 +159,39 @@ __device__ __forceinline__ int qz_xpick(float ov, int oi, float pv, int pi) {
 __device__ __forceinline__ void qz_xfold(float & bv, int & bi, float pv, int pi) {
     if (pv > bv || (pv == bv && pi < bi)) { bv = pv; bi = pi; }
 }
+
+// ---- exchange handles for kernels that push and sum inline (Inkling) ---------------
+// qz_xpush: this card's slot in each peer's inbox at one offset; put() stores a value to
+// all of them. A null p[0] means no push.
+template <int NC> struct qz_xpush {
+    float * p[NC - 1];
+    __device__ __forceinline__ explicit operator bool() const { return p[0] != nullptr; }
+    __device__ __forceinline__ void put(size_t i, float v) const {
+        #pragma unroll
+        for (int k = 0; k < NC - 1; k++) qz_gp(p[k])[i] = v;
+    }
+    __device__ __forceinline__ void put4(size_t i, float4 v) const {
+        #pragma unroll
+        for (int k = 0; k < NC - 1; k++) *(float4 *) (qz_gp(p[k]) + i) = v;
+    }
+};
+// qz_xinbox: this card's inbox at one offset, slot stride `slot` floats, card me. add()
+// sums own with the peers' values at i in card order: own + peer at two cards (the
+// same bits either way round), (p0 + p1) + (p2 + p3) at four.
+template <int NC> struct qz_xinbox {
+    const float * base;
+    size_t slot;
+    int me;
+    __device__ __forceinline__ float add(float own, size_t i) const {
+        if constexpr (NC == 2) {
+            return own + __builtin_nontemporal_load(qz_gp(base) + i);
+        } else {
+            static_assert(NC == 4, "card-order sum for 2 or 4 cards");
+            auto v = [&](int c) {
+                const int k = (c - me + NC) % NC;
+                return k == 0 ? own : __builtin_nontemporal_load(qz_gp(base) + (size_t) (k - 1) * slot + i);
+            };
+            return __fadd_rn(__fadd_rn(v(0), v(1)), __fadd_rn(v(2), v(3)));
+        }
+    }
+};

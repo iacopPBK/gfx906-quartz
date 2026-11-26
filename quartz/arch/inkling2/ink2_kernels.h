@@ -6,6 +6,8 @@
 // blocks. A body with a block reduction must be called by every thread of the real block.
 #pragma once
 
+#include "kernels/xchg.h"                     // qz_xinbox: the TP sum in d_xconv_blk
+
 // Fused multiply-adds follow the source expression (FP_CONTRACT ON) rather than the
 // backend, whose default "fast" fuses per inline context. That keeps the standalone
 // kernels and the persistent kernel rounding identically, and is restored at the end.
@@ -368,11 +370,11 @@ __device__ __forceinline__ void att_h8(const uint4 & u, float * f) {
     for (int k = 0; k < 4; k++) { f[2 * k] = __low2float(h[k]); f[2 * k + 1] = __high2float(h[k]); }
 }
 
-// ---- the TP2 sum of the two cards' partials, then a short conv with its history and no
+// ---- the TP sum of the cards' partials, then a short conv with its history and no
 // dynamic taps. blk null: x += a. Otherwise blk = x and x = a, a new residual block. One
 // block covers t, t + NT, ... and issues all loads first, since it is latency bound.
 template <int NT>
-__device__ __forceinline__ void d_xconv_blk(const float * own, const float * peer, const float * w, float * hs,
+__device__ __forceinline__ void d_xconv_blk(const float * own, const qz_xinbox<QZ_NC> & peer, const float * w, float * hs,
                                             float * x, float * blk, int t) {
     constexpr int NE_ = (D + NT - 1) / NT;
     float u[NE_], h0[NE_], h1[NE_], h2[NE_], xv[NE_];
@@ -380,7 +382,7 @@ __device__ __forceinline__ void d_xconv_blk(const float * own, const float * pee
     #pragma unroll
     for (int k = 0; k < NE_; k++) {
         const int i = min(t + NT * k, D - 1);          // clamped: unconditional loads, the stores guarded
-        u[k] = own[i] + __builtin_nontemporal_load(peer + i);
+        u[k] = peer.add(own[i], i);
         h0[k] = hs[i]; h1[k] = hs[CHL + i]; h2[k] = hs[2 * CHL + i];
         wi[k] = *(const float4 *) (w + (size_t) i * NCONV);
         xv[k] = x[i];
