@@ -27,7 +27,7 @@ Every flag and environment variable, with its default.
 | `--slack` | `1` | Qwen adaptive depth slack |
 | `--temp` | `1.0` | Default temperature; 0 is greedy |
 | `--top-k`, `--top-p`, `--min-p` | `20`, `0.95`, `0` | Default sampling; top-k 1..64 |
-| `--reasoning-effort` | `medium` | Default reasoning effort: `xhigh`, `medium`, `low`, or `template` for the template's own default |
+| `--reasoning-effort` | `medium` | Default reasoning effort: `xhigh`, `medium`, `low`, `none` (thinking off: the answer opens directly), or `template` for the template's own default |
 | `--progress` | `0` | Log decode progress every N seconds |
 
 ## Environment

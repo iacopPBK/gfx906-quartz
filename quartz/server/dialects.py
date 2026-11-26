@@ -30,6 +30,11 @@ class Dialect:
         """Whether the rendered prompt leaves the model inside its reasoning."""
         return False
 
+    def answer_open(self, rendered):
+        """The rendered prompt with thinking off: the model's turn opened as the answer.
+        Templates that skip thinking on their own (enable_thinking) leave it as is."""
+        return rendered
+
     def parse(self, text, think_open, tools):
         """Split a whole answer into (reasoning or None, content, tool calls)."""
         raise NotImplementedError
@@ -198,6 +203,13 @@ class Inkling(Dialect):
     _MARKS = list(_KIND) + list(_ENDS)
     _TOK = re.compile("|".join(re.escape(m) for m in _MARKS))   # other <|..|> text stays text
     _HOLD = max(len(m) for m in _MARKS) - 1
+
+    def answer_open(self, rendered):
+        # the template has no generation prompt: the model writes <|message_model|> itself and
+        # then picks thinking or text, thinking even at effort 0. Thinking off opens the turn as text.
+        if not rendered.endswith("<|message_model|>"):
+            rendered += "<|message_model|>"
+        return rendered + "<|content_text|>"
 
     def parse(self, text, think_open, tools):
         out = {"r": [], "c": [], "calls": []}

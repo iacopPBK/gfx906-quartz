@@ -563,9 +563,12 @@ class Handler(BaseHTTPRequestHandler):
 
     # reasoning_effort: chat_template_kwargs, else the request field, else
     # --reasoning-effort. qwen35 maps to xhigh / medium / low, others pass it through.
-    _EFFORT = {"minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh"}
+    _EFFORT = {"none": "none", "minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh",
+               "max": "xhigh"}
 
     def _template_kwargs(self, req):
+        """(template kwargs, thinking off). Thinking is off with enable_thinking false or
+        reasoning_effort none: qwen35 gets enable_thinking false, other templates effort none."""
         kw = dict(req.get("chat_template_kwargs") or {})
         if "reasoning_effort" not in kw:
             eff = self._EFFORT.get(str(req.get("reasoning_effort") or "").lower()) or self.args.reasoning_effort
@@ -573,7 +576,13 @@ class Handler(BaseHTTPRequestHandler):
                 eff = req["reasoning_effort"]      # other templates take their own levels (Inkling: none .. max)
             if eff:
                 kw["reasoning_effort"] = eff
-        return kw
+        off = kw.get("enable_thinking") is False or str(kw.get("reasoning_effort", "")).lower() == "none"
+        if off and self.eng.arch == "qwen35":
+            kw.pop("reasoning_effort", None)
+            kw["enable_thinking"] = False
+        elif off:
+            kw["reasoning_effort"] = "none"
+        return kw, off
 
     def _complete(self, req, chat):
         sampling, err, notes = self._sampling(req)
@@ -588,9 +597,11 @@ class Handler(BaseHTTPRequestHandler):
                 blobs = extract_images(req.get("messages"))
                 if blobs and not self.eng.vision:
                     return self._err(400, "image input needs the server started with --mmproj")
+                kw, no_think = self._template_kwargs(req)
                 text = self.eng.render(escape_specials(normalize_messages(req.get("messages", []))),
-                                       escape_specials(req.get("tools")),
-                                       self._template_kwargs(req))
+                                       escape_specials(req.get("tools")), kw)
+                if no_think:
+                    text = self.eng.dialect.answer_open(text)
                 think_open = self.eng.dialect.think_open(text)
                 prompt = self.eng.tokenize_chat(text)
                 text = text.replace(_ESC, "<|")
@@ -891,8 +902,9 @@ def main():
     ap.add_argument("--dspine", default=None, help="draft GGUF (Qwen: DSpine, Inkling: DSpark)")
     ap.add_argument("--progress", type=float, default=0, metavar="SECONDS",
                     help="log decode progress every SECONDS (0: off)")
-    ap.add_argument("--reasoning-effort", default="medium", choices=["xhigh", "medium", "low", "template"],
-                    help="default chat-template reasoning_effort when the request names none (template: the template's own)")
+    ap.add_argument("--reasoning-effort", default="medium", choices=["xhigh", "medium", "low", "none", "template"],
+                    help="default chat-template reasoning_effort when the request names none (none: thinking off, "
+                         "the answer opens directly; template: the template's own)")
     args = ap.parse_args()
     if args.max_ctx < 1024:
         ap.error("--max-ctx must be at least 1024")

@@ -22,8 +22,8 @@ one generation at a time; concurrent requests wait.
 | `stop` | String or list of strings |
 | `stream` | Server-sent events, OpenAI format |
 | `tools` | Rendered by the chat template; calls come back as `tool_calls` |
-| `reasoning_effort` | Qwen: `minimal` / `low` → `low`, `medium`, `high` / `xhigh` / `max` → `xhigh`. Other models: passed to the template unchanged (Inkling: `none` .. `max`). Default from `--reasoning-effort` |
-| `chat_template_kwargs` | Passed to the template, e.g. `{"enable_thinking": false}`; a `reasoning_effort` here wins |
+| `reasoning_effort` | Qwen: `minimal` / `low` → `low`, `medium`, `high` / `xhigh` / `max` → `xhigh`. Other models: passed to the template unchanged (Inkling: `none` .. `max`). `none` turns thinking off: the answer opens directly. Default from `--reasoning-effort` |
+| `chat_template_kwargs` | Passed to the template, e.g. `{"enable_thinking": false}` (thinking off, on every model); a `reasoning_effort` here wins |
 | `ignore_eos` | Keep generating past the end-of-answer token |
 | `return_tokens` | Add the generated token ids to the response as `tokens` |
 
