@@ -66,9 +66,10 @@ struct cyc_args {
     // the head launch: mix into F, norm into aq3 / as3 (block 0), then the vocab GEMV
     // into hg.y, with the softcap on the first nvalid rows
     sptrs hmix; const float * hq_out; njob hn; gjob hg; int nvalid; float softcap;
-    // TP2 exchange (the names kernels/xchg.h expects)
-    float * xin_mine, * xin_peer;
-    unsigned int * xflag_mine, * xflag_peer, * xseq;
+    // TP exchange (the names kernels/xchg.h expects; *_px[k - 1] is my slot in peer k)
+    static constexpr int NC = QZ_NC;
+    float * xin_mine, * xin_px[QZ_NC - 1];
+    unsigned int * xflag_mine, * xflag_px[QZ_NC - 1], * xseq;
     int * xerr;
 };
 
@@ -711,7 +712,7 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
         for (int v = blockIdx.x; v < HKVL * ATT_SPL; v += nb) c_attn(&e->at, pos, v, tid);
         BAR();
         ++xs;
-        for (int v = blockIdx.x; v < 2 * e->ngo; v += nb) c_gemv2(&e->go, v, A.xin_peer + (size_t) (xs & 1) * D);
+        for (int v = blockIdx.x; v < 2 * e->ngo; v += nb) c_gemv2(&e->go, v, A.xin_px[0] + (size_t) (xs & 1) * D);
         __threadfence_system();
         BAR();
         // ---- P1, chain group 1: the attention sum + conv, the ffn mix (and norm)
@@ -738,7 +739,7 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
         c_up_situ_w(e->guv, e->gus, sids, A.aq3, A.as3, A.beta, A.lb, A.GU, A.gcnt, A.hq, A.hs, tid);
         BAR();
         ++xs;
-        c_moe_down_q(e->dnv, e->dns, sids, swts, qz_gp(A.hq), qz_gp(A.hs), A.PART1, A.xin_peer + (size_t) (xs & 1) * D, tid, mdl);
+        c_moe_down_q(e->dnv, e->dns, sids, swts, qz_gp(A.hq), qz_gp(A.hs), A.PART1, A.xin_px[0] + (size_t) (xs & 1) * D, tid, mdl);
         __threadfence_system();
         BAR();
     }

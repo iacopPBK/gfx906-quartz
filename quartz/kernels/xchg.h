@@ -1,21 +1,29 @@
-// TP2 exchange between the two cards: per-block flags, the row-parallel GEMV push
-// and the combine. XA is the arch's args struct: it holds the exchange pointers
-// and its width as XA::DM, a multiple of 32.
+// TP exchange between the NC cards: per-block flags, the row-parallel GEMV push and
+// the combine. XA is the arch's args struct: it holds the exchange pointers, its
+// width as XA::DM, a multiple of 32, and the card count as XA::NC.
+//
+// Slots. Each card's inbox, head-merge pairs and flags hold NC - 1 slots. For card
+// me, peer k (1..NC-1) is card (me + k) % NC; me writes into that card's slot
+// NC - 1 - k (the *_px[k - 1] pointers, set by the host) and reads peer k from its
+// own slot k - 1. At NC = 2 both are slot 0, the TP2 layout.
 #pragma once
 
 #include "kernels/gemv.h"
 
-// ---- TP2 exchange ----------------------------------------------
-// push partials to the peer inbox in slot tok & 1, wait for its flag, then y = p0 + p1
+// ---- TP exchange -----------------------------------------------
+// push partials to every peer's inbox in parity tok & 1, wait for their flags, then
+// y = sum of the NC partials in card order
 #define QZ_XSPIN 2000000000ll     // clock64 ticks before a wait gives up
+#define QZ_XFS 128                // flags per slot (512 B)
 
-// per-block exchange flags. Block b only needs the peer's push of block b, and slot
-// 0 doubles as the head-merge flag.
-template <class XA> __device__ __forceinline__ void qz_xflag_b(const XA & A, unsigned int tok, int b) {
-    __threadfence_system();
-    __hip_atomic_store(A.xflag_peer + b, tok, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-}
-template <class XA> __device__ __forceinline__ void qz_xwait_b(const XA & A, unsigned int tok, int b) {
+// inbox slot stride in floats for CX rows: data [2][CX][DM] and checksums [2][CX][DM/32]
+template <int CX, int DM> constexpr size_t qz_xin_slot() { return (size_t) 2 * CX * DM + (size_t) 2 * CX * (DM / 32); }
+// card me's peer k and the slot me writes into it, for the host wiring
+__host__ __device__ constexpr int qz_xpeer(int nc, int me, int k) { return (me + k) % nc; }
+__host__ __device__ constexpr int qz_xslot_in_peer(int nc, int k) { return nc - 1 - k; }
+
+// wait in one thread for inbox flag b (slot * QZ_XFS + block) to reach tok
+template <class XA> __device__ __forceinline__ void qz_xwait_slot(const XA & A, unsigned int tok, int b) {
     const long long t0 = clock64();
     for (;;) {
         const unsigned int v = __hip_atomic_load(A.xflag_mine + b, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -27,9 +35,21 @@ template <class XA> __device__ __forceinline__ void qz_xwait_b(const XA & A, uns
         }
     }
 }
+// per-block exchange flags, set in every peer and waited on from every peer. Block b
+// only needs the peers' pushes of block b, and flag 0 doubles as the head-merge flag.
+template <class XA> __device__ __forceinline__ void qz_xflag_b(const XA & A, unsigned int tok, int b) {
+    __threadfence_system();
+    #pragma unroll
+    for (int k = 0; k < XA::NC - 1; k++)
+        __hip_atomic_store(A.xflag_px[k] + b, tok, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+template <class XA> __device__ __forceinline__ void qz_xwait_b(const XA & A, unsigned int tok, int b) {
+    #pragma unroll
+    for (int k = 0; k < XA::NC - 1; k++) qz_xwait_slot(A, tok, k * QZ_XFS + b);
+}
 
 // block 0's flag, the whole-card exchange: set it, or wait in one thread for the
-// peer's flag to reach tok. Past the spin limit, or once any wait gave up, a wait
+// peers' flags to reach tok. Past the spin limit, or once any wait gave up, a wait
 // sets the abort word and returns so the launch drains.
 template <class XA> __device__ __forceinline__ void qz_xflag(const XA & A, unsigned int tok) { qz_xflag_b(A, tok, 0); }
 template <class XA> __device__ __forceinline__ void qz_xwait(const XA & A, unsigned int tok) { qz_xwait_b(A, tok, 0); }
@@ -57,7 +77,6 @@ template <int T, int CX, bool LX = T <= 4, class XA> __device__ __forceinline__ 
     } else {
         (void) lds0;
     }
-    float * dst = A.xin_peer + (size_t) par * CX * XA::DM;
     int ns = 0;
     for (int g = blockIdx.x; g * 32 < XA::DM; g += gridDim.x, ns++) {
         const int r0 = g * 32 + wave * S;
@@ -76,12 +95,30 @@ template <int T, int CX, bool LX = T <= 4, class XA> __device__ __forceinline__ 
         const float4 v = *(const float4 *)(stage + (k * T + t) * 32 + q * 4);
         const size_t o = (size_t) t * XA::DM + g * 32 + q * 4;
         *(float4 *)(A.y_part + o) = v;
-        *(float4 *)(dst + o) = v;
+        #pragma unroll
+        for (int k = 0; k < XA::NC - 1; k++) *(float4 *)(A.xin_px[k] + (size_t) par * CX * XA::DM + o) = v;
     }
     __threadfence_system();
 }
 
-// after qz_gemv_xpush_t: flag the peer, wait for its flag and sum y = p0 + p1 over
+// the NC partials of one element summed in card order, (p0 + p1) + (p2 + p3) at
+// NC = 4. own is this card's, peer k's sits in inbox slot k - 1 at offset o.
+template <int CX, class XA> __device__ __forceinline__ float qz_xsum(const XA & A, float own, const float * src, size_t o) {
+    if constexpr (XA::NC == 2) {
+        const float peer = __builtin_nontemporal_load(src + o);
+        return A.tp_card == 0 ? __fadd_rn(own, peer) : __fadd_rn(peer, own);
+    } else {
+        static_assert(XA::NC == 4, "card-order sum for 2 or 4 cards");
+        constexpr size_t XS = qz_xin_slot<CX, XA::DM>();
+        auto v = [&](int c) {
+            const int k = (c - A.tp_card + XA::NC) % XA::NC;
+            return k == 0 ? own : __builtin_nontemporal_load(src + (size_t) (k - 1) * XS + o);
+        };
+        return __fadd_rn(__fadd_rn(v(0), v(1)), __fadd_rn(v(2), v(3)));
+    }
+}
+
+// after qz_gemv_xpush_t: flag the peers, wait for their flags and sum the partials over
 // this block's slabs. BX = false drops the trailing grid barrier.
 template <int T, int CX, bool BX = true, class XA> __device__ __forceinline__ void qz_xfinish_t(
         qz_barrier_state * bst, int & kb, const XA & A, unsigned int tok, float * y) {
@@ -96,8 +133,7 @@ template <int T, int CX, bool BX = true, class XA> __device__ __forceinline__ vo
             const int t = tid >> 5, i = tid & 31;
             const size_t o = (size_t) t * XA::DM + g * 32 + i;
             const float own = __builtin_nontemporal_load(A.y_part + o);
-            const float peer = __builtin_nontemporal_load(src + o);
-            y[o] = A.tp_card == 0 ? __fadd_rn(own, peer) : __fadd_rn(peer, own);
+            y[o] = qz_xsum<CX>(A, own, src, o);
         }
     }
     if constexpr (BX) qz_grid_barrier(bst, ++kb);
@@ -114,7 +150,12 @@ template <int T, int CX, bool LX = T <= 4, bool BX = true, class XA> __device__ 
     qz_xfinish_t<T, CX, BX>(bst, kb, A, tok, y);
 }
 
-// head merge. The larger value wins, and a tie goes to the lower token id.
+// head merge. The larger value wins, and a tie goes to the lower token id: a total
+// order, so the NC-way merge is the same in any order.
 __device__ __forceinline__ int qz_xpick(float ov, int oi, float pv, int pi) {
     return (pv > ov || (pv == ov && pi < oi)) ? pi : oi;
+}
+// fold one {value, id} pair into the running best, the same rule
+__device__ __forceinline__ void qz_xfold(float & bv, int & bi, float pv, int pi) {
+    if (pv > bv || (pv == bv && pi < bi)) { bv = pv; bi = pi; }
 }

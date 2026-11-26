@@ -258,7 +258,7 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
             fz((void **) &K.kvv_m, K.mtp_arena_rows * 2);
         }
         // exchange: inbox data, checksums, head-merge pairs, flag on its own line
-        CHECK(K.x.alloc(QZ_TMAX, D, c));
+        CHECK(K.x.alloc(QZ_TMAX, D, c, QZ_NC - 1));
 
         std::vector<qz_trunk_w> wh(n_layer);
         int nr = 0, na = 0;
@@ -372,11 +372,14 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
             if (!qz_resident(qz_dev_of(c), ks, (int) (sizeof(ks) / sizeof(ks[0])), 60, 512)) return 1;
         }
     }
-    for (int c = 0; c < QZ_NC; c++) {
-        C[c].A.xin_peer = C[1 - c].x.xin;
-        C[c].A.xhm_peer = C[1 - c].x.xhm;
-        C[c].A.xflag_peer = C[1 - c].x.xflag;
-    }
+    for (int c = 0; c < QZ_NC; c++)
+        for (int k = 1; k < QZ_NC; k++) {
+            const qz_xbufs & P = C[qz_xpeer(QZ_NC, c, k)].x;
+            const int sl = qz_xslot_in_peer(QZ_NC, k);
+            C[c].A.xin_px[k - 1] = P.xin + sl * P.xin_slot;
+            C[c].A.xhm_px[k - 1] = P.xhm + sl * P.xhm_slot;
+            C[c].A.xflag_px[k - 1] = P.xflag + sl * P.xflag_slot;
+        }
     {
         hipFuncAttributes fa;
         CHECK(hipSetDevice(qz_dev_of(0)));

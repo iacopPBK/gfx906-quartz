@@ -85,6 +85,7 @@ struct qz_mtp_w {
 
 struct qz_trunk_args {
     static constexpr int DM = QZ_D;   // row width (kernels/xchg.h)
+    static constexpr int NC = QZ_NC;  // cards
     const int * emb_vals;         // [vocab][QZ_D/4]
     const __half * emb_scal;      // [vocab][QZ_D/32]
     const float * out_norm;       // [QZ_D]
@@ -128,16 +129,16 @@ struct qz_trunk_args {
     unsigned char * cat_vals;     // eh_proj input planes [QZ_TMAX][2*QZ_D]
     float * cat_scal;             //                   scales [QZ_TMAX][2*QZ_D/32]
     float * mtp_yhead;            // MTP head rows [QZ_TMAX][n_vocab]
-    // TP2: this card's exchange state, see qwen35_cycle.hip
-    int tp_card;                  // 0 or 1
+    // TP: this card's exchange state, see kernels/xchg.h for the slots
+    int tp_card;                  // 0 .. QZ_NC - 1
     int hrows;                    // local lm_head rows (n_vocab / QZ_NC)
     float * y_part;               // [QZ_TMAX][QZ_D] own row-parallel partial
-    float * xin_mine;             // uncached inbox, rows [2][QZ_TMAX][QZ_D] + checksums
-    float * xin_peer;             // the peer's inbox (P2P)
-    float * xhm_mine;             // uncached head-merge inbox [2][QZ_TMAX][2] {value, id}
-    float * xhm_peer;
-    unsigned int * xflag_mine;    // uncached, written by the peer only
-    unsigned int * xflag_peer;
+    float * xin_mine;             // uncached inbox, [QZ_NC-1 slots] rows [2][QZ_TMAX][QZ_D] + checksums
+    float * xin_px[QZ_NC - 1];    // my slot in peer k's inbox (P2P)
+    float * xhm_mine;             // uncached head-merge inbox [slots][2][QZ_TMAX][2] {value, id}
+    float * xhm_px[QZ_NC - 1];
+    unsigned int * xflag_mine;    // uncached, [slots][QZ_XFS], written by the peers only
+    unsigned int * xflag_px[QZ_NC - 1];
     unsigned int * xseq;          // [1] exchange counter, carried across launches
     int * xerr;                   // [8] error words: chk mismatches, abort, code, tok,
                                   // seen, first bad tok, slab, row

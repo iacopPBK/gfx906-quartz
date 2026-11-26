@@ -297,7 +297,6 @@ __global__ void __launch_bounds__(256) mv_qkv_conv(const float * y_qkv, int N, f
 __global__ void __launch_bounds__(512) mv_xfin(qz_trunk_args A, unsigned int tok, int down) {
     {
         const int par = tok & 1;
-        float * dst = A.xin_peer + (size_t) par * MV_T * QZ_D;
         for (int g = blockIdx.x; g * 32 < QZ_D; g += gridDim.x)
             for (int i = threadIdx.x; i < 8 * MV_T; i += blockDim.x) {
                 const int t = i >> 3, q = i & 7;
@@ -311,7 +310,8 @@ __global__ void __launch_bounds__(512) mv_xfin(qz_trunk_args A, unsigned int tok
                     }
                     *(float4 *)(A.y_part + o) = v;
                 }
-                *(float4 *)(dst + o) = v;
+                #pragma unroll
+                for (int k = 0; k < QZ_NC - 1; k++) *(float4 *)(A.xin_px[k] + (size_t) par * MV_T * QZ_D + o) = v;
             }
         __threadfence_system();
     }
@@ -436,8 +436,9 @@ __global__ void __launch_bounds__(512) mv_argmax(qz_trunk_args A, unsigned int h
         const int gid = i0 + A.tp_card * A.hrows;
         A.y_part[2 * blockIdx.x] = b0;
         A.y_part[2 * blockIdx.x + 1] = __int_as_float(gid);
-        float * ph = A.xhm_peer + (size_t) (htok & 1) * MV_T * 2;
-        *(float2 *)(ph + 2 * blockIdx.x) = make_float2(b0, __int_as_float(gid));
+        #pragma unroll
+        for (int k = 0; k < QZ_NC - 1; k++)
+            *(float2 *)(A.xhm_px[k] + (size_t) (htok & 1) * MV_T * 2 + 2 * blockIdx.x) = make_float2(b0, __int_as_float(gid));
         __threadfence_system();
         qz_xflag_b(A, htok, 64 + blockIdx.x);
     }
@@ -448,12 +449,16 @@ __global__ void __launch_bounds__(64) mv_verify(qz_trunk_args A, const int * tok
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     (void) vtok;
     for (int b = 64; b < 64 + MV_T; b++) qz_xwait_b(A, htok, b);
-    const float * mh = A.xhm_mine + (size_t) (htok & 1) * MV_T * 2;
-    for (int t = 0; t < MV_T; t++)
-        A.out_tok[t] = qz_xpick(__builtin_nontemporal_load(A.y_part + 2 * t),
-                                __float_as_int(__builtin_nontemporal_load(A.y_part + 2 * t + 1)),
-                                __builtin_nontemporal_load(mh + 2 * t),
-                                __float_as_int(__builtin_nontemporal_load(mh + 2 * t + 1)));
+    for (int t = 0; t < MV_T; t++) {
+        float bv = __builtin_nontemporal_load(A.y_part + 2 * t);
+        int bi = __float_as_int(__builtin_nontemporal_load(A.y_part + 2 * t + 1));
+        #pragma unroll
+        for (int k = 0; k < QZ_NC - 1; k++) {
+            const float * mh = A.xhm_mine + (size_t) k * 4 * MV_T + (size_t) (htok & 1) * MV_T * 2;
+            qz_xfold(bv, bi, __builtin_nontemporal_load(mh + 2 * t), __float_as_int(__builtin_nontemporal_load(mh + 2 * t + 1)));
+        }
+        A.out_tok[t] = bi;
+    }
     int m = 0;
     if (verify) {
         while (m < MV_T - 1 && A.out_tok[m] == toks_d[m + 1]) m++;
@@ -471,7 +476,7 @@ struct mv_ctx {
     qz_trunk_args Ah = {};                // host staging, passed by value per launch
     bool part_shared = false;              // pm / pl / pacc carved from the engine's scratch (not freed here)
     float * ring8 = nullptr;               // [n_recr][2 slots][qz_geo<MV_TR>::RING_PAR]
-    float * xhm = nullptr;                 // head-merge inbox [2 slots][MV_T*2]
+    float * xhm = nullptr;                 // head-merge inbox [QZ_NC-1 slots][2 parities][MV_T*2]
     float * g8a = nullptr, * g8b = nullptr; // ffn gate / up outputs [MV_T][FF per card]
     unsigned int * xflag = nullptr;        // [64] exchange flags
     int * ctl_d = nullptr;                // [8] ctl (both cards compute it)
@@ -510,9 +515,6 @@ inline void mv_xrow_g8(mv_ctx & m, int il, int down, unsigned int tok) {
     using Gm = qz_geo<MV_T>;
     const qz_trunk_w & W = m.wh[il];
     const qz_trunk_args & A = m.Ah;
-    const int par = tok & 1;
-    float * dst = A.xin_peer + (size_t) par * MV_T * QZ_D;
-    (void) dst;
     if (down && MV_T > 8 && MV_T <= 12) mv_gemv_down_launch(m.st, A.ffn_q, A.ffn_sc, Gm::FF, W.fd_vals, W.fd_scal, QZ_D, A.y_part);
     else if (down) mv_gemv8_launch(m.st, A.ffn_q, A.ffn_sc, Gm::FF, W.fd_vals, W.fd_scal, QZ_D, A.y_part);
     else mv_gemv8_launch(m.st, A.pl_vals, A.pl_scal, Gm::G, W.out_vals, W.out_scal, QZ_D, A.y_part);
@@ -540,10 +542,10 @@ inline int mv_init(mv_ctx & m, qz_engine & eng, int c, float * ring_share = null
     for (const auto & W : m.wh) n_recr += W.recr != 0;
     if (ring_share) m.ring8 = ring_share;
     else fz((void **) &m.ring8, n_recr * 2 * (size_t) qz_geo<MV_TR>::RING_PAR * 4);
-    // the two peers' mailboxes: uncached VRAM under p2p, pinned host memory under the
-    // host link, which both cards reach with one pointer. Nothing else changes.
-    CHECK(qz_xalloc((void **) &m.xhm, (size_t) 2 * MV_T * 2 * 4, c, "xhm"));
-    CHECK(qz_xalloc((void **) &m.xflag, 512, c, "xflag"));
+    // the peers' mailboxes, one slot each (kernels/xchg.h): uncached VRAM under p2p,
+    // pinned host memory under the host link, which every card reaches with one pointer
+    CHECK(qz_xalloc((void **) &m.xhm, (size_t) (QZ_NC - 1) * 2 * MV_T * 2 * 4, c, "xhm"));
+    CHECK(qz_xalloc((void **) &m.xflag, (size_t) (QZ_NC - 1) * QZ_XFS * 4, c, "xflag"));
     fu((void **) &m.ctl_d, 8 * 4);
     fz((void **) &m.g8a, (size_t) MV_T * Gm::FF * 4);
     fz((void **) &m.g8b, (size_t) MV_T * Gm::FF * 4);
@@ -579,8 +581,7 @@ inline int mv_init(mv_ctx & m, qz_engine & eng, int c, float * ring_share = null
     fz(&A.y_head, (size_t) MV_T * eng.hrows * 4);
     fz(&A.out_tok, (size_t) MV_T * 4);
     fz(&A.y_part, (size_t) MV_DKC * MV_T * QZ_D * 4);
-    CHECK(qz_xalloc((void **) &A.xin_mine,
-                    ((size_t) 2 * MV_T * QZ_D + (size_t) 2 * MV_T * (QZ_D / 32)) * 4, c, "xin"));
+    CHECK(qz_xalloc((void **) &A.xin_mine, (QZ_NC - 1) * qz_xin_slot<MV_T, QZ_D>() * 4, c, "xin"));
     A.xhm_mine = m.xhm;
     A.xflag_mine = m.xflag;
     A.ctl = m.ctl_d;
@@ -612,11 +613,14 @@ inline int mv_init(mv_ctx & m, qz_engine & eng, int c, float * ring_share = null
 }
 
 inline void mv_wire_peers(mv_ctx * c) {
-    for (int i = 0; i < 2; i++) {
-        c[i].Ah.xin_peer = c[1 - i].Ah.xin_mine;
-        c[i].Ah.xhm_peer = c[1 - i].Ah.xhm_mine;
-        c[i].Ah.xflag_peer = c[1 - i].xflag;
-    }
+    for (int i = 0; i < QZ_NC; i++)
+        for (int k = 1; k < QZ_NC; k++) {
+            const mv_ctx & P = c[qz_xpeer(QZ_NC, i, k)];
+            const int sl = qz_xslot_in_peer(QZ_NC, k);
+            c[i].Ah.xin_px[k - 1] = P.Ah.xin_mine + sl * qz_xin_slot<MV_T, QZ_D>();
+            c[i].Ah.xhm_px[k - 1] = P.Ah.xhm_mine + (size_t) sl * 4 * MV_T;
+            c[i].Ah.xflag_px[k - 1] = P.xflag + sl * QZ_XFS;
+        }
 }
 
 static const int mv_ldnk[5] = { 1, 16, 31, 46, 61 };   // mirrors PF_FEAT_LAYERS

@@ -933,7 +933,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         ++xs;
         v_by_rows(nr, [&](auto t) {
             for (int v = blockIdx.x; v < 4 / VG_S * e0->ngo; v += nb)
-                v_gemv<VG_S, decltype(t)::value>(&e0->go, v, rs, rsf, Av.xin_peer + 2 * D + (size_t) (xs & 1) * VR * D);
+                v_gemv<VG_S, decltype(t)::value>(&e0->go, v, rs, rsf, Av.xin_px[0] + 2 * D + (size_t) (xs & 1) * VR * D);
         });
         __threadfence_system();
         cyc_barrier(vbst, ++kb);
@@ -970,7 +970,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         v_by_rows(nr, [&](auto t) { v_up_dd<decltype(t)::value>(e0->guv, e0->gus, sids, dd, Av.aq3, Av.as3, Av.beta, Av.lb, Av.hq, Av.hs, tid, rs, rsf, nr); });
         cyc_barrier(vbst, ++kb);
         ++xs;
-        v_down_dd(e0->dnv, e0->dns, sids, swts, dd, Av.hq, Av.hs, Av.PART1, Av.xin_peer + 2 * D + (size_t) (xs & 1) * VR * D,
+        v_down_dd(e0->dnv, e0->dns, sids, swts, dd, Av.hq, Av.hs, Av.PART1, Av.xin_px[0] + 2 * D + (size_t) (xs & 1) * VR * D,
                   tid, rs, rsf, cyc_lds, nr);
         __threadfence_system();
         cyc_barrier(vbst, ++kb);

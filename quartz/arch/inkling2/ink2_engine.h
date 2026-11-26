@@ -203,7 +203,7 @@ struct ink2_engine {
         for (int s = 0; s < NAPP; s++) { K.kc[s] = (__half *) nx_(); K.vc[s] = (__half *) nx_(); }
         K.hist = (float *) nx_();
         ICHECK(hipEventCreateWithFlags(&K.ev, hipEventDisableTiming));
-        ICHECK(K.x.alloc(VR + 1, D, c));           // the verify rows' inbox past the decode's 2 D
+        ICHECK(K.x.alloc(VR + 1, D, c, QZ_NC - 1));           // the verify rows' inbox past the decode's 2 D
         K.apsz = (size_t) HKVL * ATT_SPL * GQ * ATT_PW;
         ICHECK(qz_dmalloc(&K.apart, K.apsz * sizeof(float), "state"));   // the decode's (verify: vws)
         ICHECK(qz_dmalloc(&K.acnt, HKVL * sizeof(int), "state"));
@@ -401,7 +401,13 @@ struct ink2_engine {
     float * dtap = nullptr, * dtap_head = nullptr;
     void plan_all() {
         if (planned) return;
-        for (int c = 0; c < 2; c++) { C[c].ca.xin_peer = C[1 - c].x.xin; C[c].ca.xflag_peer = C[1 - c].x.xflag; }
+        for (int c = 0; c < QZ_NC; c++)
+            for (int k = 1; k < QZ_NC; k++) {
+                const qz_xbufs & P = C[qz_xpeer(QZ_NC, c, k)].x;
+                const int sl = qz_xslot_in_peer(QZ_NC, k);
+                C[c].ca.xin_px[k - 1] = P.xin + sl * P.xin_slot;
+                C[c].ca.xflag_px[k - 1] = P.xflag + sl * P.xflag_slot;
+            }
         for (int c = 0; c < QZ_NC; c++) {
             plan(c);
             ICHECK(hipSetDevice(qz_dev_of(c)));

@@ -570,15 +570,24 @@ __device__ __forceinline__ void qz_mtp_pass(
                     const int ix = ((int *)(part + 512))[t2];
                     if (v > b0 || (v == b0 && ix < i0)) { b0 = v; i0 = ix; }
                 }
-                // Merge with the peer's half: one pair, block 0 alone.
+                // Merge with the peers' shares: one pair, block 0 alone.
                 const unsigned int tok = xs + 1;
                 const int gid = i0 + A.tp_card * A.hrows;
-                float * ph = A.xhm_peer + (size_t)(tok & 1) * QZ_TMAX * 2;
-                *(float2 *) ph = make_float2(b0, __int_as_float(gid));
+                #pragma unroll
+                for (int k = 0; k < QZ_NC - 1; k++)
+                    *(float2 *) (A.xhm_px[k] + (size_t)(tok & 1) * QZ_TMAX * 2) = make_float2(b0, __int_as_float(gid));
                 qz_xflag(A, tok);
                 qz_xwait(A, tok);
-                const float * mh = A.xhm_mine + (size_t)(tok & 1) * QZ_TMAX * 2;
-                *am_out = qz_xpick(b0, gid, __builtin_nontemporal_load(mh), __float_as_int(__builtin_nontemporal_load(mh + 1)));
+                int best = gid;
+                float bestv = b0;
+                #pragma unroll
+                for (int k = 0; k < QZ_NC - 1; k++) {
+                    const float * mh = A.xhm_mine + (size_t) k * 4 * QZ_TMAX + (size_t)(tok & 1) * QZ_TMAX * 2;
+                    const float pv = __builtin_nontemporal_load(mh);
+                    const int pi = __float_as_int(__builtin_nontemporal_load(mh + 1));
+                    qz_xfold(bestv, best, pv, pi);
+                }
+                *am_out = best;
             }
         }
         xs++;
@@ -832,12 +841,13 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
                 const int ix = ((int *)(part + 512))[t2];
                 if (v > b0 || (v == b0 && ix < i0)) { b0 = v; i0 = ix; }
             }
-            // own pair to y_part, where block 0 merges, and the same pair to the peer
+            // own pair to y_part, where block 0 merges, and the same pair to the peers
             const int gid = i0 + A.tp_card * A.hrows;
             A.y_part[2 * blockIdx.x] = b0;
             A.y_part[2 * blockIdx.x + 1] = __int_as_float(gid);
-            float * ph = A.xhm_peer + (size_t)(htok & 1) * QZ_TMAX * 2;
-            *(float2 *)(ph + 2 * blockIdx.x) = make_float2(b0, __int_as_float(gid));
+            #pragma unroll
+            for (int k = 0; k < QZ_NC - 1; k++)
+                *(float2 *)(A.xhm_px[k] + (size_t)(htok & 1) * QZ_TMAX * 2 + 2 * blockIdx.x) = make_float2(b0, __int_as_float(gid));
             __threadfence_system();
         }
     }
@@ -847,12 +857,18 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
     if (blockIdx.x == 0 && tid == 0) {
         qz_xflag(A, htok);
         qz_xwait(A, htok);
-        const float * mh = A.xhm_mine + (size_t)(htok & 1) * QZ_TMAX * 2;
-        for (int t = 0; t < T; t++)
-            A.out_tok[t] = qz_xpick(__builtin_nontemporal_load(A.y_part + 2 * t),
-                                    __float_as_int(__builtin_nontemporal_load(A.y_part + 2 * t + 1)),
-                                    __builtin_nontemporal_load(mh + 2 * t),
-                                    __float_as_int(__builtin_nontemporal_load(mh + 2 * t + 1)));
+        for (int t = 0; t < T; t++) {
+            float bestv = __builtin_nontemporal_load(A.y_part + 2 * t);
+            int best = __float_as_int(__builtin_nontemporal_load(A.y_part + 2 * t + 1));
+            #pragma unroll
+            for (int k = 0; k < QZ_NC - 1; k++) {
+                const float * mh = A.xhm_mine + (size_t) k * 4 * QZ_TMAX + (size_t)(htok & 1) * QZ_TMAX * 2;
+                const float pv = __builtin_nontemporal_load(mh + 2 * t);
+                const int pi = __float_as_int(__builtin_nontemporal_load(mh + 2 * t + 1));
+                qz_xfold(bestv, best, pv, pi);
+            }
+            A.out_tok[t] = best;
+        }
     }
     if (blockIdx.x == 0 && tid == 0) {
         int m = 0;
