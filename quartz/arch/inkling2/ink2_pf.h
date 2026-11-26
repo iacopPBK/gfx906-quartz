@@ -675,7 +675,7 @@ static __device__ __forceinline__ void moe_gemm_body(
         const int4 tl,
         const char * W, const __half * sw, const int * perm,
         const int8_t * Ag, const float * sag, int Mp, int K,
-        float * C, int ldc, int N, const pf_situo so = pf_situo{}) {
+        float * C, int ldc, int N, const pf_situo so = pf_situo{}, float * C2 = nullptr) {
     constexpr int NT = NTT;                    // pair lanes
     constexpr int RG = 256 / NT;               // row groups
     constexpr int RR = 64 / RG;                // rows per thread
@@ -819,13 +819,24 @@ static __device__ __forceinline__ void moe_gemm_body(
         if (slot >= cnt) continue;
         if (row0 + 64 > N) {                       // partial weight tile (N % 64 != 0): guard each row
 #pragma unroll
-            for (int r = 0; r < RR; r++) if (row0 + rb + r < N) C[(size_t) (tl.y + slot) * ldc + row0 + rb + r] = acc[r][n];
+            for (int r = 0; r < RR; r++) if (row0 + rb + r < N) {
+                const size_t o = (size_t) (tl.y + slot) * ldc + row0 + rb + r;
+                C[o] = acc[r][n];
+                if (C2) C2[o] = acc[r][n];
+            }
             continue;
         }
-        float * dst = C + (size_t) (tl.y + slot) * ldc + row0 + rb;
+        const size_t off = (size_t) (tl.y + slot) * ldc + row0 + rb;
+        float * dst = C + off;
 #pragma unroll
         for (int r = 0; r < RR; r += 4)
             *(float4 *) (dst + r) = make_float4(acc[r][n], acc[r + 1][n], acc[r + 2][n], acc[r + 3][n]);
+        if (C2) {
+            float * d2 = C2 + off;
+#pragma unroll
+            for (int r = 0; r < RR; r += 4)
+                *(float4 *) (d2 + r) = make_float4(acc[r][n], acc[r + 1][n], acc[r + 2][n], acc[r + 3][n]);
+        }
     }
 }
 
@@ -841,25 +852,43 @@ static __global__ __launch_bounds__(256, BN <= 32 ? 3 : 2) void k_pf_moe_gemm(
 
 // Dense projections through the same tile body. One launch runs up to 8 jobs along
 // blockIdx.z, with 64-row token tiles along blockIdx.y; a job's last weight tile may be partial.
-struct dgjob { const char * W; const __half * sw; const int8_t * A; const float * as; float * C; int ldc, N, K; };
+// C2, when set (P2P row-parallel partial), streams a second copy straight into the peer's inbox.
+struct dgjob { const char * W; const __half * sw; const int8_t * A; const float * as; float * C; int ldc, N, K; float * C2; };
 struct dgjobs { dgjob j[8]; };
 static __global__ __launch_bounds__(256, 2) void k_pf_dgemm(dgjobs J, int m) {
     const dgjob & g = J.j[blockIdx.z];
     if ((int) blockIdx.x * 64 >= g.N) return;
     const int a0 = blockIdx.y * 64;
-    moe_gemm_body<64, 0, 16>(make_int4(0, a0, min(64, m - a0), 0), g.W, g.sw, nullptr, g.A, g.as, PF_M, g.K, g.C, g.ldc, g.N);
+    moe_gemm_body<64, 0, 16>(make_int4(0, a0, min(64, m - a0), 0), g.W, g.sw, nullptr, g.A, g.as, PF_M, g.K, g.C, g.ldc, g.N, pf_situo{}, g.C2);
 }
 
 // Per row, the weighted sum of its pairs' partials in the router's selection order. That
 // order fixes the rounding and there are no atomics, so the sum is deterministic.
-static __global__ __launch_bounds__(256) void k_pf_moe_reduce(const float * y, const int * inv, const float * wts, float * out) {
-    const int r = blockIdx.x;
+// out2, when set (P2P), writes a second copy straight into the peer's inbox.
+static __global__ __launch_bounds__(256) void k_pf_moe_reduce(
+        const float * __restrict__ y, const int * __restrict__ inv, const float * __restrict__ wts,
+        float * __restrict__ out, float * __restrict__ out2) {
+    const int r = blockIdx.x, t = threadIdx.x;
     const int * iv = inv + (size_t) r * NE_USED;
     const float * wt = wts + (size_t) r * NE_USED;
-    for (int o = threadIdx.x; o < D; o += 256) {
-        float acc = 0.f;
-        for (int k = 0; k < NE_USED; k++) acc = fmaf(wt[k], y[(size_t) iv[k] * D + o], acc);
-        out[(size_t) r * D + o] = acc;
+    const float * yp[NE_USED];
+    float w[NE_USED];
+#pragma unroll
+    for (int k = 0; k < NE_USED; k++) { yp[k] = y + (size_t) iv[k] * D; w[k] = wt[k]; }
+    float4 * o1 = (float4 *) (out + (size_t) r * D);
+    float4 * o2 = out2 ? (float4 *) (out2 + (size_t) r * D) : nullptr;
+    for (int o = t; o < D / 4; o += 256) {
+        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int k = 0; k < NE_USED; k++) {
+            const float4 v = ((const float4 *) yp[k])[o];
+            acc.x = fmaf(w[k], v.x, acc.x);
+            acc.y = fmaf(w[k], v.y, acc.y);
+            acc.z = fmaf(w[k], v.z, acc.z);
+            acc.w = fmaf(w[k], v.w, acc.w);
+        }
+        o1[o] = acc;
+        if (o2) o2[o] = acc;
     }
 }
 
@@ -1005,8 +1034,8 @@ struct ink2_pf {
 
     // ---- launch helpers (current device = card c), then one application: all m chunk
     // rows of positions pos0..pos0+m-1 through state slot `slot` of physical layer ip
-    dgjob djob(const qw & W, const unsigned char * av, const float * as, float * C, int ldc) {
-        return dgjob{W.v, W.s, (const int8_t *) av, as, C, ldc, (int) W.N, (int) W.K};
+    dgjob djob(const qw & W, const unsigned char * av, const float * as, float * C, int ldc, float * C2 = nullptr) {
+        return dgjob{W.v, W.s, (const int8_t *) av, as, C, ldc, (int) W.N, (int) W.K, C2};
     }
     // several dense GEMMs in one launch, up to 8 jobs
     void dgemm(int c, std::initializer_list<dgjob> js, int m) {
@@ -1178,9 +1207,10 @@ struct ink2_pf {
             t.pos0 = pos0; t.full = full; t.oq = b.AT.q; t.os = b.AT.s;
             t.rv = b.TB; t.relb = L.relb; t.sk = b.SK;
             k_pf_fattn<1, true><<<dim3((m + 31) / 32, HQL), 512, 0, st>>>(t, m);
-            dgemm(c, {djob(L.out, b.AT.q, b.AT.s, b.PART[buf], D)}, m);
+            float * peer_out = qz_link == QZ_LINK_P2P ? B[1 - c].PARTP[buf] : nullptr;
+            dgemm(c, {djob(L.out, b.AT.q, b.AT.s, b.PART[buf], D, peer_out)}, m);
         }
-        push_part(buf, m);
+        if (qz_link != QZ_LINK_P2P) push_part(buf, m);
         E.exchange();
         bnx++;
         for (int c = 0; c < 2; c++) {
@@ -1240,9 +1270,10 @@ struct ink2_pf {
             so.q = b.APQ; so.qs = b.APS; so.np = np; so.beta = E.hp.situ_beta; so.lb = E.hp.situ_lin_beta;
             moe(c, bn, 1, L.gu, b.FF.q, b.FF.s, PF_M, D, nullptr, GUL, GUL, yt, so);
             moe(c, bn, 0, L.dn, b.APQ, b.APS, np, FFL, b.YD, D, D, yt);
-            k_pf_moe_reduce<<<m, 256, 0, st>>>(b.YD, b.INV, b.WTS, b.PART[buf2]);
+            float * peer_out = qz_link == QZ_LINK_P2P ? B[1 - c].PARTP[buf2] : nullptr;
+            k_pf_moe_reduce<<<m, 256, 0, st>>>(b.YD, b.INV, b.WTS, b.PART[buf2], peer_out);
         }
-        push_part(buf2, m);
+        if (qz_link != QZ_LINK_P2P) push_part(buf2, m);
         E.exchange();
         bnx++;
         for (int c = 0; c < 2; c++) {
