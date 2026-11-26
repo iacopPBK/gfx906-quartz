@@ -8,7 +8,7 @@ commands are in the [README](../README.md), flags and environment variables in
 
 | | Item | Needed for |
 |---|---|---|
-| GPU | exactly 2× AMD MI50/MI60 (gfx906) 32 GB; PCIe peer access recommended | all |
+| GPU | 2× AMD MI50/MI60 (gfx906) 32 GB, PCIe peer access recommended; or 4× with peer access on every pair (experimental, `--tp 4`) | all |
 | Toolchain | ROCm (`hipcc`, HIP runtime, rocBLAS), a C++17 compiler. Tested on TheRock HIP 7.14 | build, run |
 | Model (`--model`) | Qwen3.8-27B or a fine-tune as Q8_0 GGUF with the nextn (MTP) block, ~28 GB; or Inkling-2-Mini as Q8_0 GGUF, ~28 GB | all |
 | Drafter (`--dspine`) | Qwen: DSpine draft GGUF, ~2.1 GB. Inkling: DSpark draft GGUF, ~0.4 GB | speculative decode |
@@ -17,10 +17,19 @@ commands are in the [README](../README.md), flags and environment variables in
 
 ## Hardware
 
-- **Two gfx906 cards, 32 GB each.** Every layer is split across the pair and the
-  cards write into each other's memory, so there is no single-card mode and no
-  mode for more cards. With more than two cards visible, quartz uses one pair
-  (`QZ_DEVICES`).
+- **Two gfx906 cards, 32 GB each, or four.** Every layer is split across the
+  cards and they write into each other's memory, so there is no single-card
+  mode. By default quartz runs on one pair (`QZ_DEVICES` picks it when more cards
+  are visible).
+- **Four cards (experimental).** `make tp4` builds `build/tp4/libquartz.so`, and
+  `--tp 4` (or `QZ_TP=4`) splits every layer four ways. Each card holds a quarter
+  of the weights, which leaves room for more context. Every pair of the four must
+  have peer access: the host-memory link is two cards only, and a pair without P2P
+  refuses the start. The start checks each pair and prints a matrix of write
+  bandwidth and flag round trip; the exchange is only as fast as the slowest
+  pair. Images (`--mmproj`) are two cards only. So far this mode has only run
+  emulated on two cards (`QZ_VIRT=2`, [configuration](configuration.md#environment)),
+  not on a 4-card machine.
 - **P2P is recommended, not required.** With peer access the cards write into
   each other's VRAM. Without it they exchange through pinned host memory, with the
   same arithmetic and the same greedy output, only slower: roughly 5-20 %. `QZ_LINK=auto` (the default)
@@ -38,8 +47,8 @@ commands are in the [README](../README.md), flags and environment variables in
 
 ## Memory
 
-The server checks before the load that the requested context fits on both
-cards, and prints a per-card ledger after it.
+The server checks before the load that the requested context fits on every
+card, and prints a per-card ledger after it (one line per GPU).
 
 **Qwen3.8-27B** at the default context (262144) with DSpine: about 59 GB of the
 ~69 GB the two cards report (weights 30.4, KV cache 18.2, DSpine 7.6, buffers
@@ -55,6 +64,10 @@ default context: 20.6 GB per card, with DSpark 22.4 GB on card 0 and 22.2 GB on
 card 1. The vision encoder adds up to 1.8 GB on card 0. The prefix cache takes
 about 0.1 GB of pinned host RAM.
 
+With four cards each card holds about a quarter of the weights (Qwen 8.3 GB,
+Inkling 7.4 GB) plus its own share of the KV cache and the buffers, which do not
+shrink: about 1.8 GB per card.
+
 Without P2P none of the above changes, but the exchange takes a stretch of
 pinned host RAM: a few MB for the exchange itself, a few hundred MB once
 prefill has run (the bulk copies are staged through it), and about 0.3 GB more
@@ -62,7 +75,8 @@ with `--mmproj` on Qwen.
 
 ## Build
 
-- `make` builds `build/bin/libquartz.so` with `hipcc`. rocBLAS is used by the
+- `make` builds `build/bin/libquartz.so` with `hipcc`; `make tp4` builds the
+  4-card library into `build/tp4`. A library runs one card count only. rocBLAS is used by the
   vision encoders only. There is no cmake, no submodule and no llama.cpp tree.
 - `hipcc` comes from `PATH`, else `$(ROCM_PATH)/bin/hipcc` (`ROCM_PATH`
   defaults to `/opt/rocm`). With only a versioned install and no `hipcc` on

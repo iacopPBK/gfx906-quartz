@@ -21,7 +21,7 @@
 
 quartz is a small inference engine for **two-cards** gfx906 (MI50/MI60 32 GB) systems.<br>
 It runs a short list of models as **Q8_0** GGUF files only (other quantisations are refused).<br>
-It needs **exactly two cards**: no single-card or 4-card mode. PCIe peer access (P2P)
+It needs **two cards** (a 4-card mode, `make tp4` and `--tp 4`, is experimental). PCIe peer access (P2P)
 between them is recommended; without it they exchange through host memory and it is slower.
 
 </div>

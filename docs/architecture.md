@@ -11,7 +11,7 @@ one MTP layer that drafts the next tokens.
 
 ### Two cards
 
-The weights are split in half across the cards (`arch/qwen35/qwen35_tp2.h`):
+The weights are split in half across the cards (`arch/qwen35/qwen35_tp.h`):
 each card holds half the attention heads, half the FFN rows and half the
 vocabulary head. After each layer the cards write their partial results
 straight into each other's memory over PCIe. `core/devices.h` picks the pair.
@@ -28,6 +28,25 @@ or read-modify-writes across the link. Some boards (Intel client root ports)
 forward peer writes but not peer reads, and a peer read there takes both cards
 down until a reboot. Partials go into the reader's own memory by a store or a
 peer copy, and every wait polls a local flag.
+
+### Four cards (experimental)
+
+The card count is a compile-time constant of the arch code, `QZ_NC` (`core/nc.h`):
+`make` builds 2, `make tp4` builds 4. The slice specs (`qwen35_tp.h`, `ink2_tp.h`)
+take the count. Shared code reads the runtime count and sizes its arrays for up to
+four. Each card has one inbox slot per other card: card `me`'s peer `k` is
+`(me + k) % NC`, `me` writes its partial into that card's slot `NC - 1 - k` and
+reads peer `k` from its own slot `k - 1` (`kernels/xchg.h`). At two cards that is
+the single slot of before, with the same bits. At four, a sum is
+`(p0 + p1) + (p2 + p3)` in card order on every card, so all cards hold the same
+values. The vocabulary head's merge (`qz_xfold`: max, lower id on ties) does not
+depend on order. Greedy output at four cards differs from two only where the
+reordered sums break a near-tie.
+
+`QZ_VIRT=2` runs two cards per GPU on CU-masked streams over alternate CUs
+(`qz_card_stream`, `core/devices.h`). The persistent grids are sized to the
+masked CU count, so the 4-card path can run on a 2-GPU machine. A contiguous
+half mask leaves the barrier short of a CU and hangs; the alternating one does not.
 
 ### A request
 
