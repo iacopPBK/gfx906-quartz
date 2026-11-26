@@ -1,5 +1,9 @@
-// The two cards the engine runs on, as HIP device ordinals. qz_dev_select() runs once
-// before any allocation: QZ_DEVICES=a,b when set, else devices 0 and 1. HIP device 0
+// The cards the engine runs on, as HIP device ordinals. qz_dev_select() runs once before
+// any allocation. QZ_TP=2|4 is the card count (2 by default; the arch code is built for
+// one count, QZ_NC). The cards sit on QZ_TP / QZ_VIRT GPUs: QZ_DEVICES=a,b (or a,b,c,d)
+// when set, else devices 0, 1, ... With QZ_VIRT=2 each GPU carries two virtual cards on
+// CU-masked streams over alternate CUs (qz_card_stream), card c on GPU c % (that count);
+// this emulates 4 cards on 2 GPUs. HIP device 0
 // must be gfx906 whatever the pair is. This build has gfx906 code objects only and
 // the runtime resolves kernels through device 0, so another architecture in slot 0 fails
 // every launch ("invalid device function") even when the work runs elsewhere.
@@ -11,6 +15,7 @@
 #pragma once
 #include <hip/hip_runtime.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,12 +26,43 @@ inline constexpr int qz_dev_max = 8;     // the ledger's table size (QZ_MEM_CARD
 inline constexpr int QZ_NC_MAX = 4;      // the most cards a tensor-parallel group has (shared arrays' size)
 inline int qz_dev[QZ_NC_MAX] = { 0, 1 }; // card index -> HIP ordinal
 inline bool qz_dev_chosen = false;
+inline int qz_ncard = 2;                 // cards in the group (QZ_TP)
+inline int qz_virt = 1;                  // cards per GPU (QZ_VIRT)
+inline int qz_nphys = 2;                 // GPUs: qz_ncard / qz_virt
 
 enum qz_link_mode { QZ_LINK_P2P, QZ_LINK_HOST };
 inline qz_link_mode qz_link = QZ_LINK_P2P;   // the mode the pair runs in; set below
 inline bool qz_link_auto = false;             // QZ_LINK=auto: a failed peer check falls back to host
 
 inline int qz_dev_of(int card) { return qz_dev[card]; }
+// card c's place among the virtual cards on its GPU, 0 .. qz_virt - 1
+inline int qz_card_slot(int card) { return card / qz_nphys; }
+// two cards on one GPU: their exchange is local, no peer access between them
+inline bool qz_card_same_gpu(int a, int b) { return qz_dev[a] == qz_dev[b]; }
+
+// card c's CUs: all of its GPU's, or every qz_virt-th starting at its slot (an alternating
+// mask; a contiguous half leaves one CU unusable and the grid barrier hangs). m holds 64
+// bits. Returns the CU count, 0 on error. The current device need not be the card's.
+inline int qz_card_mask(int card, uint32_t m[2]) {
+    int n = 0;
+    if (hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, qz_dev_of(card)) != hipSuccess || n <= 0) return 0;
+    if (n > 64) n = 64;
+    m[0] = m[1] = 0;
+    int k = 0;
+    for (int cu = 0; cu < n; cu++)
+        if (cu % qz_virt == qz_card_slot(card)) { m[cu / 32] |= 1u << (cu % 32); k++; }
+    return k;
+}
+// the CUs a card's persistent grid may use: one block per CU
+inline int qz_card_ncu(int card) { uint32_t m[2]; return qz_card_mask(card, m); }
+// a stream for card c's work, on the current device (the card's): non-blocking when the
+// card has the whole GPU, else CU-masked to the card's CUs
+inline hipError_t qz_card_stream(int card, hipStream_t * st) {
+    if (qz_virt == 1) return hipStreamCreateWithFlags(st, hipStreamNonBlocking);
+    uint32_t m[2];
+    if (!qz_card_mask(card, m)) return hipErrorInvalidDevice;
+    return hipExtStreamCreateWithCUMask(st, 2, m);
+}
 
 inline bool qz_dev_gfx906(const hipDeviceProp_t & p) {
     return std::strstr(p.gcnArchName, "gfx906") != nullptr;
@@ -76,9 +112,68 @@ inline bool qz_dev_host_pair(const std::vector<hipDeviceProp_t> & p, int * a, in
     return false;
 }
 
+inline int qz_dev_select_gpus();
 inline int qz_dev_select() {
     if (qz_dev_chosen) return 0;
     qz_dev_chosen = true;
+    const char * tp = getenv("QZ_TP"), * vi = getenv("QZ_VIRT");
+    qz_ncard = tp && *tp ? atoi(tp) : 2;
+    qz_virt = vi && *vi ? atoi(vi) : 1;
+    if ((qz_ncard != 2 && qz_ncard != 4) || (qz_virt != 1 && qz_virt != 2) || qz_ncard / qz_virt < 2) {
+        fprintf(stderr, "quartz: QZ_TP=%s QZ_VIRT=%s: the cards are 2 or 4, on 2 or 4 GPUs (QZ_VIRT 1 or 2)\n",
+                tp ? tp : "2", vi ? vi : "1");
+        return 1;
+    }
+    qz_nphys = qz_ncard / qz_virt;
+    // two queues per stream would be shared otherwise: each virtual card's persistent kernel
+    // needs its own hardware queue (set before HIP starts; an explicit value is kept)
+    if (qz_virt > 1) setenv("GPU_MAX_HW_QUEUES", "8", 0);
+    const int rc = qz_dev_select_gpus();
+    if (rc) return rc;
+    if (qz_virt > 1 && qz_link != QZ_LINK_P2P) {
+        fprintf(stderr, "quartz: QZ_VIRT=%d needs peer access between the GPUs (the host link is two cards only)\n", qz_virt);
+        return 1;
+    }
+    int ph[QZ_NC_MAX];
+    for (int g = 0; g < qz_nphys; g++) ph[g] = qz_dev[g];
+    for (int c = 0; c < qz_ncard; c++) qz_dev[c] = ph[c % qz_nphys];
+    if (qz_ncard > 2 || qz_virt > 1) {
+        fprintf(stderr, "quartz: %d cards on %d GPUs:", qz_ncard, qz_nphys);
+        for (int c = 0; c < qz_ncard; c++) fprintf(stderr, " card %d = HIP %d%s", c, qz_dev[c], qz_virt > 1 ? (qz_card_slot(c) ? " (odd CUs)" : " (even CUs)") : "");
+        fprintf(stderr, "\n");
+    }
+    return 0;
+}
+
+// four GPUs: QZ_DEVICES=a,b,c,d or 0,1,2,3, all gfx906, peer access between every pair
+inline int qz_dev_select4(const std::vector<hipDeviceProp_t> & p, int n) {
+    int d[4] = { 0, 1, 2, 3 };
+    const char * spec = getenv("QZ_DEVICES");
+    const int hi = n < qz_dev_max ? n - 1 : qz_dev_max - 1;
+    if (spec && sscanf(spec, "%d,%d,%d,%d", &d[0], &d[1], &d[2], &d[3]) != 4) {
+        fprintf(stderr, "quartz: QZ_DEVICES=%s: four cards need four ordinals\n", spec);
+        return 1;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (d[i] < 0 || d[i] > hi) { fprintf(stderr, "quartz: HIP %d is not visible (0..%d)\n", d[i], hi); qz_dev_list(p); return 1; }
+        if (!qz_dev_gfx906(p[(size_t) d[i]])) { fprintf(stderr, "quartz: HIP %d is %s, not gfx906\n", d[i], p[(size_t) d[i]].gcnArchName); return 1; }
+        for (int j = 0; j < i; j++) {
+            if (d[i] == d[j]) { fprintf(stderr, "quartz: QZ_DEVICES lists HIP %d twice\n", d[i]); return 1; }
+            if (!qz_dev_peer(d[i], d[j])) {
+                fprintf(stderr, "quartz: no peer access between HIP %d and HIP %d; four cards need it on every pair\n", d[j], d[i]);
+                qz_dev_list(p);
+                return 1;
+            }
+        }
+    }
+    if (qz_dev_link_want() == 2) { fprintf(stderr, "quartz: QZ_LINK=host is two cards only\n"); return 1; }
+    for (int i = 0; i < 4; i++) qz_dev[i] = d[i];
+    qz_link = QZ_LINK_P2P;
+    return 0;
+}
+
+// the GPUs (qz_nphys of them) into qz_dev[0 ..], with the link mode
+inline int qz_dev_select_gpus() {
 
     int n = 0;
     if (hipGetDeviceCount(&n) != hipSuccess) { fprintf(stderr, "quartz: cannot enumerate HIP devices\n"); return 1; }
@@ -96,10 +191,11 @@ inline int qz_dev_select() {
         qz_dev_list(p);
         return 1;
     }
-    if (n < 2) {
+    if (n >= qz_nphys && qz_nphys == 4) return qz_dev_select4(p, n);
+    if (n < qz_nphys) {
         const char * env = qz_dev_env();
-        if (env) fprintf(stderr, "quartz: the engine needs two GPUs, %d visible (visible set %s)\n", n, env);
-        else fprintf(stderr, "quartz: the engine needs two GPUs, %d visible\n", n);
+        if (env) fprintf(stderr, "quartz: the engine needs %d GPUs, %d visible (visible set %s)\n", qz_nphys, n, env);
+        else fprintf(stderr, "quartz: the engine needs %d GPUs, %d visible\n", qz_nphys, n);
         qz_dev_list(p);
         return 1;
     }

@@ -947,7 +947,7 @@ inline int qz_ds_block_load(qz_ds_block & d, qz_ds_ctx & cx, const char * draft,
         fz((void **) &d.ptsva[k], 2 * DS_R * 4);
     }
     DS_CHECK(hipEventCreateWithFlags(&d.ev, hipEventDisableTiming));
-    DS_CHECK(hipStreamCreateWithFlags(&d.st, hipStreamNonBlocking));
+    DS_CHECK(qz_card_stream(d.card, &d.st));
     printf("qz_ds_block: dev %d, block tensors %.2f GB\n", d.dev, d.ld.need_bytes / 1e9);
     return 0;
 }

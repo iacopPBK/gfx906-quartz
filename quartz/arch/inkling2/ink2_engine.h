@@ -214,7 +214,7 @@ struct ink2_engine {
         ICHECK(qz_dmalloc((void **) &K.uh, (size_t) NAPP * VR * CHL * sizeof(float), "state"));
         ICHECK(qz_dmalloc((void **) &K.LOGV, (size_t) VR * K.nvalid * sizeof(float), "state"));
         ICHECK(hipMalloc((void **) &K.vtk, (size_t) VR * QZ_TOPK_NB * QZ_TOPK * sizeof(float2)));
-        ICHECK(hipDeviceGetAttribute(&K.ncu, hipDeviceAttributeMultiprocessorCount, qz_dev_of(c)));
+        K.ncu = qz_card_ncu(c);                        // one block per CU the card has (CU-masked when virtual)
         if (K.ncu > CYC_NBMAX) K.ncu = CYC_NBMAX;      // the barrier's flag lanes
         if (K.ncu < 2 * CG) { fprintf(stderr, "inkling2: card %d: %d CUs, the persistent decode needs %d\n", c, K.ncu, 2 * CG); return false; }
         {
@@ -267,12 +267,15 @@ struct ink2_engine {
         else if (m == 3) k_mix<3><<<1, 512, MIX_LDS, C[c].st>>>(S, q, out);
         else k_mix<4><<<1, 512, MIX_LDS, C[c].st>>>(S, q, out);
     }
-    // record each card's partials, then let each wait for the peer's event before reading.
-    // Ordering only: no pointer crosses, so host mode needs nothing here (the partials go
-    // through the xin mailbox, which qz_xbufs allocates per mode).
+    // record each card's partials, then let each wait for every other card's event before
+    // reading. Ordering only: no pointer crosses, so host mode needs nothing here (the
+    // partials go through the xin mailbox, which qz_xbufs allocates per mode).
     void exchange() {
         for (int c = 0; c < QZ_NC; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipEventRecord(C[c].ev, C[c].st)); }
-        for (int c = 0; c < 2; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamWaitEvent(C[c].st, C[1 - c].ev, 0)); }
+        for (int c = 0; c < QZ_NC; c++) {
+            ICHECK(hipSetDevice(qz_dev_of(c)));
+            for (int j = 1; j < QZ_NC; j++) ICHECK(hipStreamWaitEvent(C[c].st, C[(c + j) % QZ_NC].ev, 0));
+        }
     }
 
     // ---- the token's 48 layer applications as a table of appk (ink2_cycle.h), built once

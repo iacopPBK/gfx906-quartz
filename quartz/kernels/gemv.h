@@ -100,7 +100,7 @@ template <int T> __device__ __forceinline__ void qz_gemv_slice_t(
     const int wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
     const int S = 4;
     int g0 = (int) blockIdx.x - off;
-    if (g0 < 0) g0 += gridDim.x;
+    while (g0 < 0) g0 += gridDim.x;      // off may pass the grid when it is under 60
     for (int g = g0; g * (8 * S) < N; g += gridDim.x) {
         const int r0 = g * (8 * S) + wave * S;
         float acc[T][S];

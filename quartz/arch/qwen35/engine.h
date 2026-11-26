@@ -98,6 +98,8 @@ public:
     qz_trunk_args H = {};      // per-call fields; everything else is per card
     bool H_mtp = false;
     long long n_launch = 0;
+    int grid = 60;                 // persistent grid: one block per CU of the smallest card
+    int xstage = QZ_XSTAGE_BYTES;  // the push stage past the cycle's LDS, for that grid
     qz_hparams hp;
     int n_vocab = 0, hrows = 0, n_layer = 64, steps = 0;
     float eps = 1e-6f;
@@ -176,7 +178,15 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
     printf("engine: eps %g, %d layers, vocab %d (%d per card), steps %d\n",
            eps, n_layer, n_vocab, hrows, steps);
 
+    if (qz_ncard != QZ_NC) { fprintf(stderr, "engine: built for %d cards, QZ_TP=%d\n", QZ_NC, qz_ncard); return 1; }
     if (!qz_peer_enable()) return 1;
+    // every card runs the same grid (block b waits for block b of the others): one block per
+    // CU of the smallest card, at most 60, with the push stage sized to its slabs per block
+    grid = 60;
+    for (int c = 0; c < QZ_NC; c++) grid = std::min(grid, qz_card_ncu(c));
+    if (grid < 8) { fprintf(stderr, "engine: %d CUs per card is too few\n", grid); return 1; }
+    xstage = std::max(QZ_XSLAB, (D / 32 + grid - 1) / grid) * QZ_TMAX * 32 * 4;
+    if (grid != 60) printf("engine: persistent grid %d blocks per card\n", grid);
 
     const int n_pages = qz_kv_pages(steps);
     const int n_pages_m = qz_kv_pages_mtp(steps);
@@ -188,7 +198,7 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
         if (!K.ld.load(path, g, qz_dev_of(c), c)) { fprintf(stderr, "card %d load failed\n", c); return 1; }
         printf("card %d: weights %.2f GB in %.1f s, %.2f GB free\n", c, K.ld.need_bytes / 1e9, K.ld.load_seconds, K.ld.free_after / 1e9);
         CHECK(hipSetDevice(qz_dev_of(c)));
-        CHECK(hipStreamCreateWithFlags(&K.st, hipStreamNonBlocking));
+        CHECK(qz_card_stream(c, &K.st));
         auto find2 = [&](int il, const char * suf) -> const qz_dev_tensor & {
             char name[64];
             snprintf(name, sizeof(name), "blk.%d.%s", il, suf);
@@ -355,7 +365,7 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
         A.xseq = K.x.xseq; A.xerr = K.x.xerr;
 
         // dynamic LDS opt-in per device
-        const int xs_b = QZ_XSTAGE_BYTES;   // TP2 push stage beyond the cycle's LDS
+        const int xs_b = xstage;            // the push stage beyond the cycle's LDS
         const int sm1 = (int) qz_cycle_smem<1>() + xs_b, sm2 = (int) qz_cycle_smem<2>() + xs_b, sm3 = (int) qz_cycle_smem<3>() + xs_b, sm4 = (int) qz_cycle_smem<4>() + xs_b;
         CHECK(hipFuncSetAttribute((const void *) qz_cycle<1>, hipFuncAttributeMaxDynamicSharedMemorySize, sm1));
         CHECK(hipFuncSetAttribute((const void *) qz_cycle<2>, hipFuncAttributeMaxDynamicSharedMemorySize, sm2));
@@ -363,13 +373,13 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
         CHECK(hipFuncSetAttribute((const void *) qz_cycle<4>, hipFuncAttributeMaxDynamicSharedMemorySize, sm4));
         CHECK(hipFuncSetAttribute((const void *) qz_mtp<3>, hipFuncAttributeMaxDynamicSharedMemorySize, sm3));
         CHECK(hipFuncSetAttribute((const void *) qz_mtp<4>, hipFuncAttributeMaxDynamicSharedMemorySize, sm4));
-        // the grid barrier needs all 60 blocks resident, so check every specialization
+        // the grid barrier needs all its blocks resident, so check every specialization
         {
             const qz_resident_kernel ks[] = {
                 {(const void *) qz_cycle<1>, sm1, "qz_cycle<1>"}, {(const void *) qz_cycle<2>, sm2, "qz_cycle<2>"},
                 {(const void *) qz_cycle<3>, sm3, "qz_cycle<3>"}, {(const void *) qz_cycle<4>, sm4, "qz_cycle<4>"},
                 {(const void *) qz_mtp<3>, sm3, "qz_mtp<3>"}, {(const void *) qz_mtp<4>, sm4, "qz_mtp<4>"}};
-            if (!qz_resident(qz_dev_of(c), ks, (int) (sizeof(ks) / sizeof(ks[0])), 60, 512)) return 1;
+            if (!qz_resident(qz_dev_of(c), ks, (int) (sizeof(ks) / sizeof(ks[0])), grid, 512)) return 1;
         }
     }
     for (int c = 0; c < QZ_NC; c++)
@@ -390,7 +400,6 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
         CHECK(hipFuncGetAttributes(&fa, (const void *) qz_cycle<1>));
         printf("qz_cycle<1> regs %d, scratch %zu B\n", fa.numRegs, fa.localSizeBytes);
     }
-    if (60 * QZ_XSLAB * 32 < D) { fprintf(stderr, "push stage too small for 60 blocks\n"); return 1; }
     printf("loaded\n");
     return 0;
 }
@@ -411,10 +420,10 @@ inline void qz_engine::launch_cyc(int T) {
         put(K);
         CHECK(hipMemsetAsync(K.bst, 0, sizeof(qz_barrier_state), K.st));
         switch (T) {
-            case 1: hipLaunchKernelGGL((qz_cycle<1>), dim3(60), dim3(512), qz_cycle_smem<1>() + QZ_XSTAGE_BYTES, K.st, K.bst, K.A); break;
-            case 2: hipLaunchKernelGGL((qz_cycle<2>), dim3(60), dim3(512), qz_cycle_smem<2>() + QZ_XSTAGE_BYTES, K.st, K.bst, K.A); break;
-            case 3: hipLaunchKernelGGL((qz_cycle<3>), dim3(60), dim3(512), qz_cycle_smem<3>() + QZ_XSTAGE_BYTES, K.st, K.bst, K.A); break;
-            default: hipLaunchKernelGGL((qz_cycle<4>), dim3(60), dim3(512), qz_cycle_smem<4>() + QZ_XSTAGE_BYTES, K.st, K.bst, K.A); break;
+            case 1: hipLaunchKernelGGL((qz_cycle<1>), dim3(grid), dim3(512), qz_cycle_smem<1>() + xstage, K.st, K.bst, K.A); break;
+            case 2: hipLaunchKernelGGL((qz_cycle<2>), dim3(grid), dim3(512), qz_cycle_smem<2>() + xstage, K.st, K.bst, K.A); break;
+            case 3: hipLaunchKernelGGL((qz_cycle<3>), dim3(grid), dim3(512), qz_cycle_smem<3>() + xstage, K.st, K.bst, K.A); break;
+            default: hipLaunchKernelGGL((qz_cycle<4>), dim3(grid), dim3(512), qz_cycle_smem<4>() + xstage, K.st, K.bst, K.A); break;
         }
         CHECK(hipGetLastError());
     }
@@ -428,8 +437,8 @@ inline void qz_engine::launch_mtp(int T) {
         CHECK(hipSetDevice(qz_dev_of(c)));
         put(K);
         CHECK(hipMemsetAsync(K.bst_m, 0, sizeof(qz_barrier_state), K.st));
-        if (T == 4) hipLaunchKernelGGL((qz_mtp<4>), dim3(60), dim3(512), qz_cycle_smem<4>() + QZ_XSTAGE_BYTES, K.st, K.bst_m, K.A);
-        else        hipLaunchKernelGGL((qz_mtp<3>), dim3(60), dim3(512), qz_cycle_smem<3>() + QZ_XSTAGE_BYTES, K.st, K.bst_m, K.A);
+        if (T == 4) hipLaunchKernelGGL((qz_mtp<4>), dim3(grid), dim3(512), qz_cycle_smem<4>() + xstage, K.st, K.bst_m, K.A);
+        else        hipLaunchKernelGGL((qz_mtp<3>), dim3(grid), dim3(512), qz_cycle_smem<3>() + xstage, K.st, K.bst_m, K.A);
         CHECK(hipGetLastError());
     }
     n_launch++;

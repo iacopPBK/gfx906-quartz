@@ -455,9 +455,10 @@ static qz_ctx * create(const char * path, const qz_create_opts & o) {
     c->E.hp = hp;
     c->EPF.E = &c->E;
     c->E.ctx = ctx;
-    qz_mem_baseline(2);
+    qz_mem_baseline(QZ_NC);
+    if (qz_ncard != QZ_NC) { fprintf(stderr, "inkling2: built for %d cards, QZ_TP=%d\n", QZ_NC, qz_ncard); delete c; return nullptr; }
     if (!qz_peer_enable()) { delete c; return nullptr; }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < QZ_NC; i++) {
         ink2_card & K = c->E.C[i];
         {
             qz_mem_scope mem("weights");
@@ -466,7 +467,7 @@ static qz_ctx * create(const char * path, const qz_create_opts & o) {
         }
         fprintf(stderr, "inkling2: card %d weights %.2f GB in %.1f s, %.2f GB free\n", i, K.ld.need_bytes / 1e9, K.ld.load_seconds, K.ld.free_after / 1e9);
         ICHECK(hipSetDevice(qz_dev_of(i)));
-        ICHECK(hipStreamCreateWithFlags(&K.st, hipStreamNonBlocking));
+        ICHECK(qz_card_stream(i, &K.st));
         c->E.bind(i);
         if (!c->E.alloc(i) || !c->EPF.alloc(i)) { delete c; return nullptr; }
     }
@@ -474,7 +475,7 @@ static qz_ctx * create(const char * path, const qz_create_opts & o) {
         qz_mem_scope mem("snapshot staging");
         qz_blob hb;
         hb.bytes = (size_t) NAPP * 3 * CHL * 4;
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < QZ_NC; i++) {
             ICHECK(hipSetDevice(qz_dev_of(i)));
             ICHECK(qz_dmalloc((void **) &c->shist[i], hb.bytes));
             hb.live[i] = c->E.C[i].hist; hb.stage[i] = c->shist[i];
@@ -493,7 +494,7 @@ static qz_ctx * create(const char * path, const qz_create_opts & o) {
         fprintf(stderr, "inkling2: DSpark drafter %s\n", dp);
     }
     ICHECK(hipSetDevice(qz_dev_of(0)));
-    qz_mem_report(stderr, 2);
+    qz_mem_report(stderr, QZ_NC);
     return c;
 }
 

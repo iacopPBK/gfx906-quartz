@@ -157,7 +157,7 @@ struct qz_ds_ctx {
 
 // load only the context tensors, fc, hidden_norm, per-layer k and v and k_norm; the
 // loader skips everything else in place.
-inline int qz_ds_ctx_load(qz_ds_ctx & d, const char * draft, int dev, int h0 = 0, int hn = DS_NKV) {
+inline int qz_ds_ctx_load(qz_ds_ctx & d, const char * draft, int dev, int h0 = 0, int hn = DS_NKV, int card = 0) {
     d.dev = dev;
     d.h0 = h0;
     d.hn = hn;
@@ -222,7 +222,7 @@ inline int qz_ds_ctx_load(qz_ds_ctx & d, const char * draft, int dev, int h0 = 0
         fz((void **) &d.ring_k[l], (size_t) DS_RING * DS_NKV * DS_HD * 4);
         fz((void **) &d.ring_v[l], (size_t) DS_RING * DS_NKV * DS_HD * 4);
     }
-    DS_CHECK(hipStreamCreateWithFlags(&d.st, hipStreamNonBlocking));
+    DS_CHECK(qz_card_stream(card, &d.st));
     printf("qz_ds_ctx: dev %d, draft context tensors %.2f GB, kv heads %d..%d\n",
            dev, d.ld.need_bytes / 1e9, d.h0, d.h0 + d.hn - 1);
     return 0;

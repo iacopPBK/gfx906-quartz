@@ -1,4 +1,4 @@
-// Two-card (TP2) plumbing shared by the archs: peer access, each card's exchange
+// Tensor-parallel card plumbing shared by the archs: peer access, each card's exchange
 // buffers, the exchange error words, and the residency check that keeps a persistent
 // grid-barrier kernel from hanging.
 #pragma once
@@ -12,19 +12,22 @@
 #include "core/link.h"
 #include "mem.h"
 
-// Peer access both ways between the two chosen cards (devices.h); false, with a message.
-// Host mode has none to enable: the mailboxes are pinned host memory (core/link.h).
+// Peer access both ways between every two cards on different GPUs (devices.h); false,
+// with a message. Two virtual cards on one GPU need none. Host mode has none to enable:
+// the mailboxes are pinned host memory (core/link.h).
 inline bool qz_peer_enable() {
     if (qz_link == QZ_LINK_HOST) return true;
-    for (int c = 0; c < 2; c++) {
-        if (hipSetDevice(qz_dev_of(c)) != hipSuccess) return false;
-        hipError_t e = hipDeviceEnablePeerAccess(qz_dev_of(1 - c), 0);
-        if (e == hipErrorPeerAccessAlreadyEnabled) { (void) hipGetLastError(); e = hipSuccess; }
-        if (e != hipSuccess) {
-            fprintf(stderr, "no peer access %d -> %d: %s\n", qz_dev_of(c), qz_dev_of(1 - c), hipGetErrorString(e));
-            return false;
+    for (int a = 0; a < qz_ncard; a++)
+        for (int b = 0; b < qz_ncard; b++) {
+            if (qz_card_same_gpu(a, b)) continue;
+            if (hipSetDevice(qz_dev_of(a)) != hipSuccess) return false;
+            hipError_t e = hipDeviceEnablePeerAccess(qz_dev_of(b), 0);
+            if (e == hipErrorPeerAccessAlreadyEnabled) { (void) hipGetLastError(); e = hipSuccess; }
+            if (e != hipSuccess) {
+                fprintf(stderr, "no peer access %d -> %d: %s\n", qz_dev_of(a), qz_dev_of(b), hipGetErrorString(e));
+                return false;
+            }
         }
-    }
     return true;
 }
 

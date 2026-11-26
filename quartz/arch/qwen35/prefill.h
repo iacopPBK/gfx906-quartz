@@ -541,7 +541,7 @@ struct qz_prefill {
             CHECK(hipEventCreateWithFlags(&k.ev, hipEventDisableTiming));
             CHECK(hipEventCreateWithFlags(&k.ev_aux, hipEventDisableTiming));
             for (int j = 0; j < 4; j++) CHECK(hipEventCreateWithFlags(&k.evp[j], hipEventDisableTiming));
-            CHECK(hipStreamCreateWithFlags(&k.aux, hipStreamNonBlocking));
+            CHECK(qz_card_stream(i, &k.aux));
             CHECK(hipEventRecord(k.ev_aux, k.aux));
         }
         CHECK(hipSetDevice(qz_dev_of(0)));

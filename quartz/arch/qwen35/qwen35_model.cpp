@@ -464,7 +464,7 @@ static qz_ctx * create(const char * model, const qz_create_opts & o) {
     const int max_ctx = o.max_ctx, slot_t = o.slot_t, adapt_slack = o.adapt_slack;
     if ( max_ctx < 1024 || (slot_t != 0 && slot_t != 3 && slot_t != 4) || adapt_slack < 0) return nullptr;
     qz_mem_scope mem("engine");
-    qz_mem_baseline(2);
+    qz_mem_baseline(QZ_NC);
     // steps, the arena positions: prompt, generated tokens and the cycle / MTP overhang
     const int steps = max_ctx + 2 * QZ_TMAX;
     // the scratch the cycle's partials share with batched prefill and the DSpine verify
@@ -504,7 +504,7 @@ static qz_ctx * create(const char * model, const qz_create_opts & o) {
         fprintf(stderr, "quartz: drafter switch on: leave DSpine < %.2f, MTP >= %.2f tok/round, window %d\n", w.lo, w.hi, w.win);
     }
     // per card: used and free, the ledger's tags, what the runtime holds beyond them
-    qz_mem_report(stderr, 2);
+    qz_mem_report(stderr, QZ_NC);
     return c;
 }
 

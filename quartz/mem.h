@@ -201,16 +201,22 @@ inline void * qz_mem_host_del(void * p) {
     return host_p;
 }
 
+// an earlier card is on the same GPU (virtual cards): the GPU is already counted
+inline bool qz_mem_seen_gpu(int c) {
+    for (int j = 0; j < c; j++) if (qz_dev_of(j) == qz_dev_of(c)) return true;
+    return false;
+}
+
 // used memory on each card before the engine allocates, so the report can tell
 // the baseline from untracked growth
 inline void qz_mem_baseline(int n_cards) {
     qz_mem_ledger & L = qz_mem();
     int dev0 = 0;
     (void) hipGetDevice(&dev0);
-    for (int c = 0; c < n_cards && c < 2; c++) {
+    for (int c = 0; c < n_cards && c < QZ_NC_MAX; c++) {
         size_t fr = 0, tot = 0;
         const int d = qz_dev_of(c);
-        if (d >= QZ_MEM_CARDS) continue;
+        if (d >= QZ_MEM_CARDS || qz_mem_seen_gpu(c)) continue;   // virtual cards: one line per GPU
         if (hipSetDevice(d) == hipSuccess && hipMemGetInfo(&fr, &tot) == hipSuccess) L.base[d] = (long long) (tot - fr);
     }
     (void) hipSetDevice(dev0);
@@ -222,10 +228,10 @@ inline void qz_mem_report(FILE * f, int n_cards, double min_gb = 0.05) {
     qz_mem_ledger & L = qz_mem();
     int dev0 = 0;
     (void) hipGetDevice(&dev0);
-    for (int c = 0; c < n_cards && c < 2; c++) {
+    for (int c = 0; c < n_cards && c < QZ_NC_MAX; c++) {
         size_t fr = 0, tot = 0;
         const int d = qz_dev_of(c);
-        if (d >= QZ_MEM_CARDS) continue;
+        if (d >= QZ_MEM_CARDS || qz_mem_seen_gpu(c)) continue;   // virtual cards: one line per GPU
         if (hipSetDevice(d) != hipSuccess || hipMemGetInfo(&fr, &tot) != hipSuccess) continue;
         // tags grouped by their first word (target/weights + target/head -> target)
         std::map<std::string, size_t> grp;
