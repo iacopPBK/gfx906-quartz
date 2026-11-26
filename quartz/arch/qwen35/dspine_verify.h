@@ -633,14 +633,14 @@ inline float * mv_feat_cap(qz_engine & eng) {
     }
     return mv_cap_rows;
 }
-static float * mv_cap_rows1 = nullptr;  // [MV_T][5][QZ_D] f32, device 1
-inline float * mv_feat_cap1() {
-    if (!mv_cap_rows1) {
-        CHECK(hipSetDevice(qz_dev_of(1)));
-        CHECK(qz_dmalloc(&mv_cap_rows1, (size_t) MV_T * 5 * QZ_D * 4));
+static float * mv_cap_rows_c[QZ_NC] = {};  // [MV_T][5][QZ_D] f32 on card c >= 1 (slot 0 unused)
+inline float * mv_feat_cap_c(int c) {
+    if (!mv_cap_rows_c[c]) {
+        CHECK(hipSetDevice(qz_dev_of(c)));
+        CHECK(qz_dmalloc(&mv_cap_rows_c[c], (size_t) MV_T * 5 * QZ_D * 4));
         CHECK(hipSetDevice(qz_dev_of(0)));
     }
-    return mv_cap_rows1;
+    return mv_cap_rows_c[c];
 }
 
 
@@ -677,13 +677,14 @@ inline void mv_round(mv_ctx * c, int pos, int cycle, int n_rep, int verify,
                 CHECK(hipMemcpy2DAsync(mv_cap_rows + (size_t) fq * QZ_D, (size_t) 5 * QZ_D * 4,
                                        c[0].Ah.x_rows + (size_t) parn * MV_T * QZ_D, (size_t) QZ_D * 4,
                                        (size_t) QZ_D * 4, MV_T, hipMemcpyDeviceToDevice, c[0].st));
-                if (mv_cap_rows1) {
-                    CHECK(hipSetDevice(qz_dev_of(1)));
-                    CHECK(hipMemcpy2DAsync(mv_cap_rows1 + (size_t) fq * QZ_D, (size_t) 5 * QZ_D * 4,
-                                           c[1].Ah.x_rows + (size_t) parn * MV_T * QZ_D, (size_t) QZ_D * 4,
-                                           (size_t) QZ_D * 4, MV_T, hipMemcpyDeviceToDevice, c[1].st));
-                    CHECK(hipSetDevice(qz_dev_of(0)));
-                }
+                for (int j = 1; j < QZ_NC; j++)
+                    if (mv_cap_rows_c[j]) {
+                        CHECK(hipSetDevice(qz_dev_of(j)));
+                        CHECK(hipMemcpy2DAsync(mv_cap_rows_c[j] + (size_t) fq * QZ_D, (size_t) 5 * QZ_D * 4,
+                                               c[j].Ah.x_rows + (size_t) parn * MV_T * QZ_D, (size_t) QZ_D * 4,
+                                               (size_t) QZ_D * 4, MV_T, hipMemcpyDeviceToDevice, c[j].st));
+                        CHECK(hipSetDevice(qz_dev_of(0)));
+                    }
             }
         }
         if (recr) {

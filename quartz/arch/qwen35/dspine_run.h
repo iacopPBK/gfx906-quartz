@@ -48,9 +48,8 @@ struct qz_dsrun {
         mv12::mv_wire_peers(mw);
         mv8::mv_wire_peers(mv);
         feat[0] = mv12::mv_feat_cap(eng);
-        feat[1] = mv12::mv_feat_cap1();
         feat8[0] = mv8::mv_feat_cap(eng);
-        feat8[1] = mv8::mv_feat_cap1();
+        for (int c = 1; c < QZ_NC; c++) { feat[c] = mv12::mv_feat_cap_c(c); feat8[c] = mv8::mv_feat_cap_c(c); }
         // the drafter embeds with the engine's token_embd and reads its half of the head
         // on each card; TG and TSV are built per vocab half too
         auto emb = [&](int c) { return &eng.C[c].ld.ts[eng.C[c].ld.find("token_embd.weight")]; };
@@ -75,8 +74,8 @@ struct qz_dsrun {
             DS_CHECK(qz_dmalloc(&topk_d[c], (size_t) MVW * QZ_TOPK_NB * QZ_TOPK * sizeof(float2)));
             // the exchange flags: p2p memsets the card's VRAM, host mode writes the pinned
             // mailbox itself (no kernel is in flight yet)
-            DS_CHECK(qz_xzero(mv[c].xflag, 512));
-            DS_CHECK(qz_xzero(mw[c].xflag, 512));
+            DS_CHECK(qz_xzero(mv[c].xflag, (size_t) (QZ_NC - 1) * QZ_XFS * 4));
+            DS_CHECK(qz_xzero(mw[c].xflag, (size_t) (QZ_NC - 1) * QZ_XFS * 4));
         }
         DS_CHECK(hipSetDevice(qz_dev_of(0)));
         DS_CHECK(hipEventCreateWithFlags(&fev, hipEventDisableTiming));
@@ -89,9 +88,9 @@ struct qz_dsrun {
     }
 
     // a prefill chunk's features, [5][Mmax][QZ_D] on card 0 with row r at position
-    // p0 + r, into both cards' context rings
+    // p0 + r, into every card's context rings
     void set_rope_shift(int s) { for (auto & m : mv) m.Ah.rope_shift = s; for (auto & m : mw) m.Ah.rope_shift = s; }   // the target's rope is the KV row + s, which images shift
-    // batched qz_ds_ctx_rows: card 0 quantizes and card 1 gets a copy, then each card
+    // batched qz_ds_ctx_rows: card 0 quantizes and the other cards get a copy, then each card
     // runs fc, norm and the k / v GEMMs of its kv heads
     void fill_prefill(const float * pf_feat, int Mmax, int p0, int n) {
         constexpr int KF = 5 * QZ_D;
@@ -101,14 +100,16 @@ struct qz_dsrun {
             hipLaunchKernelGGL(ds_feat_quant, dim3(nb), dim3(256), 0, cx[0].st, pf_feat + (size_t) b0 * QZ_D, (size_t) Mmax * QZ_D,
                                fa[0], fas[0], Mp);
             DS_CHECK(hipEventRecord(fev, cx[0].st));
-            DS_CHECK(hipSetDevice(qz_dev_of(1)));
-            DS_CHECK(hipStreamWaitEvent(cx[1].st, fev, 0));
-            // the quantized features card 0 just wrote, into card 1's copies: the source
-            // is card 0's, so the copy is queued on its stream and card 1's stream waits
-            // for it (both modes: under p2p the copy no longer runs on card 1's stream, so
-            // the qz_xcopy event is what orders the GEMMs below).
-            DS_CHECK(qz_xcopy(fa[1], 1, cx[1].st, fa[0], 0, cx[0].st, (size_t) Mp * KF));
-            DS_CHECK(qz_xcopy(fas[1], 1, cx[1].st, fas[0], 0, cx[0].st, (size_t) Mp * KF / 32 * 4));
+            for (int c = 1; c < QZ_NC; c++) {
+                DS_CHECK(hipSetDevice(qz_dev_of(c)));
+                DS_CHECK(hipStreamWaitEvent(cx[c].st, fev, 0));
+                // the quantized features card 0 just wrote, into card c's copies: the source
+                // is card 0's, so the copy is queued on its stream and card c's stream waits
+                // for it (both modes: under p2p the copy no longer runs on card c's stream, so
+                // the qz_xcopy event is what orders the GEMMs below).
+                DS_CHECK(qz_xcopy(fa[c], c, cx[c].st, fa[0], 0, cx[0].st, (size_t) Mp * KF));
+                DS_CHECK(qz_xcopy(fas[c], c, cx[c].st, fas[0], 0, cx[0].st, (size_t) Mp * KF / 32 * 4));
+            }
             for (int c = 0; c < QZ_NC; c++) {
                 DS_CHECK(hipSetDevice(qz_dev_of(c)));
                 qz_ds_ctx & d = cx[c];
@@ -151,7 +152,7 @@ struct qz_dsrun {
         DS_CHECK(hipSetDevice(qz_dev_of(0)));
         qz_ds_block & b = blk[0];
         ds_cand_sort<<<1, 64, 0, b.st>>>(b.cand);
-        ds_bas_pick<<<((DS_T - 1) * DS_TOPK + 127) / 128, 128, 0, b.st>>>(b.cand, b.tki, b.bas_l, b.ptki, b.pbas, bas_d);
+        ds_bas_pick<<<((DS_T - 1) * DS_TOPK + 127) / 128, 128, 0, b.st>>>(b.cand, ds_lists_of(b), bas_d);
         if (invT > 0.f) {                    // sampled drafts: host uniforms in, q and the candidates out
             float u[DS_T - 1];
             std::uniform_real_distribution<float> u01(0.f, 1.f);

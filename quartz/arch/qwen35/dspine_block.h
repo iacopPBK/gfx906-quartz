@@ -561,20 +561,36 @@ static inline int ds_a3_ps(int S, int heads) {
     return ps < 2 * DS_A3_TL ? 2 * DS_A3_TL : ps;
 }
 
-// ------------------------------------------------ the two-card round ----
-// x += a + b: the two cards' partials, bit-identical on both cards
-__global__ void __launch_bounds__(256) ds_add2(float * x, const float * a, const float * b, int tot) {
+// ------------------------------------------------- the N-card round ----
+// x += the cards' partials p[0..QZ_NC-1] in card order, bit-identical on every card:
+// x + (p0 + p1) at two cards, x + ((p0 + p1) + (p2 + p3)) at four
+struct ds_parts { const float * p[QZ_NC]; };
+__global__ void __launch_bounds__(256) ds_addn(float * x, ds_parts P, int tot) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < tot) x[i] = x[i] + (a[i] + b[i]);
+    if (i >= tot) return;
+    if constexpr (QZ_NC == 2) x[i] = x[i] + (P.p[0][i] + P.p[1][i]);
+    else x[i] = x[i] + ((P.p[0][i] + P.p[1][i]) + (P.p[2][i] + P.p[3][i]));
 }
-// global top-16 merge of the two vocab halves, ordered by value, ties to the lower id
-__global__ void __launch_bounds__(256) ds_top16_m(const float * av, const int * ai, const float * bv, const int * bi,
-                                                  int * out) {
+// every card's top-16 lists on card 0, in card order: card 0's own, then the staged copies
+struct ds_lists {
+    const float * tkv[QZ_NC]; const int * tki[QZ_NC]; const float * bas[QZ_NC];
+    const float * tg[QZ_NC], * tsv[QZ_NC], * tsva[QZ_NC];
+};
+// a[j] for a runtime card j, without indexing the kernel argument
+template <class T> __device__ __forceinline__ T ds_sel(const T (&a)[QZ_NC], int j) {
+    T p = a[0];
+    #pragma unroll
+    for (int k = 1; k < QZ_NC; k++) if (j == k) p = a[k];
+    return p;
+}
+// global top-16 merge of the cards' vocab shares, ordered by value, ties to the lower id
+__global__ void __launch_bounds__(256) ds_top16_m(ds_lists L, int * out) {
     const int r = blockIdx.x, t = threadIdx.x;
     float v[1];
     int id[1];
-    v[0] = t < DS_TOPK ? av[r * DS_TOPK + t] : t < 2 * DS_TOPK ? bv[r * DS_TOPK + t - DS_TOPK] : -3e30f;
-    id[0] = t < DS_TOPK ? ai[r * DS_TOPK + t] : t < 2 * DS_TOPK ? bi[r * DS_TOPK + t - DS_TOPK] : 0x7fffffff;
+    const int j = t / DS_TOPK, k = t % DS_TOPK;
+    v[0] = j < QZ_NC ? ds_sel(L.tkv, j)[r * DS_TOPK + k] : -3e30f;
+    id[0] = j < QZ_NC ? ds_sel(L.tki, j)[r * DS_TOPK + k] : 0x7fffffff;
     __shared__ float ov[DS_TOPK];
     __shared__ int oi[DS_TOPK];
     ds_tk_select(v, id, ov, oi);
@@ -638,10 +654,11 @@ struct qz_ds_block {
     const unsigned char * hh_v = nullptr;             // this card's head rows [dev V/NC, (dev + 1) V/NC)
     const unsigned short * hh_s = nullptr;
     float * bas_l = nullptr;                          // [T-1][16] bas of this card's half top-16 (tki)
-    float * pbas = nullptr;                           // card 0: the peer half's
+    float * pbas[QZ_NC - 1] = {};                     // card 0: card j's (j >= 1) in slot j - 1
     float * TG = nullptr, * TSV = nullptr;             // this card's rows [dev V/NC, (dev + 1) V/NC) of [V][R], [V][2R]
     float * tg_l = nullptr, * tsv_l = nullptr, * tsva_l = nullptr;   // ds_rows_l's output: this card's top-16 rows and the anchor's
-    float * ptg = nullptr, * ptsv = nullptr, * ptsva = nullptr;      // card 0: the peer's
+    float * ptg[QZ_NC - 1] = {}, * ptsv[QZ_NC - 1] = {}, * ptsva[QZ_NC - 1] = {};   // card 0: the other cards'
+
     float * tg_s = nullptr, * tsv_s = nullptr, * tsva_s = nullptr;   // card 0: ds_rows_pick's staged rows
     int ids[DS_T] = {};
     int * ids_d = nullptr;
@@ -670,12 +687,12 @@ struct qz_ds_block {
     float * hist_hdr = nullptr;                       // [T][DS_TOPK][H] dequanted cand head rows
     float * at_o = nullptr, * at_ml = nullptr;        // ds_attn_split3 partials
     float * tk_v = nullptr;                           // ds_top16_a partials
-    // the two-card round: the peer exchange inboxes and the top-16 halves
-    float * xin[2] = {};                              // [T][H] peer partials (written by the peer's copy)
-    float * tkv = nullptr;                            // [T-1][16] this card's half top-16 values
+    // the N-card round: the exchange inboxes and the top-16 lists
+    float * xin[2][QZ_NC - 1] = {};                   // [T][H] partials, slot k - 1 from card (card + k) % NC
+    float * tkv = nullptr;                            // [T-1][16] this card's share's top-16 values
     int * tki = nullptr;                              // [T-1][16] ids
-    float * ptkv = nullptr;                           // card 0: the peer half's values / ids
-    int * ptki = nullptr;
+    float * ptkv[QZ_NC - 1] = {};                     // card 0: the other cards' values / ids
+    int * ptki[QZ_NC - 1] = {};
     hipEvent_t ev = nullptr;
     int * tk_i = nullptr;
 };
@@ -910,28 +927,44 @@ inline int qz_ds_block_load(qz_ds_block & d, qz_ds_ctx & cx, const char * draft,
         fz((void **) &d.tk_v, (size_t) (DS_T - 1) * nch * DS_TOPK * 4);
         fz((void **) &d.tk_i, (size_t) (DS_T - 1) * nch * DS_TOPK * 4);
     }
-    fz((void **) &d.xin[0], (size_t) DS_T * DS_H * 4);
-    fz((void **) &d.xin[1], (size_t) DS_T * DS_H * 4);
+    for (int k = 0; k < QZ_NC - 1; k++) {
+        fz((void **) &d.xin[0][k], (size_t) DS_T * DS_H * 4);
+        fz((void **) &d.xin[1][k], (size_t) DS_T * DS_H * 4);
+    }
     fz((void **) &d.tkv, (size_t) DS_T * DS_TOPK * 4);
     fz((void **) &d.tki, (size_t) DS_T * DS_TOPK * 4);
-    fz((void **) &d.ptkv, (size_t) DS_T * DS_TOPK * 4);
-    fz((void **) &d.ptki, (size_t) DS_T * DS_TOPK * 4);
     fz((void **) &d.bas_l, (size_t) DS_T * DS_TOPK * 4);
-    {
-        const size_t nr = (size_t) (DS_T - 1) * DS_TOPK;
-        for (float ** p : { &d.tg_l, &d.ptg, &d.tg_s }) fz((void **) p, nr * DS_R * 4);
-        for (float ** p : { &d.tsv_l, &d.ptsv, &d.tsv_s }) fz((void **) p, nr * 2 * DS_R * 4);
-        for (float ** p : { &d.tsva_l, &d.ptsva, &d.tsva_s }) fz((void **) p, 2 * DS_R * 4);
+    const size_t nr = (size_t) (DS_T - 1) * DS_TOPK;
+    for (float ** p : { &d.tg_l, &d.tg_s }) fz((void **) p, nr * DS_R * 4);
+    for (float ** p : { &d.tsv_l, &d.tsv_s }) fz((void **) p, nr * 2 * DS_R * 4);
+    for (float ** p : { &d.tsva_l, &d.tsva_s }) fz((void **) p, 2 * DS_R * 4);
+    for (int k = 0; k < QZ_NC - 1; k++) {        // card 0's staging of the other cards' lists
+        fz((void **) &d.ptkv[k], (size_t) DS_T * DS_TOPK * 4);
+        fz((void **) &d.ptki[k], (size_t) DS_T * DS_TOPK * 4);
+        fz((void **) &d.pbas[k], (size_t) DS_T * DS_TOPK * 4);
+        fz((void **) &d.ptg[k], nr * DS_R * 4);
+        fz((void **) &d.ptsv[k], nr * 2 * DS_R * 4);
+        fz((void **) &d.ptsva[k], 2 * DS_R * 4);
     }
-    fz((void **) &d.pbas, (size_t) DS_T * DS_TOPK * 4);
     DS_CHECK(hipEventCreateWithFlags(&d.ev, hipEventDisableTiming));
     DS_CHECK(hipStreamCreateWithFlags(&d.st, hipStreamNonBlocking));
     printf("qz_ds_block: dev %d, block tensors %.2f GB\n", d.dev, d.ld.need_bytes / 1e9);
     return 0;
 }
 
-// the two-card block round. Card c owns half the heads, FFN rows and head rows; the
-// o / down partials are summed on both cards and the chain inputs end on card 0.
+// card 0's view of every card's top-16 lists (ds_lists), card order
+inline ds_lists ds_lists_of(const qz_ds_block & b) {
+    ds_lists L;
+    L.tkv[0] = b.tkv; L.tki[0] = b.tki; L.bas[0] = b.bas_l; L.tg[0] = b.tg_l; L.tsv[0] = b.tsv_l; L.tsva[0] = b.tsva_l;
+    for (int j = 1; j < QZ_NC; j++) {
+        L.tkv[j] = b.ptkv[j - 1]; L.tki[j] = b.ptki[j - 1]; L.bas[j] = b.pbas[j - 1];
+        L.tg[j] = b.ptg[j - 1]; L.tsv[j] = b.ptsv[j - 1]; L.tsva[j] = b.ptsva[j - 1];
+    }
+    return L;
+}
+
+// the N-card block round. Card c owns 1/NC of the heads, FFN rows and head rows; the
+// o / down partials are summed on every card and the chain inputs end on card 0.
 inline void qz_ds_block_round2(qz_ds_block * D, qz_ds_ctx * CX, int anchor, int p0, int wbase, int nt = DS_T) {
     const int S = p0 - wbase + DS_T;
     const int H = DS_H, FF2 = DS_FF / QZ_NC, QWl = DS_NQ / QZ_NC * DS_HD, KVl = DS_NKV / QZ_NC * DS_HD, V2 = DS_V / QZ_NC;
@@ -940,16 +973,24 @@ inline void qz_ds_block_round2(qz_ds_block * D, qz_ds_ctx * CX, int anchor, int 
     auto each = [&](auto && fn) {
         for (int c = 0; c < QZ_NC; c++) { DS_CHECK(hipSetDevice(D[c].dev)); fn(c, D[c], CX[c], D[c].st); }
     };
-    auto exchange = [&]() {          // ship the partials in t1, then x += own + peer on both cards
+    auto exchange = [&]() {          // ship the partials in t1 to every card, then x += the sum on each
         each([&](int c, qz_ds_block & d, qz_ds_ctx &, hipStream_t s) {
-            // into the peer's inbox: a peer copy on this card's stream under p2p, a D2H and
-            // an H2D on the peer's stream under the host link (qz_xdst, so p2p is unchanged)
-            DS_CHECK(qz_xcopy(D[1 - c].xin[xk], 1 - c, qz_xdst(D[1 - c].st), d.t1, c, s, (size_t) DS_T * H * 4));
+            // into peer k's inbox slot: a peer copy on this card's stream under p2p, a D2H
+            // and an H2D on the peer's stream under the host link (qz_xdst, so p2p is unchanged)
+            for (int k = 1; k < QZ_NC; k++) {
+                const int p = (c + k) % QZ_NC;
+                DS_CHECK(qz_xcopy(D[p].xin[xk][QZ_NC - 1 - k], p, qz_xdst(D[p].st), d.t1, c, s, (size_t) DS_T * H * 4));
+            }
             DS_CHECK(hipEventRecord(d.ev, s));
         });
         each([&](int c, qz_ds_block & d, qz_ds_ctx &, hipStream_t s) {
-            DS_CHECK(hipStreamWaitEvent(s, D[1 - c].ev, 0));
-            ds_add2<<<((size_t) DS_T * H + 255) / 256, 256, 0, s>>>(d.x, c == 0 ? d.t1 : d.xin[xk], c == 0 ? d.xin[xk] : d.t1, DS_T * H);
+            ds_parts P;
+            for (int j = 0; j < QZ_NC; j++) {
+                const int k = (j - c + QZ_NC) % QZ_NC;
+                if (k) DS_CHECK(hipStreamWaitEvent(s, D[j].ev, 0));
+                P.p[j] = k ? d.xin[xk][k - 1] : d.t1;
+            }
+            ds_addn<<<((size_t) DS_T * H + 255) / 256, 256, 0, s>>>(d.x, P, DS_T * H);
         });
         xk ^= 1;
     };
@@ -1023,23 +1064,25 @@ inline void qz_ds_block_round2(qz_ds_block * D, qz_ds_ctx * CX, int anchor, int 
                                                                       d.hh_v, d.hh_s, d.bas_l);
         ds_rows_l<<<(DS_T - 1) * DS_TOPK + 1, 256, 0, s>>>(d.TG, d.TSV, d.tki, c * V2, anchor, d.tg_l, d.tsv_l, d.tsva_l);
     });
-    // card 1's top-16 lists into card 0's staging: six copies on card 1's stream under
-    // p2p. Under the host link the H2D lands on card 0's stream (qz_xdst), which is where
-    // ds_top16_m reads them, so the event below and its wait stay as they are.
-    DS_CHECK(hipSetDevice(D[1].dev));
-    DS_CHECK(qz_xcopy(D[0].ptkv, 0, qz_xdst(D[0].st), D[1].tkv, 1, D[1].st, (size_t) (DS_T - 1) * DS_TOPK * 4));
-    DS_CHECK(qz_xcopy(D[0].ptki, 0, qz_xdst(D[0].st), D[1].tki, 1, D[1].st, (size_t) (DS_T - 1) * DS_TOPK * 4));
-    DS_CHECK(qz_xcopy(D[0].pbas, 0, qz_xdst(D[0].st), D[1].bas_l, 1, D[1].st, (size_t) (DS_T - 1) * DS_TOPK * 4));
-    {
-        const size_t nr = (size_t) (DS_T - 1) * DS_TOPK;
-        DS_CHECK(qz_xcopy(D[0].ptg, 0, qz_xdst(D[0].st), D[1].tg_l, 1, D[1].st, nr * DS_R * 4));
-        DS_CHECK(qz_xcopy(D[0].ptsv, 0, qz_xdst(D[0].st), D[1].tsv_l, 1, D[1].st, nr * 2 * DS_R * 4));
-        if (anchor >= V2) DS_CHECK(qz_xcopy(D[0].ptsva, 0, qz_xdst(D[0].st), D[1].tsva_l, 1, D[1].st, 2 * DS_R * 4));
+    // the other cards' top-16 lists into card 0's staging slot j - 1: six copies on card
+    // j's stream under p2p. Under the host link the H2D lands on card 0's stream
+    // (qz_xdst), which is where ds_top16_m reads them, so the events and waits hold.
+    const size_t nr = (size_t) (DS_T - 1) * DS_TOPK;
+    for (int j = 1; j < QZ_NC; j++) {
+        qz_ds_block & d = D[j];
+        hipStream_t dst = qz_xdst(D[0].st);
+        DS_CHECK(hipSetDevice(d.dev));
+        DS_CHECK(qz_xcopy(D[0].ptkv[j - 1], 0, dst, d.tkv, j, d.st, nr * 4));
+        DS_CHECK(qz_xcopy(D[0].ptki[j - 1], 0, dst, d.tki, j, d.st, nr * 4));
+        DS_CHECK(qz_xcopy(D[0].pbas[j - 1], 0, dst, d.bas_l, j, d.st, nr * 4));
+        DS_CHECK(qz_xcopy(D[0].ptg[j - 1], 0, dst, d.tg_l, j, d.st, nr * DS_R * 4));
+        DS_CHECK(qz_xcopy(D[0].ptsv[j - 1], 0, dst, d.tsv_l, j, d.st, nr * 2 * DS_R * 4));
+        if (anchor / V2 == j) DS_CHECK(qz_xcopy(D[0].ptsva[j - 1], 0, dst, d.tsva_l, j, d.st, 2 * DS_R * 4));
+        DS_CHECK(hipEventRecord(d.ev, d.st));
     }
-    DS_CHECK(hipEventRecord(D[1].ev, D[1].st));
     DS_CHECK(hipSetDevice(D[0].dev));
-    DS_CHECK(hipStreamWaitEvent(D[0].st, D[1].ev, 0));
-    ds_top16_m<<<DS_T - 1, 256, 0, D[0].st>>>(D[0].tkv, D[0].tki, D[0].ptkv, D[0].ptki, D[0].cand);
+    for (int j = 1; j < QZ_NC; j++) DS_CHECK(hipStreamWaitEvent(D[0].st, D[j].ev, 0));
+    ds_top16_m<<<DS_T - 1, 256, 0, D[0].st>>>(ds_lists_of(D[0]), D[0].cand);
 }
 
 // ------------------------------------------------- the chain on device ----
@@ -1055,38 +1098,34 @@ __global__ void __launch_bounds__(64) ds_cand_sort(int * cand) {
         c[b + 1] = v;
     }
 }
-// each candidate's bas from the half that holds it; card 1's list is copied to card 0
-__global__ void __launch_bounds__(128) ds_bas_pick(const int * cand, const int * ai, const float * ab,
-                                                   const int * bi, const float * bb, float * bas) {
+// each candidate's bas from the card whose share holds it; the others' lists are copied to card 0
+__global__ void __launch_bounds__(128) ds_bas_pick(const int * cand, ds_lists L, float * bas) {
     const int w = blockIdx.x * blockDim.x + threadIdx.x;
     if (w >= (DS_T - 1) * DS_TOPK) return;
     const int r = w / DS_TOPK * DS_TOPK, id = cand[w];
     float v = 0.f;
-    for (int k = 0; k < DS_TOPK; k++) {
-        if (ai[r + k] == id) v = ab[r + k];
-        if (bi[r + k] == id) v = bb[r + k];
-    }
+    for (int k = 0; k < DS_TOPK; k++)
+        #pragma unroll
+        for (int j = 0; j < QZ_NC; j++)
+            if (L.tki[j][r + k] == id) v = L.bas[j][r + k];
     bas[w] = v;
 }
 // TG / TSV rows in sorted-candidate order, plus the anchor's TSV row, for ds_chain_walk
-__global__ void __launch_bounds__(256) ds_rows_pick(const int * cand, int anchor,
-                                                    const int * ai, const float * atg, const float * atsv, const float * atsva,
-                                                    const int * bi, const float * btg, const float * btsv, const float * btsva,
+__global__ void __launch_bounds__(256) ds_rows_pick(const int * cand, int anchor, ds_lists L,
                                                     float * tg, float * tsv, float * tsva) {
     const int w = blockIdx.x, t = threadIdx.x;
     if (w < (DS_T - 1) * DS_TOPK) {
         const int r = w / DS_TOPK * DS_TOPK, id = cand[w];
-        int k = r;
-        bool own = true;
-        for (int j = 0; j < DS_TOPK; j++) {
-            if (ai[r + j] == id) { k = r + j; own = true; }
-            if (bi[r + j] == id) { k = r + j; own = false; }
-        }
-        const float * sg = (own ? atg : btg) + (size_t) k * DS_R, * ss = (own ? atsv : btsv) + (size_t) k * 2 * DS_R;
+        int k = r, src = 0;
+        for (int i = 0; i < DS_TOPK; i++)
+            #pragma unroll
+            for (int j = 0; j < QZ_NC; j++)
+                if (L.tki[j][r + i] == id) { k = r + i; src = j; }
+        const float * sg = ds_sel(L.tg, src) + (size_t) k * DS_R, * ss = ds_sel(L.tsv, src) + (size_t) k * 2 * DS_R;
         for (int e = t; e < DS_R; e += 256) tg[(size_t) w * DS_R + e] = sg[e];
         for (int e = t; e < 2 * DS_R; e += 256) tsv[(size_t) w * 2 * DS_R + e] = ss[e];
     } else {
-        const float * sa = anchor < DS_V / 2 ? atsva : btsva;
+        const float * sa = ds_sel(L.tsva, min(anchor / (DS_V / QZ_NC), QZ_NC - 1));
         for (int e = t; e < 2 * DS_R; e += 256) tsva[e] = sa[e];
     }
 }
@@ -1143,8 +1182,7 @@ __global__ void __launch_bounds__(512) ds_chain_walk(const float * bas, const in
 // the chain walk on card 0, after ds_cand_sort and the bas: stage table rows, then walk
 inline void ds_walk(qz_ds_block & b, const float * bas, int anchor, int * drafts, const float * u = nullptr,
                     float invT = 1.f, float * qall = nullptr) {
-    ds_rows_pick<<<(DS_T - 1) * DS_TOPK + 1, 256, 0, b.st>>>(b.cand, anchor, b.tki, b.tg_l, b.tsv_l, b.tsva_l,
-                                                             b.ptki, b.ptg, b.ptsv, b.ptsva, b.tg_s, b.tsv_s, b.tsva_s);
+    ds_rows_pick<<<(DS_T - 1) * DS_TOPK + 1, 256, 0, b.st>>>(b.cand, anchor, ds_lists_of(b), b.tg_s, b.tsv_s, b.tsva_s);
     ds_chain_walk<<<1, 512, 0, b.st>>>(bas, b.cand, b.rmsb, b.packed, b.b_gate, b.tg_s, b.tsv_s, anchor, drafts,
                                        u, invT, qall, b.tsva_s);
 }
