@@ -505,8 +505,9 @@ static __global__ __launch_bounds__(256) void k_pf_conv2(pfcv a) {
 }
 
 // Roll the conv history forward: its 3 rows become the chunk's last inputs, and rows
-// below the chunk start come from the old history. peer is null for K and V.
-static __global__ __launch_bounds__(256) void k_pf_commit(const float * src, const float * peer, float * hrg, int w, int m) {
+// below the chunk start come from the old history. peer is null for K and V; dst may alias hrg.
+static __global__ __launch_bounds__(256) void k_pf_commit(const float * src, const float * peer, const float * hrg,
+                                                          float * dst, int w, int m) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= w) return;
     float v[3];
@@ -517,7 +518,7 @@ static __global__ __launch_bounds__(256) void k_pf_commit(const float * src, con
              : src[(size_t) idx * w + c] + (peer ? peer[(size_t) idx * w + c] : 0.f);
     }
     #pragma unroll
-    for (int r = 0; r < 3; r++) hrg[(size_t) r * CHL + c] = v[r];
+    for (int r = 0; r < 3; r++) dst[(size_t) r * CHL + c] = v[r];
 }
 
 // The router as a tiled f32 GEMM, with K split RT_S ways for occupancy: one block per
@@ -912,6 +913,8 @@ struct ink2_pf {
     const int * irow = nullptr;
     const float * img[2] = {};
     int * irw[2] = {};                 // the chunk's irow, one per card
+    float * shist[2] = {};             // mid-chunk conv-history snapshot buffers (prefix cache)
+    float * ehist[2] = {};             // full-chunk conv-history when the last prompt token rides along
     bool tapping() const { return dtaps != nullptr; }
     void tap(int k, int p0, int m) {
         if (!tapping()) return;
@@ -1015,9 +1018,16 @@ struct ink2_pf {
     void normq(int c, const float * x, const float * w, pf_plane & pl, int m) {
         pf_norm_quant<<<m, 256, 0, E->C[c].st>>>(x, D, w, E->hp.eps, D, (int8_t *) pl.q, pl.s, PF_M, nullptr, 0);
     }
-    void commit(int c, const float * src, const float * peer, float * hrg, int w, int m) {
+    void commit(int c, const float * src, const float * peer, float * hrg, float * shrg, float * ehrg,
+                int w, int m, int snap, int snap_end) {
         hipStream_t st = E->C[c].st;
-        k_pf_commit<<<(w + 255) / 256, 256, 0, st>>>(src, peer, hrg, w, m);
+        if (shrg && snap > 0) k_pf_commit<<<(w + 255) / 256, 256, 0, st>>>(src, peer, hrg, shrg, w, snap);
+        if (ehrg && snap_end > 0) {
+            k_pf_commit<<<(w + 255) / 256, 256, 0, st>>>(src, peer, hrg, ehrg, w, m);
+            k_pf_commit<<<(w + 255) / 256, 256, 0, st>>>(src, peer, hrg, hrg, w, snap_end);
+        } else {
+            k_pf_commit<<<(w + 255) / 256, 256, 0, st>>>(src, peer, hrg, hrg, w, m);
+        }
     }
     // The other card's half of a partial: this card's copy (PARTP[buf]), which push_part()
     // filled from the peer.
@@ -1082,7 +1092,7 @@ struct ink2_pf {
         if (bn >= 32) moe_run(b, st, bn / 2, gather, W, aq, as, Mp, K, C, ldc, N, NE, b.TM + TM_B, b.NTL + 1, so);
     }
 
-    void layer(int slot, int ip, int pos0, int m, ink2_engine::seq & S) {
+    void layer(int slot, int ip, int pos0, int m, ink2_engine::seq & S, int snap, int snap_end) {
         ink2_engine & E = *this->E;
         const bool full = is_full(ip), msg = S.bank >= 0;
         const int buf = bnx & 1;
@@ -1158,8 +1168,10 @@ struct ink2_pf {
             h.tau_a = E.hp.tau_alpha; h.tau_f = E.hp.tau_floor;
             h.qk_clip = E.hp.qk_clip; h.rel_clip = E.hp.rel_clip; h.eps = E.hp.eps;
             k_pf_head_post<<<dim3(HQL + 2 * HKVL, m), 128, 0, st>>>(h);
-            commit(c, b.KR, nullptr, h.hist + H_K, KVL, m);
-            commit(c, b.VR, nullptr, h.hist + H_V, KVL, m);
+            float * sh = shist[c] ? shist[c] + (size_t) slot * 3 * CHL : nullptr;
+            float * eh = ehist[c] ? ehist[c] + (size_t) slot * 3 * CHL : nullptr;
+            commit(c, b.KR, nullptr, h.hist + H_K, sh ? sh + H_K : nullptr, eh ? eh + H_K : nullptr, KVL, m, snap, snap_end);
+            commit(c, b.VR, nullptr, h.hist + H_V, sh ? sh + H_V : nullptr, eh ? eh + H_V : nullptr, KVL, m, snap, snap_end);
             // attention, then attn_output; rows are split, so each card keeps a partial
             pfat t{};
             t.q = b.Q; t.gate = b.GR; t.kc = K.kc[slot]; t.vc = K.vc[slot];
@@ -1182,7 +1194,9 @@ struct ink2_pf {
             ca.hrg = K.hist + (size_t) slot * 3 * CHL + H_A;
             ca.x = b.X; ca.blk = push >= 0 ? b.BLK[push] : nullptr; ca.m = m; ca.push = push >= 0;
             k_pf_conv2<<<dim3((D + 255) / 256, (m + CV_R - 1) / CV_R), 256, 0, st>>>(ca);
-            commit(c, b.PART[buf], ca.peer, ca.hrg, D, m);
+            float * sha = shist[c] ? shist[c] + (size_t) slot * 3 * CHL + H_A : nullptr;
+            float * eha = ehist[c] ? ehist[c] + (size_t) slot * 3 * CHL + H_A : nullptr;
+            commit(c, b.PART[buf], ca.peer, ca.hrg, sha, eha, D, m, snap, snap_end);
         }
         if (push >= 0) { S.blocks.push_back(push); S.nblk++; }
         const int buf2 = bnx & 1;
@@ -1242,7 +1256,9 @@ struct ink2_pf {
             cf.hrg = K.hist + (size_t) slot * 3 * CHL + H_F;
             cf.x = b.X; cf.blk = nullptr; cf.m = m; cf.push = 0;
             k_pf_conv2<<<dim3((D + 255) / 256, (m + CV_R - 1) / CV_R), 256, 0, st>>>(cf);
-            commit(c, b.PART[buf2], cf.peer, cf.hrg, D, m);
+            float * shf = shist[c] ? shist[c] + (size_t) slot * 3 * CHL + H_F : nullptr;
+            float * ehf = ehist[c] ? ehist[c] + (size_t) slot * 3 * CHL + H_F : nullptr;
+            commit(c, b.PART[buf2], cf.peer, cf.hrg, shf, ehf, D, m, snap, snap_end);
         }
     }
 
@@ -1269,12 +1285,16 @@ struct ink2_pf {
     }
 
     // ---- the batched prefill of prompt rows a .. n-1. Rows below a are already in
-    // the KV and conv history. logits asks for the head on row n-1; false if aborted
-    bool prefill(const int32_t * prompt, int a, int n, bool logits) {
+    // the KV and conv history. logits asks for the head on row n-1; snap > 0 stages
+    // the conv history after snap rows into shist; snap_end > 0 leaves hist at snap_end
+    // rows and stages the full chunk's conv history into ehist; false if aborted
+    bool prefill(const int32_t * prompt, int a, int n, bool logits, int snap = -1, int snap_end = -1) {
         ink2_engine & E = *this->E;
         for (int p0 = a; p0 < n; p0 += PF_M) {
             if (abort && abort->load()) return false;
             const int m = std::min(PF_M, n - p0);
+            const int sn = (snap > 0 && p0 == a && snap < m) ? snap : -1;
+            const int se = (snap_end > 0 && p0 == a && snap_end < m) ? snap_end : -1;
             for (int c = 0; c < 2; c++) {
                 ICHECK(hipSetDevice(qz_dev_of(c)));
                 ink2_card & K = E.C[c];
@@ -1288,7 +1308,7 @@ struct ink2_pf {
                 }
             }
             ink2_engine::seq S;
-            for (int il = 0; il < LOOP0; il++) { if (il == 5) tap(0, p0, m); layer(il, il, p0, m, S); }
+            for (int il = 0; il < LOOP0; il++) { if (il == 5) tap(0, p0, m); layer(il, il, p0, m, S, sn, se); }
             const ink2_engine::seq pre = S;
             for (int c = 0; c < 2; c++) {
                 ICHECK(hipSetDevice(qz_dev_of(c)));
@@ -1312,11 +1332,11 @@ struct ink2_pf {
                 for (int ip = LOOP0; ip < LOOP1; ip++) {
                     const int slot = pass == 0 ? ip : NL + (pass - 1) * (LOOP1 - LOOP0) + (ip - LOOP0);
                     if ((pass == 1 && ip == 11) || (pass == 2 && ip == 17)) tap(pass, p0, m);   // visits 23 and 41
-                    layer(slot, ip, p0, m, S);
+                    layer(slot, ip, p0, m, S, sn, se);
                 }
             }
             S.bank = -1;
-            for (int il = LOOP1; il < NL; il++) layer(il, il, p0, m, S);
+            for (int il = LOOP1; il < NL; il++) layer(il, il, p0, m, S, sn, se);
             tap_head(S, p0, m);
             if (logits && p0 + m == n) head_last(S, m);
         }
