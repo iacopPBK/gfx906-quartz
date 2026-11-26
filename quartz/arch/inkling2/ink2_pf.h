@@ -647,7 +647,10 @@ static __global__ __launch_bounds__(256) void k_pf_conv2(pfcv a) {
 
 // Roll the conv history forward: its 3 rows become the chunk's last inputs, and rows
 // below the chunk start come from the old history. peer is null for K and V; dst may alias hrg.
-static __global__ __launch_bounds__(256) void k_pf_commit(const float * src, const float * peer, const float * hrg,
+__device__ __forceinline__ float pf_to_f32(float x) { return x; }
+__device__ __forceinline__ float pf_to_f32(__half x) { return __half2float(x); }
+template <class T>
+static __global__ __launch_bounds__(256) void k_pf_commit(const T * src, const T * peer, const float * hrg,
                                                           float * dst, int w, int m) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= w) return;
@@ -656,7 +659,7 @@ static __global__ __launch_bounds__(256) void k_pf_commit(const float * src, con
     for (int r = 0; r < 3; r++) {
         const int idx = m - 3 + r;
         v[r] = idx < 0 ? hrg[(size_t)(idx + 3) * CHL + c]
-             : src[(size_t) idx * w + c] + (peer ? peer[(size_t) idx * w + c] : 0.f);
+             : pf_to_f32(src[(size_t) idx * w + c]) + (peer ? pf_to_f32(peer[(size_t) idx * w + c]) : 0.f);
     }
     #pragma unroll
     for (int r = 0; r < 3; r++) dst[(size_t) r * CHL + c] = v[r];
@@ -832,12 +835,12 @@ static __global__ __launch_bounds__(256) void k_pf_tiles2(const int * start, int
 // Fused SITU output of gate_up: int8 planes [NGRP_FF][np][128] plus scales.
 struct pf_situo { unsigned char * q = nullptr; float * qs = nullptr; int np = 0; float beta = 0.f, lb = 0.f; };
 
-template <int BN, int GATHER, int NTT, int FS = 0, bool K_DIV4 = false>
+template <int BN, int GATHER, int NTT, int FS = 0, bool K_DIV4 = false, bool HALF_OUT = false>
 static __device__ __forceinline__ void moe_gemm_body(
         const int4 tl, int bx,
         const char * __restrict__ W, const __half * __restrict__ sw, const int * __restrict__ perm,
         const int8_t * __restrict__ Ag, const float * __restrict__ sag, int Mp, int K,
-        float * __restrict__ C, int ldc, int N, const pf_situo so = pf_situo{}, float * __restrict__ C2 = nullptr) {
+        void * __restrict__ Cv, int ldc, int N, const pf_situo so = pf_situo{}, void * __restrict__ C2v = nullptr) {
     constexpr int NT = NTT;                    // pair lanes
     constexpr int RG = 256 / NT;               // row groups
     constexpr int RR = 64 / RG;                // rows per thread
@@ -982,6 +985,29 @@ static __device__ __forceinline__ void moe_gemm_body(
         }
         return;
     }
+    if constexpr (HALF_OUT) {
+        __half * __restrict__ C = (__half *) Cv;
+        __half * __restrict__ C2 = (__half *) C2v;
+#pragma unroll
+        for (int n = 0; n < NH; n++) {
+            const int slot = tx + NT * n;
+            if (slot >= cnt) continue;
+            const size_t off = (size_t) (tl.y + slot) * ldc + row0 + rb;
+            __half * dst = C + off;
+            __half * d2 = C2 ? C2 + off : nullptr;
+#pragma unroll
+            for (int r = 0; r < RR; r += 4) {
+                const __half2 h0 = __floats2half2_rn(acc[r][n], acc[r + 1][n]);
+                const __half2 h1 = __floats2half2_rn(acc[r + 2][n], acc[r + 3][n]);
+                const uint2 u = make_uint2(*(const unsigned *) &h0, *(const unsigned *) &h1);
+                *(uint2 *) (dst + r) = u;
+                if (d2) *(uint2 *) (d2 + r) = u;
+            }
+        }
+        return;
+    }
+    float * __restrict__ C = (float *) Cv;
+    float * __restrict__ C2 = (float *) C2v;
 #pragma unroll
     for (int n = 0; n < NH; n++) {
         const int slot = tx + NT * n;
@@ -1033,9 +1059,10 @@ static __global__ __launch_bounds__(256, BN == 16 ? 3 : 2) void k_pf_moe_gemm(
 // Dense projections as packed 64x64 Q8 GEMMs (up to 8 jobs in one launch, zero empty
 // blocks, 8-way L2-grouped dispatch across token tiles). C2, when set (P2P row-parallel
 // partial), streams a second copy straight into the peer's inbox. All dense K are multiples of 128.
-struct dgjob { const char * W; const __half * sw; const int8_t * A; const float * as; float * C; int ldc, N, K; float * C2; };
+struct dgjob { const char * W; const __half * sw; const int8_t * A; const float * as; void * C; int ldc, N, K; void * C2; };
 struct dgjobs { dgjob j[8]; int off[9]; int n; };
-static __global__ __launch_bounds__(256, 2) void k_pf_dgemm(dgjobs J, int m) {
+template <bool HALF_OUT = false>
+static __global__ __launch_bounds__(256, 2) void k_pf_dgemm(dgjobs J, int m, int Mp = PF_M) {
     constexpr int DG_GG = 8;
     int bx, by;
     {
@@ -1048,8 +1075,8 @@ static __global__ __launch_bounds__(256, 2) void k_pf_dgemm(dgjobs J, int m) {
     for (int k = 1; k < 8; k++) if (k < J.n && bx >= J.off[k]) ji = k;
     const dgjob & g = J.j[ji];
     const int a0 = by * 64;
-    moe_gemm_body<64, 0, 16, 0, true>(make_int4(0, a0, min(64, m - a0), 0), bx - J.off[ji],
-                                      g.W, g.sw, nullptr, g.A, g.as, PF_M, g.K, g.C, g.ldc, g.N, pf_situo{}, g.C2);
+    moe_gemm_body<64, 0, 16, 0, true, HALF_OUT>(make_int4(0, a0, min(64, m - a0), 0), bx - J.off[ji],
+                                                g.W, g.sw, nullptr, g.A, g.as, Mp, g.K, g.C, g.ldc, g.N, pf_situo{}, g.C2);
 }
 
 // Per row, the weighted sum of its pairs' partials in the router's selection order. That
@@ -1147,11 +1174,13 @@ struct ink2_pf {
         ink2_card & K = E.C[0];
         ICHECK(hipSetDevice(qz_dev_of(0)));
         if (!tapd) ICHECK(hipMalloc(&tapd, (size_t) PF_M * D * 4));
-        for (int r = 0; r < m; r++) {
-            std::vector<const float *> bl;
-            for (int ib : S.blocks) bl.push_back(B[0].BLK[ib] + (size_t) r * D);
-            E.mix(0, bl, B[0].X + (size_t) r * D, K.out_q, 1, tapd + (size_t) r * D);
-        }
+        pfmix A{};
+        int nst = 0;
+        for (int ib : S.blocks) A.p[nst++] = B[0].BLK[ib];
+        A.p[nst++] = B[0].X;
+        A.n = nst;
+        A.qy = K.out_q; A.m = 1; A.out = tapd; A.ostr = 0;
+        launch_pf_mix<1>(m, K.st, A);
         k_pf_rmsw<<<m, 256, 0, K.st>>>(tapd, K.out_norm, dtaps + 3 * D, 4 * D, E.hp.eps);
         if (on_chunk) on_chunk(p0, m);
     }
@@ -1224,10 +1253,11 @@ struct ink2_pf {
 
     // ---- launch helpers (current device = card c), then one application: all m chunk
     // rows of positions pos0..pos0+m-1 through state slot `slot` of physical layer ip
-    dgjob djob(const qw & W, const unsigned char * av, const float * as, float * C, int ldc, float * C2 = nullptr) {
+    dgjob djob(const qw & W, const unsigned char * av, const float * as, void * C, int ldc, void * C2 = nullptr) {
         return dgjob{W.v, W.s, (const int8_t *) av, as, C, ldc, (int) W.N, (int) W.K, C2};
     }
     // several dense GEMMs in one launch, up to 8 jobs, packed with zero empty blocks
+    template <bool HALF_OUT = false>
     void dgemm(int c, std::initializer_list<dgjob> js, int m) {
         dgjobs J{};
         int n = 0;
@@ -1238,7 +1268,7 @@ struct ink2_pf {
             n++;
         }
         J.n = n;
-        k_pf_dgemm<<<dim3(J.off[n], (m + 63) / 64), 256, 0, E->C[c].st>>>(J, m);
+        k_pf_dgemm<HALF_OUT><<<dim3(J.off[n], (m + 63) / 64), 256, 0, E->C[c].st>>>(J, m);
     }
     void normq1(int c, const float * x, const float * w, pf_plane & pl, int m, float * outf = nullptr) {
         pfnq A{};
@@ -1253,7 +1283,8 @@ struct ink2_pf {
         for (int j = 0; j < 3; j++) { A.q[j] = (int8_t *) pl[j].q; A.s[j] = pl[j].s; }
         k_pf_normq<<<dim3(m, 3), 256, 0, E->C[c].st>>>(A, E->hp.eps);
     }
-    void commit(int c, const float * src, const float * peer, float * hrg, float * shrg, float * ehrg,
+    template <class T>
+    void commit(int c, const T * src, const T * peer, float * hrg, float * shrg, float * ehrg,
                 int w, int m, int snap, int snap_end) {
         hipStream_t st = E->C[c].st;
         if (shrg && snap > 0) k_pf_commit<<<(w + 255) / 256, 256, 0, st>>>(src, peer, hrg, shrg, w, snap);
@@ -1406,8 +1437,8 @@ struct ink2_pf {
             k_pf_head_post<<<dim3(HQL + 2 * HKVL, (m + HP_R - 1) / HP_R), 128, 0, st>>>(h);
             float * sh = shist[c] ? shist[c] + (size_t) slot * 3 * CHL : nullptr;
             float * eh = ehist[c] ? ehist[c] + (size_t) slot * 3 * CHL : nullptr;
-            commit(c, b.KR, nullptr, h.hist + H_K, sh ? sh + H_K : nullptr, eh ? eh + H_K : nullptr, KVL, m, snap, snap_end);
-            commit(c, b.VR, nullptr, h.hist + H_V, sh ? sh + H_V : nullptr, eh ? eh + H_V : nullptr, KVL, m, snap, snap_end);
+            commit(c, b.KR, (const float *) nullptr, h.hist + H_K, sh ? sh + H_K : nullptr, eh ? eh + H_K : nullptr, KVL, m, snap, snap_end);
+            commit(c, b.VR, (const float *) nullptr, h.hist + H_V, sh ? sh + H_V : nullptr, eh ? eh + H_V : nullptr, KVL, m, snap, snap_end);
             // attention, then attn_output; rows are split, so each card keeps a partial
             pfat t{};
             t.q = b.Q; t.gate = b.GR; t.kc = K.kc[slot]; t.vc = K.vc[slot];

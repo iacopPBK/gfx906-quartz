@@ -82,6 +82,27 @@ static __global__ __launch_bounds__(256) void k_ds_mixq(const float * taps, size
         quant32(v[k] * r * w[i], q + (size_t) blockIdx.x * D, qs + (size_t) blockIdx.x * (D / 32), i);
     }
 }
+// batched prefill mix + RMSNorm into grouped int8 planes [D/128][m][128] for k_pf_dgemm
+static __global__ __launch_bounds__(256) void k_ds_mixq_pf(const float * taps, size_t tstride, float4 a, const float * w,
+                                                           int8_t * q, float * qs, int m, float eps) {
+    __shared__ float red[16];
+    const int row = blockIdx.x;
+    const float * t = taps + (size_t) row * tstride;
+    float v[D / 256], ss[1] = {0.f};
+    #pragma unroll
+    for (int k = 0; k < D / 256; k++) {
+        const int i = threadIdx.x + k * 256;
+        v[k] = a.x * t[i] + a.y * t[D + i] + a.z * t[2 * D + i] + a.w * t[3 * D + i];
+        ss[0] += v[k] * v[k];
+    }
+    bsum<1, false>(ss, red, 4);
+    const float r = rsqrtf(ss[0] / D + eps);
+    #pragma unroll
+    for (int k = 0; k < D / 256; k++) {
+        const int i = threadIdx.x + k * 256;
+        pf_quant_unit(v[k] * r * w[i], i, row, m, q, qs, threadIdx.x & 31);
+    }
+}
 // rows of x (row stride K) to int8 with per-32 scales. When w is non-null, each row is
 // RMSNormed by it first. With y, the normed f32 rows are also written.
 static __global__ __launch_bounds__(256) void k_ds_quant(const float * x, const float * w, int K, unsigned char * q, float * qs,
@@ -215,6 +236,32 @@ static __global__ void k_ds_store(const float * k, const float * v, __half * ck,
     if (i >= m * DS_KVL) return;
     ck[(size_t) pos0 * DS_KVL + i] = __float2half(k[i]);
     cv[(size_t) pos0 * DS_KVL + i] = __float2half(v[i]);
+}
+// batched context K: per-(row, kv head) RMSNorm, NeoX rope at pos0 + row, and f16 cache store
+static __global__ __launch_bounds__(128) void k_ds_knorm_rope_store(const float * xk, const float * wk, __half * ck,
+                                                                    int pos0, float eps) {
+    __shared__ float red[4], s[HD];
+    const int h = blockIdx.x, row = blockIdx.y, e = threadIdx.x;
+    const float * xr = xk + ((size_t) row * DS_NKVL + h) * HD;
+    const float v = xr[e];
+    float ss = v * v;
+    #pragma unroll
+    for (int off = 32; off > 0; off >>= 1) ss += __shfl_xor(ss, off, 64);
+    if ((e & 63) == 0) red[e >> 6] = ss;
+    __syncthreads();
+    const float r = rsqrtf((red[0] + red[1]) / HD + eps);
+    s[e] = v * r * wk[e];
+    __syncthreads();
+    if (e < HD / 2) {
+        const float inv = powf(DS_THETA, -2.f * e / HD);
+        const float ang = (float) (pos0 + row) * inv;
+        float sn, cs;
+        sincosf(ang, &sn, &cs);
+        const float x0 = s[e], x1 = s[e + HD / 2];
+        __half * dst = ck + ((size_t) (pos0 + row) * DS_NKVL + h) * HD;
+        dst[e] = __float2half(x0 * cs - x1 * sn);
+        dst[e + HD / 2] = __float2half(x0 * sn + x1 * cs);
+    }
 }
 // attention of the block's DS_BS query rows, KV head blockIdx.x of this card, over the
 // context keys [lo, a) of the f16 cache and the DS_BS block keys in f32, with no mask.
@@ -636,7 +683,7 @@ struct ink2_dspark {
         const uint16_t * how = nullptr;
         __half * ck[DS_NL] = {}, * cv[DS_NL] = {};   // [ctx][DS_KVL]
         unsigned char * fq = nullptr; float * fs = nullptr;   // context fill: the 3 layers' mixed rows, int8 [3][m][D]
-        float * ckf = nullptr, * cvf = nullptr;      // context fill: k / v [8][DS_KVL]
+        float * ckf = nullptr, * cvf = nullptr, * ckf_pf = nullptr;   // context fill: k / v [8][DS_KVL], batched k [3][PF_M][DS_KVL]
         float * X = nullptr, * Y = nullptr, * Yp[2] = {};   // residual [8][D], this card's partial, the peer's (2 slots)
         float * Q = nullptr, * Kb = nullptr, * Vb = nullptr, * O = nullptr, * G = nullptr, * U = nullptr;
         float * hid = nullptr, * part = nullptr;
@@ -761,6 +808,7 @@ struct ink2_dspark {
             for (int l = 0; l < DS_NL; l++) { al(&k.ck[l], (size_t) ctx * DS_KVL); al(&k.cv[l], (size_t) ctx * DS_KVL); }
             al(&k.fq, (size_t) DS_NL * PF_M * D); al(&k.fs, (size_t) DS_NL * PF_M * D / 32);
             al(&k.ckf, 8 * DS_KVL); al(&k.cvf, 8 * DS_KVL);
+            al(&k.ckf_pf, (size_t) DS_NL * PF_M * DS_KVL);
             al(&k.X, DS_BS * D); al(&k.Y, DS_BS * D); al(&k.Yp[0], DS_BS * D); al(&k.Yp[1], DS_BS * D);
             al(&k.Q, DS_BS * DS_QL); al(&k.Kb, DS_BS * DS_KVL); al(&k.Vb, DS_BS * DS_KVL);
             al(&k.O, DS_BS * DS_QL); al(&k.G, DS_BS * DS_FFL); al(&k.U, DS_BS * DS_FFL); al(&k.hid, DS_BS * D);
@@ -851,13 +899,21 @@ struct ink2_dspark {
     // the 3 layers and hands the int8 planes to card 1; each card fills its own kv heads.
     void fill(const float * taps, size_t tstride, int p0, int m) {
         if (m > PF_M) { fprintf(stderr, "dspark: fill of %d rows (max %d)\n", m, PF_M); exit(1); }
+        const bool batched = m > 8;
         {
             ICHECK(hipSetDevice(qz_dev_of(0)));
             hipStream_t st = E->C[0].st;
             card & k = K[0];
             ICHECK(hipStreamWaitEvent(st, K[1].ev, 0));   // card 1 is done with the last fill's planes
-            for (int l = 0; l < DS_NL; l++)
-                k_ds_mixq<<<m, 256, 0, st>>>(taps, tstride, alpha[l], k.L[l].dn, k.fq + (size_t) l * m * D, k.fs + (size_t) l * m * (D / 32), DS_EPS);
+            for (int l = 0; l < DS_NL; l++) {
+                if (batched)
+                    k_ds_mixq_pf<<<m, 256, 0, st>>>(taps, tstride, alpha[l], k.L[l].dn,
+                                                    (int8_t *) (k.fq + (size_t) l * m * D),
+                                                    k.fs + (size_t) l * m * (D / 32), m, DS_EPS);
+                else
+                    k_ds_mixq<<<m, 256, 0, st>>>(taps, tstride, alpha[l], k.L[l].dn,
+                                                 k.fq + (size_t) l * m * D, k.fs + (size_t) l * m * (D / 32), DS_EPS);
+            }
             k_ds_mixnorm<<<1, 256, 0, st>>>(taps + (size_t) (m - 1) * tstride, tstride, alpha[DS_NL], dsn, g, D, DS_EPS);
             // qz_xdst: card 1's gemvs below are ordered by the k.ev handoff that follows, so
             // p2p stays the two peer copies on card 0's stream; host mode puts the H2Ds on
@@ -869,15 +925,37 @@ struct ink2_dspark {
         }
         each([&](int c, card & k, hipStream_t st) {
             if (c == 1) ICHECK(hipStreamWaitEvent(st, K[0].ev, 0));
-            for (int r0 = 0; r0 < m; r0 += 8) {
-                const int n = std::min(8, m - r0);
+            if (batched) {
+                dgjobs Jk{}, Jv{};
+                Jk.off[0] = Jv.off[0] = 0;
                 for (int l = 0; l < DS_NL; l++) {
-                    const unsigned char * q = k.fq + ((size_t) l * m + r0) * D;
-                    const float * s = k.fs + ((size_t) l * m + r0) * (D / 32);
-                    gemv(st, q, s, k.L[l].kc, k.ckf, n == 1 ? 1 : 8);
-                    gemv(st, q, s, k.L[l].vc, k.cvf, n == 1 ? 1 : 8);
-                    k_ds_hnorm_rope<<<dim3(DS_NKVL, n), 128, 0, st>>>(k.ckf, k.L[l].kcn, DS_NKVL, k.ckf, k.L[l].kcn, 0, p0 + r0, DS_EPS);
-                    k_ds_store<<<(n * DS_KVL + 255) / 256, 256, 0, st>>>(k.ckf, k.cvf, k.ck[l], k.cv[l], p0 + r0, n);
+                    const int8_t * q = (const int8_t *) (k.fq + (size_t) l * m * D);
+                    const float * s = k.fs + (size_t) l * m * (D / 32);
+                    float * ko = k.ckf_pf + (size_t) l * m * DS_KVL;
+                    __half * vo = k.cv[l] + (size_t) p0 * DS_KVL;
+                    Jk.j[l] = dgjob{k.L[l].kc.v, k.L[l].kc.s, q, s, ko, DS_KVL, DS_KVL, D, nullptr};
+                    Jv.j[l] = dgjob{k.L[l].vc.v, k.L[l].vc.s, q, s, vo, DS_KVL, DS_KVL, D, nullptr};
+                    Jk.off[l + 1] = Jk.off[l] + (DS_KVL + 63) / 64;
+                    Jv.off[l + 1] = Jv.off[l] + (DS_KVL + 63) / 64;
+                }
+                Jk.n = Jv.n = DS_NL;
+                const int yt = (m + 63) / 64;
+                k_pf_dgemm<false><<<dim3(Jk.off[DS_NL], yt), 256, 0, st>>>(Jk, m, m);
+                k_pf_dgemm<true><<<dim3(Jv.off[DS_NL], yt), 256, 0, st>>>(Jv, m, m);
+                for (int l = 0; l < DS_NL; l++)
+                    k_ds_knorm_rope_store<<<dim3(DS_NKVL, m), 128, 0, st>>>(
+                            k.ckf_pf + (size_t) l * m * DS_KVL, k.L[l].kcn, k.ck[l], p0, DS_EPS);
+            } else {
+                for (int r0 = 0; r0 < m; r0 += 8) {
+                    const int n = std::min(8, m - r0);
+                    for (int l = 0; l < DS_NL; l++) {
+                        const unsigned char * q = k.fq + ((size_t) l * m + r0) * D;
+                        const float * s = k.fs + ((size_t) l * m + r0) * (D / 32);
+                        gemv(st, q, s, k.L[l].kc, k.ckf, n == 1 ? 1 : 8);
+                        gemv(st, q, s, k.L[l].vc, k.cvf, n == 1 ? 1 : 8);
+                        k_ds_hnorm_rope<<<dim3(DS_NKVL, n), 128, 0, st>>>(k.ckf, k.L[l].kcn, DS_NKVL, k.ckf, k.L[l].kcn, 0, p0 + r0, DS_EPS);
+                        k_ds_store<<<(n * DS_KVL + 255) / 256, 256, 0, st>>>(k.ckf, k.cvf, k.ck[l], k.cv[l], p0 + r0, n);
+                    }
                 }
             }
             if (c == 1) ICHECK(hipEventRecord(k.ev, st));
