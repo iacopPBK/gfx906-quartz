@@ -9,13 +9,13 @@
 // draft's logits are the target head on hidden_i + hidden_out(latent), one 7-row head
 // GEMV plus fold . [latent; 1]. fold = head . [hidden_out | bias] is built at load, per
 // card, over its vocab half.
-// The layers split over the two cards as the target's do (ink2_ds_tp_slice). Card c owns
-// 12 q heads, 4 kv heads with their context K / V cache, and half the FFN. The attn_output
-// and ffn_down partials are exchanged and summed on both cards, card 0's first, so the
-// residual stays replicated.
+// The layers split over the cards as the target's do (ink2_ds_tp_slice). Card c owns
+// 1/NC of the q heads, of the kv heads with their context K / V cache, and of the FFN
+// (12, 4 and half at two cards). The attn_output and ffn_down partials are exchanged and
+// summed on every card in card order, so the residual stays replicated.
 // The Markov steps run as one device-side chain with no host round trip. Card 0's joint
-// kernel waits for the peer's argmax through peer memory flags, and card 1's fold waits for
-// card 0's lat1 the same way. Only the round's tokens come back.
+// kernel waits for every other card's argmax through peer memory flags, and each other
+// card's fold waits for card 0's lat1 the same way. Only the round's tokens come back.
 // Included after ink2_engine.h / ink2_pf.h (same TU).
 #include "core/link.h"           // qz_xcopy / qz_xdst: the partials and the feature planes
 
@@ -101,16 +101,22 @@ static __global__ __launch_bounds__(256) void k_ds_quant(const float * x, const 
         quant32(v, q + (size_t) blockIdx.x * K, qs + (size_t) blockIdx.x * (K / 32), i);
     }
 }
-// x += a + b, the two cards' partials with card 0's first on both cards, then the row's
-// int8 planes from RMSNorm(x) * w. One kernel does the residual add and the quantization.
-static __global__ __launch_bounds__(256) void k_ds_add_quant(float * x, const float * a, const float * b, const float * w, int K,
+// the cards' partials p[0 .. NC-1] of one exchange, and their sum in card order:
+// a + b at two cards, (p0 + p1) + (p2 + p3) at four, the same on every card
+struct ds_parts { const float * p[QZ_NC]; };
+__device__ __forceinline__ float ds_psum(const ds_parts & P, size_t o) {
+    if constexpr (QZ_NC == 2) return P.p[0][o] + P.p[1][o];
+    else return (P.p[0][o] + P.p[1][o]) + (P.p[2][o] + P.p[3][o]);
+}
+// x += the cards' partials, then the row's int8 planes from RMSNorm(x) * w. One kernel
+// does the residual add and the quantization.
+static __global__ __launch_bounds__(256) void k_ds_add_quant(float * x, ds_parts P, const float * w, int K,
                                                              unsigned char * q, float * qs, float eps) {
     __shared__ float red[16];
     float * xr = x + (size_t) blockIdx.x * K;
-    const float * ar = a + (size_t) blockIdx.x * K, * br = b + (size_t) blockIdx.x * K;
     float ss[1] = {0.f};
     for (int i = threadIdx.x; i < K; i += 256) {
-        const float v = xr[i] + (ar[i] + br[i]);
+        const float v = xr[i] + ds_psum(P, (size_t) blockIdx.x * K + i);
         xr[i] = v;
         ss[0] += v * v;
     }
@@ -392,9 +398,19 @@ static __global__ __launch_bounds__(256) void k_ds_embed(const char * ev, const 
     else for (int i = threadIdx.x; i < D; i += 256) x[(size_t) blockIdx.x * D + i] = mask[i];
 }
 __device__ __forceinline__ float ds_bf16(uint16_t b) { return __uint_as_float((unsigned int) b << 16); }
+// the largest of card 0's best and the other cards' pushes xbest[0 .. NC-2], as a token
+__device__ __forceinline__ int ds_best_tok(const unsigned long long * best, const unsigned long long * xbest) {
+    unsigned long long b = ((volatile const unsigned long long *) best)[0];
+    #pragma unroll
+    for (int k = 0; k < QZ_NC - 1; k++) {
+        const unsigned long long o = ((volatile const unsigned long long *) xbest)[k];
+        b = b > o ? b : o;
+    }
+    return (int) ~(unsigned int) (b & 0xffffffffu);
+}
 // joint = W [state | w1[prev] | hid | g] + b, one wave per output row. From step 2 on, prev
-// is the argmax both cards agreed on, read from best / xbest once the peer's flag arrives.
-// Every block reads it, so no extra launch.
+// is the argmax all cards agreed on, read from best / xbest once every other card's flag
+// fl[k] arrives. Every block reads it, so no extra launch.
 static __global__ __launch_bounds__(512) void k_ds_joint(const uint16_t * W, const float * bias, const float * state,
                                                          const uint16_t * w1, int step, int anc, const float * hid, const float * g,
                                                          float * joint, const unsigned long long * best,
@@ -404,10 +420,8 @@ static __global__ __launch_bounds__(512) void k_ds_joint(const uint16_t * W, con
     if (threadIdx.x == 0) {
         int prev = anc;
         if (step > 1) {
-            ds_wait(fl, seq, err);
-            const unsigned long long b0 = ((volatile unsigned long long *) best)[0];
-            const unsigned long long b1 = ((volatile unsigned long long *) xbest)[0];
-            prev = (int) ~(unsigned int) ((b0 > b1 ? b0 : b1) & 0xffffffffu);
+            for (int k = 0; k < QZ_NC - 1; k++) ds_wait(fl + k, seq, err);
+            prev = ds_best_tok(best, xbest);
         }
         if (blockIdx.x == 0 && step > 1) out[step - 2] = prev;
         sprev = prev;
@@ -425,24 +439,31 @@ static __global__ __launch_bounds__(512) void k_ds_joint(const uint16_t * W, con
     for (int off = 32; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 64);
     if (lane == 0) joint[r] = acc + bias[r];
 }
-// gate, cand, latent: state = cand + gate * (state - cand) and lat1 = [tanh latent | 1].
-static __global__ __launch_bounds__(256) void k_ds_markov(const float * joint, float * state, float * lat1,
-                                                         float * lat1_peer, unsigned long long * best, unsigned long long * xbest,
-                                                         unsigned int * fl, unsigned int seq) {
+// the other cards' lat1 rows and handshake flags, card j at slot j - 1
+struct ds_peers { float * lat1[QZ_NC - 1]; unsigned int * fl[QZ_NC - 1]; };
+// gate, cand, latent: state = cand + gate * (state - cand) and lat1 = [tanh latent | 1],
+// also stored into every other card's lat1, then their flags.
+static __global__ __launch_bounds__(256) void k_ds_markov(const float * joint, float * state, float * lat1, ds_peers P,
+                                                         unsigned long long * best, unsigned long long * xbest, unsigned int seq) {
     const int k = threadIdx.x;
-    if (k == 0) { ((volatile unsigned long long *) best)[0] = 0; ((volatile unsigned long long *) xbest)[0] = 0; }
+    if (k == 0) {
+        ((volatile unsigned long long *) best)[0] = 0;
+        for (int j = 0; j < QZ_NC - 1; j++) ((volatile unsigned long long *) xbest)[j] = 0;
+    }
     const float gate = 1.f / (1.f + expf(-joint[k])), cand = tanhf(joint[DS_R + k]);
     state[k] = cand + gate * (state[k] - cand);
     const float l = tanhf(joint[2 * DS_R + k]);
     lat1[k] = l;
     if (k == 0) lat1[DS_R] = 1.f;
-    if (lat1_peer) {
-        volatile float * p = (volatile float *) lat1_peer;
+    #pragma unroll
+    for (int j = 0; j < QZ_NC - 1; j++) {
+        volatile float * p = (volatile float *) P.lat1[j];
         p[k] = l;
         if (k == 0) p[DS_R] = 1.f;
-        __syncthreads();
-        if (k == 0) ds_flag(fl, seq);
     }
+    __syncthreads();
+    if (k == 0)
+        for (int j = 0; j < QZ_NC - 1; j++) ds_flag(P.fl[j], seq);
 }
 // ---- sampled drafts: an exact draw from q = softmax(s * invTq) by Gumbel-max. z = s * invTq
 // + G with G = -log(-log(u)), u in (0, 1) from a counter-based hash of the request's seed,
@@ -577,7 +598,7 @@ static __global__ __launch_bounds__(64) void k_ds_qids(const float * base, int N
     for (int off = 32; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 64);
     if (threadIdx.x == 0) out[(size_t) r * gridDim.x + blockIdx.x] = base[(size_t) r * N + v] + acc;
 }
-// card 1: hand this step's argmax to card 0 by a peer store and a flag, then free the slot
+// card j >= 1: hand this step's argmax to its slot on card 0 by a peer store and a flag, then free it
 static __global__ __launch_bounds__(64) void k_ds_best_push(unsigned long long * best, unsigned long long * xbest_peer,
                                                             unsigned int * fl_peer, unsigned int seq) {
     if (threadIdx.x != 0) return;
@@ -585,28 +606,25 @@ static __global__ __launch_bounds__(64) void k_ds_best_push(unsigned long long *
     ds_flag(fl_peer, seq);
     *best = 0;
 }
-// the chain's last token, the argmax of its last step, once the peer's push has landed
+// the chain's last token, the argmax of its last step, once every other card's push has landed
 static __global__ __launch_bounds__(64) void k_ds_last(const unsigned long long * best, const unsigned long long * xbest,
                                                        unsigned int * fl, unsigned int seq, int * err, int * out, int slot) {
     if (threadIdx.x != 0) return;
-    ds_wait(fl, seq, err);
-    const unsigned long long b0 = ((volatile const unsigned long long *) best)[0];
-    const unsigned long long b1 = ((volatile const unsigned long long *) xbest)[0];
-    out[slot] = (int) ~(unsigned int) ((b0 > b1 ? b0 : b1) & 0xffffffffu);
+    for (int k = 0; k < QZ_NC - 1; k++) ds_wait(fl + k, seq, err);
+    out[slot] = ds_best_tok(best, xbest);
 }
 static __global__ void k_ds_tohalf(const float * y, __half * o, int n, int stride) {
     const int r = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c < n) o[(size_t) r * stride + c] = __float2half(y[(size_t) r * n + c]);
 }
-// hidden rows 1 .. 7: X += a + b as in k_ds_add_quant, then the Markov input, f32 and int8
-static __global__ __launch_bounds__(256) void k_ds_hidden(float * x, const float * a, const float * b, const float * w, int K,
+// hidden rows 1 .. 7: X += the partials as in k_ds_add_quant, then the Markov input, f32 and int8
+static __global__ __launch_bounds__(256) void k_ds_hidden(float * x, ds_parts P, const float * w, int K,
                                                           unsigned char * q, float * qs, float * hf, float eps) {
     __shared__ float red[16];
     float * xr = x + (size_t) (blockIdx.x + 1) * K;
-    const float * ar = a + (size_t) (blockIdx.x + 1) * K, * br = b + (size_t) (blockIdx.x + 1) * K;
     float ss[1] = {0.f};
     for (int i = threadIdx.x; i < K; i += 256) {
-        const float v = xr[i] + (ar[i] + br[i]);
+        const float v = xr[i] + ds_psum(P, (size_t) (blockIdx.x + 1) * K + i);
         xr[i] = v;
         ss[0] += v * v;
     }
@@ -637,7 +655,8 @@ struct ink2_dspark {
         __half * ck[DS_NL] = {}, * cv[DS_NL] = {};   // [ctx][DS_KVL]
         unsigned char * fq = nullptr; float * fs = nullptr;   // context fill: the 3 layers' mixed rows, int8 [3][m][D]
         float * ckf = nullptr, * cvf = nullptr;      // context fill: k / v [8][DS_KVL]
-        float * X = nullptr, * Y = nullptr, * Yp[2] = {};   // residual [8][D], this card's partial, the peer's (2 slots)
+        float * X = nullptr, * Y = nullptr;          // residual [8][D], this card's partial
+        float * Yp[2][QZ_NC - 1] = {};               // the others' partials: parity, slot k - 1 from card (c + k) % NC
         float * Q = nullptr, * Kb = nullptr, * Vb = nullptr, * O = nullptr, * G = nullptr, * U = nullptr;
         float * hid = nullptr, * part = nullptr;
         unsigned char * aq = nullptr; float * as = nullptr;
@@ -660,8 +679,9 @@ struct ink2_dspark {
     __half * fold[QZ_NC] = {};
     int nhp[QZ_NC] = {};
     unsigned long long * best[QZ_NC] = {};         // this card's fold target (local, zeroed per step)
-    unsigned long long * xbest[QZ_NC] = {};        // the peer's argmax pushed here (uncached)
-    unsigned int * fl[QZ_NC] = {};                 // the peer's handshake flag (uncached)
+    unsigned long long * xbest[QZ_NC] = {};        // card 0: card j's argmax pushed into slot j - 1 (uncached)
+    unsigned int * fl[QZ_NC] = {};                 // the handshake flags, written by the other side (uncached):
+                                                   // card 0 [NC - 1], slot j - 1 by card j; card j >= 1 one, by card 0
     int * out_d = nullptr, * out_h = nullptr;  // the 7 tokens (card 0's)
     // ds_wait's timeout word, one per card: a wait reads and CASes it, so it must be in the
     // waiting card's own memory. In p2p a single card-0 word served both cards, which host
@@ -715,7 +735,7 @@ struct ink2_dspark {
             {
                 qz_mem_scope mem("dspark weights");
                 k.ld.slice = ink2_ds_tp_slice;
-                if (c == 1) k.ld.skip = chain_only;
+                if (c != 0) k.ld.skip = chain_only;
                 if (!k.ld.load(path, g_, qz_dev_of(c), c)) { fprintf(stderr, "dspark: card %d load failed\n", c); return false; }
             }
             for (int l = 0; l < DS_NL; l++) {
@@ -761,7 +781,8 @@ struct ink2_dspark {
             for (int l = 0; l < DS_NL; l++) { al(&k.ck[l], (size_t) ctx * DS_KVL); al(&k.cv[l], (size_t) ctx * DS_KVL); }
             al(&k.fq, (size_t) DS_NL * PF_M * D); al(&k.fs, (size_t) DS_NL * PF_M * D / 32);
             al(&k.ckf, 8 * DS_KVL); al(&k.cvf, 8 * DS_KVL);
-            al(&k.X, DS_BS * D); al(&k.Y, DS_BS * D); al(&k.Yp[0], DS_BS * D); al(&k.Yp[1], DS_BS * D);
+            al(&k.X, DS_BS * D); al(&k.Y, DS_BS * D);
+            for (int j = 0; j < QZ_NC - 1; j++) { al(&k.Yp[0][j], DS_BS * D); al(&k.Yp[1][j], DS_BS * D); }
             al(&k.Q, DS_BS * DS_QL); al(&k.Kb, DS_BS * DS_KVL); al(&k.Vb, DS_BS * DS_KVL);
             al(&k.O, DS_BS * DS_QL); al(&k.G, DS_BS * DS_FFL); al(&k.U, DS_BS * DS_FFL); al(&k.hid, DS_BS * D);
             al(&k.part, (size_t) DS_NKVL * DS_NSPL * DS_NQV * DS_PW);
@@ -778,8 +799,8 @@ struct ink2_dspark {
             al(&fold[c], (size_t) (DS_R + 1) * nhp[c]);
             ICHECK(qz_dmalloc((void **) &best[c], 8, "dspark"));      // this card's fold target only
             ICHECK(hipMemset(best[c], 0, 8));
-            ICHECK(qz_xalloc((void **) &xbest[c], 8, c, "dspark"));
-            ICHECK(qz_xalloc((void **) &fl[c], 4, c, "dspark"));
+            ICHECK(qz_xalloc((void **) &xbest[c], 8 * (QZ_NC - 1), c, "dspark"));
+            ICHECK(qz_xalloc((void **) &fl[c], 4 * (c == 0 ? QZ_NC - 1 : 1), c, "dspark"));
             al(&errd[c], 1);
             ICHECK(hipMemset(errd[c], 0, sizeof(int)));
             al(&lses[c], (size_t) DS_BS * DS_LSEB * 2);
@@ -823,11 +844,11 @@ struct ink2_dspark {
             else k_ds_gemv_wide<1><<<nb, 256, 0, st>>>(q, s, W.K, W.v, W.s, W.N, y);
         }
     }
-    // run fn(c, card, stream) on card 0, then card 1, each with its device current
+    // run fn(c, card, stream) on each card in order, its device current
     template <class F> void each(F && fn) {
         for (int c = 0; c < QZ_NC; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); fn(c, K[c], E->C[c].st); }
     }
-    // copy Y into the peer's Yp slot and return the slot. The caller sums Y and Yp.
+    // copy Y into every other card's Yp slot and return the parity. The caller sums parts().
     // qz_xdst: the consumer (the add on the peer's stream, below) is already ordered by the
     // ev handshake at the end of this function, so p2p keeps the single peer copy on this
     // card's stream and adds no event; host mode queues its H2D on the peer's stream, where
@@ -836,39 +857,52 @@ struct ink2_dspark {
         const int s = xk;
         xk ^= 1;
         each([&](int c, card & k, hipStream_t st) {
-            ICHECK(qz_xcopy(K[1 - c].Yp[s], 1 - c, qz_xdst(E->C[1 - c].st), k.Y, c, st, (size_t) DS_BS * D * 4));
+            for (int j = 1; j < QZ_NC; j++) {
+                const int p = (c + j) % QZ_NC;
+                ICHECK(qz_xcopy(K[p].Yp[s][QZ_NC - 1 - j], p, qz_xdst(E->C[p].st), k.Y, c, st, (size_t) DS_BS * D * 4));
+            }
             ICHECK(hipEventRecord(k.ev, st));
         });
-        each([&](int c, card &, hipStream_t st) { ICHECK(hipStreamWaitEvent(st, K[1 - c].ev, 0)); });
+        each([&](int c, card &, hipStream_t st) {
+            for (int j = 1; j < QZ_NC; j++) ICHECK(hipStreamWaitEvent(st, K[(c + j) % QZ_NC].ev, 0));
+        });
         return s;
     }
-    // card 0's partial first on both cards
-    const float * pa(int c, int s) const { return c == 0 ? K[0].Y : K[1].Yp[s]; }
-    const float * pb(int c, int s) const { return c == 0 ? K[0].Yp[s] : K[1].Y; }
+    // card c's view of the partials of parity s, in card order
+    ds_parts parts(int c, int s) const {
+        ds_parts P;
+        for (int j = 0; j < QZ_NC; j++) {
+            const int k = (j - c + QZ_NC) % QZ_NC;
+            P.p[j] = k ? K[c].Yp[s][k - 1] : K[c].Y;
+        }
+        return P;
+    }
 
     // fill context rows p0 .. p0 + m - 1 from their features, which sit on card 0 at row
     // stride tstride floats. g takes the last row. Card 0 mixes and quantizes the rows for
-    // the 3 layers and hands the int8 planes to card 1; each card fills its own kv heads.
+    // the 3 layers and hands the int8 planes to the other cards; each card fills its own kv heads.
     void fill(const float * taps, size_t tstride, int p0, int m) {
         if (m > PF_M) { fprintf(stderr, "dspark: fill of %d rows (max %d)\n", m, PF_M); exit(1); }
         {
             ICHECK(hipSetDevice(qz_dev_of(0)));
             hipStream_t st = E->C[0].st;
             card & k = K[0];
-            ICHECK(hipStreamWaitEvent(st, K[1].ev, 0));   // card 1 is done with the last fill's planes
+            for (int c = 1; c < QZ_NC; c++) ICHECK(hipStreamWaitEvent(st, K[c].ev, 0));   // done with the last fill's planes
             for (int l = 0; l < DS_NL; l++)
                 k_ds_mixq<<<m, 256, 0, st>>>(taps, tstride, alpha[l], k.L[l].dn, k.fq + (size_t) l * m * D, k.fs + (size_t) l * m * (D / 32), DS_EPS);
             k_ds_mixnorm<<<1, 256, 0, st>>>(taps + (size_t) (m - 1) * tstride, tstride, alpha[DS_NL], dsn, g, D, DS_EPS);
-            // qz_xdst: card 1's gemvs below are ordered by the k.ev handoff that follows, so
-            // p2p stays the two peer copies on card 0's stream; host mode puts the H2Ds on
-            // card 1's stream, ahead of those gemvs and after the last fill's readers of the
+            // qz_xdst: card c's gemvs below are ordered by the k.ev handoff that follows, so
+            // p2p stays the peer copies on card 0's stream; host mode puts the H2Ds on card
+            // c's stream, ahead of those gemvs and after the last fill's readers of the
             // planes, which are on that stream too.
-            ICHECK(qz_xcopy(K[1].fq, 1, qz_xdst(E->C[1].st), k.fq, 0, st, (size_t) DS_NL * m * D));
-            ICHECK(qz_xcopy(K[1].fs, 1, qz_xdst(E->C[1].st), k.fs, 0, st, (size_t) DS_NL * m * (D / 32) * 4));
+            for (int c = 1; c < QZ_NC; c++) {
+                ICHECK(qz_xcopy(K[c].fq, c, qz_xdst(E->C[c].st), k.fq, 0, st, (size_t) DS_NL * m * D));
+                ICHECK(qz_xcopy(K[c].fs, c, qz_xdst(E->C[c].st), k.fs, 0, st, (size_t) DS_NL * m * (D / 32) * 4));
+            }
             ICHECK(hipEventRecord(k.ev, st));
         }
         each([&](int c, card & k, hipStream_t st) {
-            if (c == 1) ICHECK(hipStreamWaitEvent(st, K[0].ev, 0));
+            if (c != 0) ICHECK(hipStreamWaitEvent(st, K[0].ev, 0));
             for (int r0 = 0; r0 < m; r0 += 8) {
                 const int n = std::min(8, m - r0);
                 for (int l = 0; l < DS_NL; l++) {
@@ -880,7 +914,7 @@ struct ink2_dspark {
                     k_ds_store<<<(n * DS_KVL + 255) / 256, 256, 0, st>>>(k.ckf, k.cvf, k.ck[l], k.cv[l], p0 + r0, n);
                 }
             }
-            if (c == 1) ICHECK(hipEventRecord(k.ev, st));
+            if (c != 0) ICHECK(hipEventRecord(k.ev, st));
         });
         ICHECK(hipSetDevice(qz_dev_of(0)));
     }
@@ -913,7 +947,7 @@ struct ink2_dspark {
             int s = exchange();
             each([&](int c, card & k, hipStream_t st) {
                 const layer & y = k.L[l];
-                k_ds_add_quant<<<DS_BS, 256, 0, st>>>(k.X, pa(c, s), pb(c, s), y.fn, D, k.aq, k.as, DS_EPS);
+                k_ds_add_quant<<<DS_BS, 256, 0, st>>>(k.X, parts(c, s), y.fn, D, k.aq, k.as, DS_EPS);
                 gemv(st, k.aq, k.as, y.gate, k.G, 8); gemv(st, k.aq, k.as, y.up, k.U, 8);
                 k_ds_swiglu_quant<<<dim3(DS_FFL / 256, DS_BS), 256, 0, st>>>(k.G, k.U, DS_FFL, k.aq, k.as);
                 gemv(st, k.aq, k.as, y.down, k.Y, 8);
@@ -923,9 +957,9 @@ struct ink2_dspark {
             // next layer's attention norm. After the last layer it takes hidden rows 1 .. 7
             // instead: f32 into hid for card 0's Markov input, int8 for the base logits.
             each([&](int c, card & k, hipStream_t st) {
-                if (l + 1 < DS_NL) k_ds_add_quant<<<DS_BS, 256, 0, st>>>(k.X, pa(c, s), pb(c, s), k.L[l + 1].an, D, k.aq, k.as, DS_EPS);
+                if (l + 1 < DS_NL) k_ds_add_quant<<<DS_BS, 256, 0, st>>>(k.X, parts(c, s), k.L[l + 1].an, D, k.aq, k.as, DS_EPS);
                 else {
-                    k_ds_hidden<<<DS_BS - 1, 256, 0, st>>>(k.X, pa(c, s), pb(c, s), k.onorm, D, hq[c], hs[c], k.hid, DS_EPS);
+                    k_ds_hidden<<<DS_BS - 1, 256, 0, st>>>(k.X, parts(c, s), k.onorm, D, hq[c], hs[c], k.hid, DS_EPS);
                     gemv(st, hq[c], hs[c], E->C[c].head, base[c], 7);
                 }
             });
@@ -934,44 +968,40 @@ struct ink2_dspark {
         hipStream_t st = E->C[0].st;
         const float * hid = K[0].hid;
         ICHECK(hipMemsetAsync(state, 0, DS_R * 4, st));
-        // the nd Markov steps, each chained to the peer through lat1 and the argmax push.
-        // With sa the packed value is the Gumbel-max's z, so the drafts are drawn from q.
-        // The handshake's sequence number only ever counts up, so a shorter round leaves
-        // both cards' flags consistent.
-        const int nb[2] = { (E->C[0].nvalid + 256 * DS_FE - 1) / (256 * DS_FE),
-                            (E->C[1].nvalid + 256 * DS_FE - 1) / (256 * DS_FE) };
+        // the nd Markov steps, each chained to the other cards through lat1 and the argmax
+        // pushes. With sa the packed value is the Gumbel-max's z, so the drafts are drawn
+        // from q. The handshake's sequence number only ever counts up, so a shorter round
+        // leaves every card's flags consistent.
+        int nb[QZ_NC];
+        for (int c = 0; c < QZ_NC; c++) nb[c] = (E->C[c].nvalid + 256 * DS_FE - 1) / (256 * DS_FE);
         for (int i = 1; i <= nd; i++) {
             const unsigned int sq = ++seq;
             const int r = i - 1;
-            dsamp s0 = { 0.f, 0, 0, nullptr, 0.f }, s1 = { 0.f, 0, 0, nullptr, 0.f };
-            if (sa) {
-                s0 = { sa->invTq, sa->seed, sa->rnd, lses[0] + (size_t) r * DS_LSEB * 2, sa->cap };
-                s1 = { sa->invTq, sa->seed, sa->rnd, lses[1] + (size_t) r * DS_LSEB * 2, sa->cap };
-            }
+            dsamp sc[QZ_NC];
+            for (int c = 0; c < QZ_NC; c++)
+                sc[c] = sa ? dsamp{ sa->invTq, sa->seed, sa->rnd, lses[c] + (size_t) r * DS_LSEB * 2, sa->cap }
+                           : dsamp{ 0.f, 0, 0, nullptr, 0.f };
             k_ds_joint<<<3 * DS_R / 8, 512, 0, st>>>(jw, jb, state, w1, i, tok, hid + (size_t) r * D, g, joint, best[0], xbest[0],
                                                      fl[0], sq - 1, errd[0], out_d);
-            k_ds_markov<<<1, 256, 0, st>>>(joint, state, lat1[0] + (size_t) r * (DS_R + 1), lat1[1] + (size_t) r * (DS_R + 1),
-                                           best[0], xbest[0], fl[1], sq);
-            const float * L0 = lat1[0] + (size_t) r * (DS_R + 1), * L1 = lat1[1] + (size_t) r * (DS_R + 1);
-            const float * B0 = base[0] + (size_t) r * E->C[0].head.N, * B1 = base[1] + (size_t) r * E->C[1].head.N;
-            if (sa)
-                k_ds_fold_argmax<false, true><<<nb[0], 256, 0, st>>>(B0, fold[0], nhp[0], E->C[0].nvalid, L0,
-                                                                     E->C[0].id0, best[0], fl[0], sq, errd[0], s0, (unsigned int) r);
-            else
-                k_ds_fold_argmax<false, false><<<nb[0], 256, 0, st>>>(B0, fold[0], nhp[0], E->C[0].nvalid, L0,
-                                                                      E->C[0].id0, best[0], fl[0], sq, errd[0], s0, 0u);
-            ICHECK(hipSetDevice(qz_dev_of(1)));
-            hipStream_t s1s = E->C[1].st;
-            if (sa)
-                k_ds_fold_argmax<true, true><<<nb[1], 256, 0, s1s>>>(B1, fold[1], nhp[1], E->C[1].nvalid, L1,
-                                                                     E->C[1].id0, best[1], fl[1], sq, errd[1], s1, (unsigned int) r);
-            else
-                k_ds_fold_argmax<true, false><<<nb[1], 256, 0, s1s>>>(B1, fold[1], nhp[1], E->C[1].nvalid, L1,
-                                                                      E->C[1].id0, best[1], fl[1], sq, errd[1], s1, 0u);
-            k_ds_best_push<<<1, 64, 0, s1s>>>(best[1], xbest[0], fl[0], sq);
+            ds_peers P;
+            for (int j = 1; j < QZ_NC; j++) { P.lat1[j - 1] = lat1[j] + (size_t) r * (DS_R + 1); P.fl[j - 1] = fl[j]; }
+            k_ds_markov<<<1, 256, 0, st>>>(joint, state, lat1[0] + (size_t) r * (DS_R + 1), P, best[0], xbest[0], sq);
+            for (int c = 0; c < QZ_NC; c++) {
+                const ink2_card & T = E->C[c];
+                const float * Lc = lat1[c] + (size_t) r * (DS_R + 1), * Bc = base[c] + (size_t) r * T.head.N;
+                hipStream_t sc_st = T.st;
+                if (c) ICHECK(hipSetDevice(qz_dev_of(c)));
+                const unsigned int grow = sa ? (unsigned int) r : 0u;
+                // card 0 folds at once; the others wait for card 0's lat1 (WT)
+                if (c == 0 && sa) k_ds_fold_argmax<false, true><<<nb[c], 256, 0, sc_st>>>(Bc, fold[c], nhp[c], T.nvalid, Lc, T.id0, best[c], fl[c], sq, errd[c], sc[c], grow);
+                else if (c == 0) k_ds_fold_argmax<false, false><<<nb[c], 256, 0, sc_st>>>(Bc, fold[c], nhp[c], T.nvalid, Lc, T.id0, best[c], fl[c], sq, errd[c], sc[c], grow);
+                else if (sa) k_ds_fold_argmax<true, true><<<nb[c], 256, 0, sc_st>>>(Bc, fold[c], nhp[c], T.nvalid, Lc, T.id0, best[c], fl[c], sq, errd[c], sc[c], grow);
+                else k_ds_fold_argmax<true, false><<<nb[c], 256, 0, sc_st>>>(Bc, fold[c], nhp[c], T.nvalid, Lc, T.id0, best[c], fl[c], sq, errd[c], sc[c], grow);
+                if (c) k_ds_best_push<<<1, 64, 0, sc_st>>>(best[c], xbest[0] + (c - 1), fl[0] + (c - 1), sq);
+            }
             ICHECK(hipSetDevice(qz_dev_of(0)));
         }
-        if (sa) {   // each card's per-row (max, sum) of the halves, merged before the host
+        if (sa) {   // each card's per-row (max, sum) of its share, merged before the host
             for (int c = 0; c < QZ_NC; c++) {
                 ICHECK(hipSetDevice(qz_dev_of(c)));
                 k_ds_lse_merge<<<DS_BS - 1, 64, 0, E->C[c].st>>>(lses[c], nb[c], lsem[c]);
@@ -1009,11 +1039,18 @@ struct ink2_dspark {
         for (int c = 0; c < QZ_NC; c++) { ICHECK(hipSetDevice(qz_dev_of(c))); ICHECK(hipStreamSynchronize(E->C[c].st)); }
         ICHECK(hipSetDevice(qz_dev_of(0)));
         for (int r = 0; r < DS_BS - 1; r++)            // an id's logit sits on the card that owns it
-            for (int j = 0; j < DS_QID; j++)
-                lg[r * DS_QID + j] = qs_h[ids[r * DS_QID + j] < E->C[1].id0 ? 0 : 1][r * DS_QID + j];
-        for (int r = 0; r < DS_BS - 1; r++) {          // logaddexp of the two cards' halves
-            const float m = fmaxf(lseh[0][2 * r], lseh[1][2 * r]);
-            lse[r] = m + logf(lseh[0][2 * r + 1] * expf(lseh[0][2 * r] - m) + lseh[1][2 * r + 1] * expf(lseh[1][2 * r] - m));
+            for (int j = 0; j < DS_QID; j++) {
+                const int id = ids[r * DS_QID + j];
+                int o = 0;
+                for (int c = 1; c < QZ_NC; c++) if (id >= E->C[c].id0) o = c;
+                lg[r * DS_QID + j] = qs_h[o][r * DS_QID + j];
+            }
+        for (int r = 0; r < DS_BS - 1; r++) {          // logaddexp of the cards' shares, in card order
+            float m = lseh[0][2 * r];
+            for (int c = 1; c < QZ_NC; c++) m = fmaxf(m, lseh[c][2 * r]);
+            float t = lseh[0][2 * r + 1] * expf(lseh[0][2 * r] - m);
+            for (int c = 1; c < QZ_NC; c++) t += lseh[c][2 * r + 1] * expf(lseh[c][2 * r] - m);
+            lse[r] = m + logf(t);
         }
     }
 };
