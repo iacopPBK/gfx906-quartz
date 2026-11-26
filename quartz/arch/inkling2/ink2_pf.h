@@ -312,64 +312,75 @@ static __global__ __launch_bounds__(256) void k_pf_normq(pfnq A, float eps) {
     }
 }
 
-// Head post, one chunk row per blockIdx.y. Local heads: the Q and R clips, tau and the
-// clipped R for the attention bias. Kv heads: the K or V conv along rows, then clip or norm.
+// Head post, HP_R chunk rows per blockIdx.y. Local heads: the Q and R clips, tau and the
+// clipped R for the attention bias. Kv heads: the K or V conv walked along rows so each
+// input is read once, then clip or norm.
+constexpr int HP_R = 16;
 struct pfhp {
     const float * qr, * rr, * kr, * vr, * dk, * dv;          // [M][QL/HL../KVL/16]
     const float * qclip, * rclip, * kconv, * vconv;
     float * hist, * q;                                        // slot hist, [M][QL]
     float * rvo;                                              // [M][HQL][DREL] clipped R
     __half * kc, * vc;
-    int pos0, full;
+    int pos0, m, full;
     float tau_a; int tau_f;
     float qk_clip, rel_clip, eps;
 };
 static __global__ __launch_bounds__(128) void k_pf_head_post(pfhp a) {
-    __shared__ float rv[DREL];
     __shared__ float red[2];
-    const int b = blockIdx.x, row = blockIdx.y, t = threadIdx.x, pos = a.pos0 + row;
+    const int b = blockIdx.x, r0 = blockIdx.y * HP_R, r1 = min(r0 + HP_R, a.m), t = threadIdx.x;
     if (b < HQL) {
         const int h = b, i = h * HD + t;
-        const float tau = a.full ? 1.f + a.tau_a * logf(fmaxf(1.f, (float) (pos + 1) / (float) a.tau_f)) : 1.f;
-        float x = a.qr[(size_t) row * QL + i] * a.qclip[i];
-        float n2[1] = {x * x};
-        bsum<1>(n2, red);
-        const float nr = sqrtf(n2[0]) + 1e-6f;
-        x *= fminf(fmaxf(a.qk_clip / nr, 0.f), 1.f);
-        a.q[(size_t) row * QL + i] = x * tau;
-        float r = t < DREL ? a.rr[(size_t) row * (HQL * DREL) + h * DREL + t] * a.rclip[h * DREL + t] : 0.f;
-        float r2[1] = {r * r};
-        bsum<1>(r2, red);
-        const float rn = sqrtf(r2[0]) + 1e-6f;
-        if (t < DREL) rv[t] = r * fminf(fmaxf(a.rel_clip / rn, 0.f), 1.f) * tau;
-        if (t < DREL) a.rvo[((size_t) row * HQL + h) * DREL + t] = rv[t];
+        const float qc = a.qclip[i];
+        const float rc = t < DREL ? a.rclip[h * DREL + t] : 0.f;
+        for (int row = r0; row < r1; row++) {
+            const int pos = a.pos0 + row;
+            const float tau = a.full ? 1.f + a.tau_a * logf(fmaxf(1.f, (float) (pos + 1) / (float) a.tau_f)) : 1.f;
+            float x = a.qr[(size_t) row * QL + i] * qc;
+            float n2[1] = {x * x};
+            bsum<1>(n2, red);
+            const float nr = sqrtf(n2[0]) + 1e-6f;
+            x *= fminf(fmaxf(a.qk_clip / nr, 0.f), 1.f);
+            a.q[(size_t) row * QL + i] = x * tau;
+            float r = t < DREL ? a.rr[(size_t) row * (HQL * DREL) + h * DREL + t] * rc : 0.f;
+            float r2[1] = {r * r};
+            bsum<1>(r2, red);
+            const float rn = sqrtf(r2[0]) + 1e-6f;
+            if (t < DREL) a.rvo[((size_t) row * HQL + h) * DREL + t] = r * fminf(fmaxf(a.rel_clip / rn, 0.f), 1.f) * tau;
+        }
         return;
     }
     const bool isk = b < HQL + HKVL;
     const int hk = isk ? b - HQL : b - HQL - HKVL, ch = hk * HD + t;
-    const float * rb = isk ? a.kr : a.vr;                     // [M][KVL]
-    const float * hb = a.hist + (isk ? H_K : H_V) + ch;
-    const float u = rb[(size_t) row * KVL + ch];
-    const float v1 = row >= 1 ? rb[(size_t)(row - 1) * KVL + ch] : hb[(size_t)(row + 2) * CHL];
-    const float v2 = row >= 2 ? rb[(size_t)(row - 2) * KVL + ch] : hb[(size_t)(row + 1) * CHL];
-    const float v3 = row >= 3 ? rb[(size_t)(row - 3) * KVL + ch] : hb[(size_t) row * CHL];
-    const float * w = (isk ? a.kconv : a.vconv) + (size_t) ch * NCONV;
-    float o = w[0] * v3 + w[1] * v2 + w[2] * v1 + w[3] * u;
-    if (a.dk) {
-        const float * tp = (isk ? a.dk : a.dv) + (size_t) row * (HKVL * NCONV) + hk * NCONV;
-        o += u * tp[0] + v1 * tp[1] + v2 * tp[2] + v3 * tp[3];
-    }
-    float y = (u + o) * (a.dk ? 1.f / sqrtf(2.f * NCONV + 1.f) : 1.f / sqrtf((float) NCONV + 1.f));
-    float n2[1] = {y * y};
-    bsum<1>(n2, red);
-    const int rrow = a.full ? pos : pos % PF_RING;
-    if (isk) {
-        const float nr = sqrtf(n2[0]) + 1e-6f;
-        y *= fminf(fmaxf(a.qk_clip / nr, 0.f), 1.f);
-        a.kc[(size_t) rrow * KVL + ch] = __float2half(y);
-    } else {
-        y *= rsqrtf(n2[0] / HD + a.eps);
-        a.vc[(size_t) rrow * KVL + ch] = __float2half(y);
+    const float * __restrict__ rb = isk ? a.kr : a.vr;        // [M][KVL]
+    const float * __restrict__ hb = a.hist + (isk ? H_K : H_V) + ch;
+    const float4 w = *(const float4 *) ((isk ? a.kconv : a.vconv) + (size_t) ch * NCONV);
+    const float sc = a.dk ? 1.f / sqrtf(2.f * NCONV + 1.f) : 1.f / sqrtf((float) NCONV + 1.f);
+    auto in = [&](int r) {
+        return r >= 0 ? rb[(size_t) r * KVL + ch] : hb[(size_t)(r + 3) * CHL];
+    };
+    float v3 = in(r0 - 3), v2 = in(r0 - 2), v1 = in(r0 - 1);
+    for (int row = r0; row < r1; row++) {
+        const float u = rb[(size_t) row * KVL + ch];
+        float o = w.x * v3 + w.y * v2 + w.z * v1 + w.w * u;
+        if (a.dk) {
+            const float * tp = (isk ? a.dk : a.dv) + (size_t) row * (HKVL * NCONV) + hk * NCONV;
+            o += u * tp[0] + v1 * tp[1] + v2 * tp[2] + v3 * tp[3];
+        }
+        float y = (u + o) * sc;
+        float n2[1] = {y * y};
+        bsum<1>(n2, red);
+        const int pos = a.pos0 + row;
+        const int rrow = a.full ? pos : pos % PF_RING;
+        if (isk) {
+            const float nr = sqrtf(n2[0]) + 1e-6f;
+            y *= fminf(fmaxf(a.qk_clip / nr, 0.f), 1.f);
+            a.kc[(size_t) rrow * KVL + ch] = __float2half(y);
+        } else {
+            y *= rsqrtf(n2[0] / HD + a.eps);
+            a.vc[(size_t) rrow * KVL + ch] = __float2half(y);
+        }
+        v3 = v2; v2 = v1; v1 = u;
     }
 }
 
@@ -384,12 +395,25 @@ struct pfat {
 };
 
 // Tiled flash attention, one block per (row tile, q head) and 64-wide key tiles.
-// S = Q.K^T uses packed f16 dots, 4 rows x 4 keys per thread. The online softmax runs
-// per row with the bias R . relb - sink, the causal and window masks and the zero sink
-// logit. O += P.V in f32. Row statistics stay in registers because the 16 lanes of a
-// row group own the same rows in both phases.
+// S = Q.K^T uses packed f16 dots with hi+lo Q, RPT rows x 4 keys per thread. Online
+// softmax uses 16-lane DPP reductions; O += P.V in f32. Reverse blockIdx.x schedules
+// long causal tiles first.
 constexpr int FA_K = 64, FA_QS = HD + 8;                // key tile, Q / K / V LDS row stride in halves
 typedef __fp16 fa_h2 __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ float fa_sum16(float x) {
+    x += qz_dpp<0x128>(x);
+    x += qz_dpp<0x124>(x);
+    x += qz_dpp<0x4E>(x);
+    x += qz_dpp<0xB1>(x);
+    return x;
+}
+__device__ __forceinline__ float fa_max16(float x) {
+    x = qz_dpp_fmax<0x128>(x);
+    x = qz_dpp_fmax<0x124>(x);
+    x = qz_dpp_fmax<0x4E>(x);
+    x = qz_dpp_fmax<0xB1>(x);
+    return x;
+}
 // RPT rows per thread, so a tile holds 16 * RPT rows. QLO splits Q into an f16 hi and lo.
 template <int RPT, bool QLO, int FA_R = 32>
 static __global__ __launch_bounds__(16 * FA_R / RPT) void k_pf_fattn(pfat a, int m) {
@@ -399,7 +423,7 @@ static __global__ __launch_bounds__(16 * FA_R / RPT) void k_pf_fattn(pfat a, int
     __shared__ float sP[FA_R][FA_K + 4];
     __shared__ float sB[FA_R + FA_K - 1][DREL + 1];          // bias basis rows of this tile's distances
     const int t = threadIdx.x, rg = t >> 4, cg = t & 15;
-    const int h = blockIdx.y, kvh = h / (HQ / HKV), r0 = blockIdx.x * FA_R;
+    const int h = blockIdx.y, kvh = h / (HQ / HKV), r0 = (gridDim.x - 1 - blockIdx.x) * FA_R;
     const int rows = min(FA_R, m - r0);
     const float scale = 1.f / sqrtf((float) HD);
     for (int e = t; e < FA_R * HD / 4; e += NTH) {
@@ -516,8 +540,7 @@ static __global__ __launch_bounds__(16 * FA_R / RPT) void k_pf_fattn(pfat a, int
                     tm = fmaxf(tm, s);
                 }
             }
-            #pragma unroll
-            for (int off = 8; off > 0; off >>= 1) tm = fmaxf(tm, __shfl_xor(tm, off, 16));
+            tm = fa_max16(tm);
             const float mn = fmaxf(mx[i], tm);
             const float cr = mn == -INFINITY ? 1.f : expf(mx[i] - mn);
             float ps = 0.f;
@@ -527,12 +550,13 @@ static __global__ __launch_bounds__(16 * FA_R / RPT) void k_pf_fattn(pfat a, int
                 sP[rg * RPT + i][cg + 16 * c] = p;
                 ps += p;
             }
-            #pragma unroll
-            for (int off = 8; off > 0; off >>= 1) ps += __shfl_xor(ps, off, 16);
+            ps = fa_sum16(ps);
             l[i] = l[i] * cr + ps;
             mx[i] = mn;
-            #pragma unroll
-            for (int d = 0; d < 8; d++) o[i][d] *= cr;
+            if (cr < 1.f) {
+                #pragma unroll
+                for (int d = 0; d < 8; d++) o[i][d] *= cr;
+            }
         }
         __syncthreads();
         st(vr);
@@ -1328,10 +1352,10 @@ struct ink2_pf {
             h.hist = K.hist + (size_t) slot * 3 * CHL;
             h.q = b.Q; h.kc = K.kc[slot]; h.vc = K.vc[slot];
             h.rvo = b.TB;
-            h.pos0 = pos0; h.full = full;
+            h.pos0 = pos0; h.m = m; h.full = full;
             h.tau_a = E.hp.tau_alpha; h.tau_f = E.hp.tau_floor;
             h.qk_clip = E.hp.qk_clip; h.rel_clip = E.hp.rel_clip; h.eps = E.hp.eps;
-            k_pf_head_post<<<dim3(HQL + 2 * HKVL, m), 128, 0, st>>>(h);
+            k_pf_head_post<<<dim3(HQL + 2 * HKVL, (m + HP_R - 1) / HP_R), 128, 0, st>>>(h);
             float * sh = shist[c] ? shist[c] + (size_t) slot * 3 * CHL : nullptr;
             float * eh = ehist[c] ? ehist[c] + (size_t) slot * 3 * CHL : nullptr;
             commit(c, b.KR, nullptr, h.hist + H_K, sh ? sh + H_K : nullptr, eh ? eh + H_K : nullptr, KVL, m, snap, snap_end);
