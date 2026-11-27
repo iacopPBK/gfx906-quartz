@@ -13,7 +13,7 @@ constexpr int PF_D = QZ_D, PF_CCH = QZ_CCH / QZ_NC, PF_HK = QZ_HK / QZ_NC, PF_HV
               PF_G = QZ_G / QZ_NC, PF_AQ = QZ_AQ / QZ_NC, PF_AKV = QZ_AKV / QZ_NC, PF_HQ = QZ_HQ / QZ_NC,
               PF_HKV = QZ_HKV / QZ_NC, PF_HD = QZ_HD, PF_FF = QZ_FF / QZ_NC;
 static_assert(PF_D == 5120 && PF_HD == 256 && PF_S == 128 && QZ_NC * PF_FF == 17408, "qwen35 prefill geometry");
-#include "kernels/pf_gemm.h"
+#include "kernels/pf_gemm_sm.h"   // pf_gemm plus the small-M path used below
 
 // ------------------------------------------------------- elementwise ----
 // Token embeddings. With irow, row m takes image row irow[m] when that is >= 0.
@@ -574,7 +574,7 @@ struct qz_prefill {
     void gemm(qz_engine & e, int i, int h, const char * W, const __half * sw, int N, int K, float * C, int ldc,
               const int8_t * A = nullptr, const float * As = nullptr) {
         const half & H = hv[h];
-        pf_gemm_go<0>(H.nty, H.r1 - H.r0, dim3((N + 63) / 64, H.nty), hs(e, i, h), A ? A : c[i].aq, As ? As : c[i].as, Mp,
+        pf_gemm_sm_go<0>(H.nty, H.r1 - H.r0, dim3((N + 63) / 64, H.nty), hs(e, i, h), A ? A : c[i].aq, As ? As : c[i].as, Mp,
                            W, sw, K, K, C, ldc, N, H.ty0, 0);
     }
     // Row-parallel projection. Each card writes its bf16 partial locally and to the peers.
@@ -593,7 +593,7 @@ struct qz_prefill {
         const bool xc = qz_link == QZ_LINK_HOST || QZ_NC > 2;   // partials by copy, no peer store
         for (int i = 0; i < QZ_NC; i++) {
             CHECK(hipSetDevice(qz_dev_of(i)));
-            pf_gemm_go<0>(H.nty, H.r1 - H.r0, dim3(PF_D / 64, H.nty), hs(e, i, h), ffn ? c[i].aq2 : c[i].aq, ffn ? c[i].as2 : c[i].as, Mp, W[i], sw[i],
+            pf_gemm_sm_go<0>(H.nty, H.r1 - H.r0, dim3(PF_D / 64, H.nty), hs(e, i, h), ffn ? c[i].aq2 : c[i].aq, ffn ? c[i].as2 : c[i].as, Mp, W[i], sw[i],
                                K, K, (float *) c[i].pl[s_], PF_D, PF_D, H.ty0, 1,
                                xc ? (unsigned short *) nullptr : (unsigned short *) c[(i + 1) % QZ_NC].pr[s_][0]);
             CHECK(hipEventRecord(evx[i][h], hs(e, i, h)));
@@ -866,7 +866,7 @@ struct qz_prefill {
                     CHECK(hipSetDevice(qz_dev_of(i)));
                     norm(e, i, h, W.post_norm, k.aq, (float *) nullptr);
                     // gate, up and SwiGLU plus quantize in one GEMM, aq in and aq2 out
-                    pf_gemm_go<1>(H.nty, H.r1 - H.r0, dim3(PF_FF / 32, H.nty), hs(e, i, h), k.aq, k.as, Mp, W.fg_vals, W.fg_scal,
+                    pf_gemm_sm_go<1>(H.nty, H.r1 - H.r0, dim3(PF_FF / 32, H.nty), hs(e, i, h), k.aq, k.as, Mp, W.fg_vals, W.fg_scal,
                                        PF_D, PF_D, (float *) nullptr, 0, PF_FF, H.ty0, 0, (unsigned short *) nullptr,
                                        W.fu_vals, W.fu_scal, k.aq2, k.as2);
                 }

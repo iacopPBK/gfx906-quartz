@@ -1098,6 +1098,26 @@ static __global__ __launch_bounds__(256, 2) void k_pf_dgemm(dgjobs J, int m, int
                                                 g.W, g.sw, nullptr, g.A, g.as, Mp, g.K, g.C, g.ldc, g.N, pf_situo{}, g.C2);
 }
 
+// Same dense jobs in 32-token tiles: a short prefill chunk leaves half of a 64-token tile
+// empty, and the tile width is what sets the block's cost.
+template <bool HALF_OUT = false>
+static __global__ __launch_bounds__(256, 2) void k_pf_dgemm32(dgjobs J, int m, int Mp = PF_M) {
+    constexpr int DG_GG = 8;
+    int bx, by;
+    {
+        const int gx = gridDim.x, lin = blockIdx.y * gx + blockIdx.x, per = DG_GG * gx, fy = (lin / per) * DG_GG;
+        const int gs = min((int) gridDim.y - fy, DG_GG), rem = lin - fy * gx;
+        bx = rem / gs; by = fy + rem % gs;
+    }
+    int ji = 0;
+#pragma unroll
+    for (int k = 1; k < 8; k++) if (k < J.n && bx >= J.off[k]) ji = k;
+    const dgjob & g = J.j[ji];
+    const int a0 = by * 32;
+    moe_gemm_body<32, 0, 16, 0, true, HALF_OUT>(make_int4(0, a0, min(32, m - a0), 0), bx - J.off[ji],
+                                                g.W, g.sw, nullptr, g.A, g.as, Mp, g.K, g.C, g.ldc, g.N, pf_situo{}, g.C2);
+}
+
 // Per row, the weighted sum of its pairs' partials in the router's selection order. That
 // order fixes the rounding and there are no atomics, so the sum is deterministic.
 // out2, when set (P2P), writes a second copy straight into the peer's inbox.
@@ -1286,7 +1306,8 @@ struct ink2_pf {
             n++;
         }
         J.n = n;
-        k_pf_dgemm<<<dim3(J.off[n], (m + 63) / 64), 256, 0, E->C[c].st>>>(J, m);
+        if (m <= 32) k_pf_dgemm32<<<dim3(J.off[n], (m + 31) / 32), 256, 0, E->C[c].st>>>(J, m);
+        else k_pf_dgemm<<<dim3(J.off[n], (m + 63) / 64), 256, 0, E->C[c].st>>>(J, m);
     }
     void normq1(int c, const float * x, const float * w, pf_plane & pl, int m, float * outf = nullptr) {
         pfnq A{};
