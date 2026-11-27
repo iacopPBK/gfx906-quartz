@@ -775,9 +775,12 @@ __global__ void __launch_bounds__(256) ds_tab_gemm(const unsigned char * av, con
 }
 
 // --------------------------------------------------------- load / free ----
-// loads the block-pass tensors from the draft GGUF, then this card's half of TG / TSV
+// loads the block-pass tensors from the draft GGUF, then this card's half of TG / TSV.
+// The codebook (read once per card here, then one anchor row per round) is one pinned host
+// copy: card 0's load (first null) places it, the later cards share first's.
 inline int qz_ds_block_load(qz_ds_block & d, qz_ds_ctx & cx, const char * draft,
-                            const qz_dev_tensor * emb, const qz_dev_tensor * head_half, int card) {
+                            const qz_dev_tensor * emb, const qz_dev_tensor * head_half, int card,
+                            const qz_ds_block * first = nullptr) {
     d.dev = cx.dev;
     d.card = card;
     DS_CHECK(hipSetDevice(d.dev));
@@ -799,8 +802,28 @@ inline int qz_ds_block_load(qz_ds_block & d, qz_ds_ctx & cx, const char * draft,
                !strcmp(s, "ffn_up.weight") || !strcmp(s, "ffn_down.weight") ||
                !strcmp(s, "dspine_read.weight") || !strcmp(s, "dspine_write.weight");
     };
-    d.ld.skip = [](const char * n) { return !need_blk(n); };
-    if (!d.ld.load(draft, g, d.dev)) return 1;
+    static const bool cb_host = !getenv("QZ_EMB_VRAM");
+    static auto is_cb = [](const char * n) { return strcmp(n, "dspine_codebook.weight") == 0; };
+    if (cb_host && first) d.ld.skip = [](const char * n) { return !need_blk(n) || is_cb(n); };
+    else d.ld.skip = [](const char * n) { return !need_blk(n); };
+    if (cb_host && !first) d.ld.host = is_cb;
+    // this card's share of each layer: q rows (its heads), the o and down contraction
+    // blocks, the gate / up rows; the round reads them at offset 0 with local strides
+    d.ld.slice = [](const char * n, int c, int64_t, qz_slice & s) {
+        s.rows.clear(); s.cols.clear();
+        const char * suf = strncmp(n, "blk.", 4) == 0 ? strchr(n + 4, '.') : nullptr;
+        if (!suf) return false;
+        suf++;
+        const int QWl = DS_NQ / QZ_NC * DS_HD, FF2 = DS_FF / QZ_NC;
+        auto range = [](std::vector<int32_t> & v, int a, int k) { for (int i = 0; i < k; i++) v.push_back(a + i); };
+        if (!strcmp(suf, "attn_q.weight")) range(s.rows, c * QWl, QWl);
+        else if (!strcmp(suf, "attn_output.weight")) range(s.cols, c * QWl / 32, QWl / 32);
+        else if (!strcmp(suf, "ffn_gate.weight") || !strcmp(suf, "ffn_up.weight")) range(s.rows, c * FF2, FF2);
+        else if (!strcmp(suf, "ffn_down.weight")) range(s.cols, c * FF2 / 32, FF2 / 32);
+        else return false;
+        return true;
+    };
+    if (!d.ld.load(draft, g, d.dev, card)) return 1;
     if ((emb->type != GGML_TYPE_Q8_0 || emb->ne0 != DS_H || emb->ne1 != DS_V || (emb->vstride && emb->vstride != DS_H))) {
         fprintf(stderr, "qz_ds_block: the shared token_embd is not the dense [%d x %d] Q8_0 the drafter reads\n", DS_H, DS_V);
         return 1;
@@ -864,8 +887,8 @@ inline int qz_ds_block_load(qz_ds_block & d, qz_ds_ctx & cx, const char * draft,
         d.Psv = upload_f32(PsvT);
     }
     const qz_dev_tensor & cb = fd("dspine_codebook.weight");
-    d.cb_v = (const unsigned char *) cb.vals;
-    d.cb_s = (const unsigned short *) cb.scal;
+    d.cb_v = cb_host && first ? first->cb_v : (const unsigned char *) cb.vals;
+    d.cb_s = cb_host && first ? first->cb_s : (const unsigned short *) cb.scal;
     d.emb_v = (const unsigned char *) emb->vals;
     d.emb_s = (const unsigned short *) emb->scal;
     d.hh_v = (const unsigned char *) head_half->vals;
@@ -1005,7 +1028,7 @@ inline void qz_ds_block_round2(qz_ds_block * D, qz_ds_ctx * CX, int anchor, int 
     for (int l = 0; l < DS_FL; l++) {
         each([&](int c, qz_ds_block & d, qz_ds_ctx & cx, hipStream_t s) {
             ds_gemvR_launch(nt, s, d.q1, d.s1, H, H, {
-                { (const char *) d.q_v[l] + (size_t) c * QWl * lh, (const __half *) d.q_s[l] + (size_t) c * QWl * (H / 32), QWl, d.xa, 0 },
+                { (const char *) d.q_v[l], (const __half *) d.q_s[l], QWl, d.xa, 0 },
                 { (const char *) cx.k_v[l] + (size_t) c * KVl * lh, (const __half *) cx.k_s[l] + (size_t) c * KVl * (H / 32), KVl, d.kb, 0 },
                 { (const char *) cx.v_v[l] + (size_t) c * KVl * lh, (const __half *) cx.v_s[l] + (size_t) c * KVl * (H / 32), KVl, d.vb, 0 } });
             ds_norm_rope<<<DS_T * DS_NQ / QZ_NC, 128, 0, s>>>(d.xa, d.qnw[l], cx.inv, DS_NQ / QZ_NC, DS_T, p0);
@@ -1016,20 +1039,20 @@ inline void qz_ds_block_round2(qz_ds_block * D, qz_ds_ctx * CX, int anchor, int 
                                                                  S, wbase, aps, d.at_o, d.at_ml, DS_NQ / QZ_NC, c * DS_NKV / QZ_NC);
             ds_attn_comb3<<<DS_T * DS_NQ / QZ_NC, 128, 0, s>>>(d.at_o, d.at_ml, d.att, nsp, DS_NQ / QZ_NC);
             ds_qrows<<<(DS_T * QWl / 32 + 7) / 8, 256, 0, s>>>(d.att, d.qq2, d.qs2, DS_T, QWl);
-            ds_gemvR_launch(nt, s, d.qq2, d.qs2, QWl, DS_NQ * DS_HD, {
-                { (const char *) d.o_v[l] + (size_t) c * QWl, (const __half *) d.o_s[l] + (size_t) c * QWl / 32, H, d.t1, 0 } });
+            ds_gemvR_launch(nt, s, d.qq2, d.qs2, QWl, QWl, {
+                { (const char *) d.o_v[l], (const __half *) d.o_s[l], H, d.t1, 0 } });
         });
         exchange();
         each([&](int c, qz_ds_block & d, qz_ds_ctx &, hipStream_t s) {
             ds_rms_b<<<DS_T, 256, 0, s>>>(d.x, d.pnorm[l], d.t2, H, DS_EPS);
             ds_qrows<<<(DS_T * H / 32 + 7) / 8, 256, 0, s>>>(d.t2, d.q1, d.s1, DS_T, H);
             ds_gemvR_launch(nt, s, d.q1, d.s1, H, H, {
-                { (const char *) d.g_v[l] + (size_t) c * FF2 * lh, (const __half *) d.g_s[l] + (size_t) c * FF2 * (H / 32), FF2, d.fg, 0 },
-                { (const char *) d.u_v[l] + (size_t) c * FF2 * lh, (const __half *) d.u_s[l] + (size_t) c * FF2 * (H / 32), FF2, d.fu, 0 } });
+                { (const char *) d.g_v[l], (const __half *) d.g_s[l], FF2, d.fg, 0 },
+                { (const char *) d.u_v[l], (const __half *) d.u_s[l], FF2, d.fu, 0 } });
             ds_silu_mul<<<((size_t) DS_T * FF2 + 255) / 256, 256, 0, s>>>(d.fg, d.fu, DS_T * FF2);
             ds_qrows<<<(DS_T * FF2 / 32 + 7) / 8, 256, 0, s>>>(d.fg, d.q3, d.s3, DS_T, FF2);
-            ds_gemvR_launch(nt, s, d.q3, d.s3, FF2, DS_FF, {
-                { (const char *) d.d_v[l] + (size_t) c * FF2, (const __half *) d.d_s[l] + (size_t) c * FF2 / 32, H, d.t1, 0 } },
+            ds_gemvR_launch(nt, s, d.q3, d.s3, FF2, FF2, {
+                { (const char *) d.d_v[l], (const __half *) d.d_s[l], H, d.t1, 0 } },
                 2, (size_t) DS_T * H);
             ds_fold2<<<(DS_T * H + 255) / 256, 256, 0, s>>>(d.t1, DS_T * H);
         });

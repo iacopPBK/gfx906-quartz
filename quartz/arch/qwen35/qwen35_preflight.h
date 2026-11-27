@@ -12,10 +12,12 @@
 #include "engine.h"
 #include "loader.h"
 
-// Per-card ledger: DSpine takes 3.8 GB at any context, and the cycle buffers, the
-// snapshot staging, the drafter switch and the HIP runtime share about 1 GB. The
-// batched prefill wants 256 MB left free.
-constexpr double QZ_PF_DSPINE = 3.85e9, QZ_PF_FIXED = 1.0e9, QZ_PF_HEADROOM = 0.25e9;
+// Per-card ledger: DSpine takes 1.1 GB at any context plus 3.2 GB split over the cards (its
+// block layers, tables and buffers: 2.7 GB at two cards, 1.9 at four), budgeted with 0.45 GB
+// to spare; its codebook adds 0.27 GB when it is kept on each card (QZ_EMB_VRAM). The cycle buffers, the snapshot staging, the drafter switch
+// and the HIP runtime share about 1 GB. The batched prefill wants 256 MB left free.
+inline double qz_pf_dspine() { return 1.55e9 + 3.2e9 / QZ_NC + (getenv("QZ_EMB_VRAM") ? 0.27e9 : 0.0); }
+constexpr double QZ_PF_FIXED = 1.0e9, QZ_PF_HEADROOM = 0.25e9;
 // With --mmproj both cards grow by 1.1-1.2 GB at load and one by another ~0.3 GB once
 // an image is encoded; the projector is 0.93 GB, so budget its file size + 1 GB.
 constexpr double QZ_PF_MMPROJ_EXTRA = 1.0e9;
@@ -33,6 +35,11 @@ inline int qz_vram_check(const char * model, int max_ctx, int steps, size_t scra
     for (int c = 0; c < QZ_NC; c++) {
         qz_loader L;
         L.slice = qz_tp_slice;
+        if (!getenv("QZ_EMB_VRAM")) {   // the embedding is in host memory (engine.h), on no card
+            auto is_emb = [](const char * n) { return strcmp(n, "token_embd.weight") == 0; };
+            if (c == 0) L.host = is_emb;
+            else L.skip = is_emb;
+        }
         if (!L.plan(g, c)) return 0;
         weights[c] = (double) L.need_bytes;
         size_t fr = 0, tot = 0;
@@ -40,7 +47,7 @@ inline int qz_vram_check(const char * model, int max_ctx, int steps, size_t scra
         free_b[c] = (double) fr; total_b[c] = (double) tot;
     }
     (void) hipSetDevice(qz_dev_of(0));
-    const double kv = (double) qz_kv_bytes(steps), ds = dspine ? QZ_PF_DSPINE : 0.0;
+    const double kv = (double) qz_kv_bytes(steps), ds = dspine ? qz_pf_dspine() : 0.0;
     const double mm = mmproj ? qz_file_bytes(mmproj) + QZ_PF_MMPROJ_EXTRA : 0.0;
     const double buf = (double) scratch + QZ_PF_FIXED + QZ_PF_HEADROOM;
     double need[QZ_NC];

@@ -21,6 +21,7 @@ bool qz_loader::plan(const qz_gguf & g, int card) {
     ts.resize(nt);
     raw_off.resize(nt);
     need_bytes = 0;
+    host_bytes = 0;
     for (int64_t t = 0; t < nt; t++) {
         ts[t].name = gguf_get_tensor_name(g.ctx, t);
         ts[t].type = gguf_get_tensor_type(g.ctx, t);
@@ -44,7 +45,8 @@ bool qz_loader::plan(const qz_gguf & g, int card) {
         }
         ts[t].vstride = ts[t].ne0;
         ts[t].shared = skip && skip(ts[t].name.c_str());
-        if (!ts[t].shared) need_bytes += ts[t].bytes();
+        ts[t].host = !ts[t].shared && host && host(ts[t].name.c_str());
+        if (!ts[t].shared) (ts[t].host ? host_bytes : need_bytes) += ts[t].bytes();
     }
     return true;
 }
@@ -94,6 +96,16 @@ bool qz_loader::load(const char * path, const qz_gguf & g, int dev, int card) {
         qz_dev_tensor & t = ts[oi];
         if (t.shared) continue;
         const char * role = t.name == "token_embd.weight" ? "embd" : t.name == "output.weight" ? "head" : "weights";
+        if (t.host) {   // pinned and mapped for every GPU (one pointer works on all of them)
+            const unsigned fl = hipHostMallocPortable | hipHostMallocMapped;
+            if (t.type == GGML_TYPE_Q8_0) {
+                CHECK(hipHostMalloc(&t.vals, (size_t)(t.vstride * t.ne1), fl));
+                CHECK(hipHostMalloc(&t.scal, (size_t)(t.ne0 * t.ne1 / 16), fl));
+            } else {
+                CHECK(hipHostMalloc(&t.vals, (size_t) t.bytes(), fl));
+            }
+            continue;
+        }
         if (t.type == GGML_TYPE_Q8_0) {
             CHECK(qz_dmalloc(&t.vals, (size_t)(t.vstride * t.ne1), role));
             CHECK(qz_dmalloc(&t.scal, (size_t)(t.ne0 * t.ne1 / 16), role));
@@ -123,7 +135,7 @@ bool qz_loader::load(const char * path, const qz_gguf & g, int dev, int card) {
         return pin[cur];
     };
     auto submit = [&](void * dev_dst, const void * src, size_t n) {
-        if (n && hipMemcpyAsync(dev_dst, src, n, hipMemcpyHostToDevice, st) != hipSuccess) ok = false;
+        if (n && hipMemcpyAsync(dev_dst, src, n, hipMemcpyDefault, st) != hipSuccess) ok = false;   // VRAM or pinned host
     };
     // both events start signaled, so the first take() does not wait
     CHECK(hipEventRecord(ev[0], st));

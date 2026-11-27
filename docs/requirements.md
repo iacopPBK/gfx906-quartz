@@ -27,9 +27,9 @@ commands are in the [README](../README.md), flags and environment variables in
   have peer access: the host-memory link is two cards only, and a pair without P2P
   refuses the start. The start checks each pair and prints a matrix of write
   bandwidth and flag round trip; the exchange is only as fast as the slowest
-  pair. Images (`--mmproj`) are two cards only. So far this mode has only run
-  emulated on two cards (`QZ_VIRT=2`, [configuration](configuration.md#environment)),
-  not on a 4-card machine.
+  pair. Images (`--mmproj`) are two cards only. It has run on a 4x MI50 machine
+  with PCIe P2P on every pair, and emulated on two cards (`QZ_VIRT=2`,
+  [configuration](configuration.md#environment)).
 - **P2P is recommended, not required.** With peer access the cards write into
   each other's VRAM. Without it they exchange through pinned host memory, with the
   same arithmetic and the same greedy output, only slower: roughly 5-20 %. `QZ_LINK=auto` (the default)
@@ -50,10 +50,13 @@ commands are in the [README](../README.md), flags and environment variables in
 The server checks before the load that the requested context fits on every
 card, and prints a per-card ledger after it (one line per GPU).
 
-**Qwen3.8-27B** at the default context (262144) with DSpine: about 59 GB of the
-~69 GB the two cards report (weights 30.4, KV cache 18.2, DSpine 7.6, buffers
-3.2). Without DSpine, about 52 GB. A smaller `--max-ctx` shrinks the KV cache.
-The prefix cache takes about 1.2 GB of pinned host RAM. If less than 256 MB is
+**Qwen3.8-27B** at the default context (262144) with DSpine: about 54 GB of the
+~69 GB the two cards report (weights 27.7, KV cache 18.2, DSpine 5.4, buffers
+3.1). Without DSpine, about 49 GB. With `--tp 4`, about 14.6 GB per card with
+DSpine and 12.7 GB without. A smaller `--max-ctx` shrinks the KV cache.
+The token embedding (1.35 GB) and the DSpine codebook (0.27 GB) are one copy in
+pinned host RAM that every card reads (`QZ_EMB_VRAM=1` keeps them on each card
+instead). The prefix cache takes about 1.2 GB of pinned host RAM. If less than 256 MB is
 free after the load, batched prefill is off, and with it DSpine and image input.
 
 **Inkling-2-Mini**, per card: the weights take about half of the file. The 8

@@ -29,6 +29,7 @@ struct qz_dev_tensor {
     void * vals = nullptr;         // Q8_0 values plane, otherwise the raw bytes
     int64_t vstride = 0;           // Q8_0 values row stride in bytes, 0 means ne0
     bool shared = false;           // not loaded; vals/scal point at another owner's copy
+    bool host = false;             // in pinned host memory, read by every GPU over PCIe
     void * scal = nullptr;         // Q8_0 scale plane
     int64_t src_ne0 = 0, src_ne1 = 1;   // file dims, they differ from ne0/ne1 when sliced
     int64_t ne[GGML_MAX_DIMS] = {0, 1, 1, 1};   // file dims in ggml order, ne[0] fastest
@@ -44,7 +45,8 @@ class qz_loader {
 public:
     std::vector<qz_dev_tensor> ts;       // GGUF order
     std::vector<uint64_t> raw_off;       // absolute file offset of raw bytes
-    int64_t need_bytes = 0;
+    int64_t need_bytes = 0;              // VRAM; host tensors are counted in host_bytes
+    int64_t host_bytes = 0;
     size_t free_before = 0;
     size_t free_after = 0;
     double load_seconds = 0;
@@ -53,6 +55,9 @@ public:
     std::function<bool(const char *)> skip;
     // the arch's TP split of one tensor for one card; false means replicated
     std::function<bool(const char *, int, int64_t, qz_slice &)> slice;
+    // host(name) places a tensor in pinned host memory instead of VRAM: for tensors read
+    // a few rows at a time (the token embedding), so one copy serves every card
+    std::function<bool(const char *)> host;
 
     // card >= 0 loads only that card's slices, otherwise the whole model
     bool load(const char * path, const qz_gguf & g, int dev, int card = -1);

@@ -39,6 +39,7 @@ Every flag and environment variable, with its default.
 | `QZ_VIRT` | `1` | Testing: `2` runs two cards per GPU, each on alternate CUs (CU-masked streams), so `QZ_TP=4` runs on two GPUs. Correct, not fast. Needs P2P |
 | `QZ_LINK` | `auto` | How the two cards reach each other (four cards: P2P only): `auto` takes a peer pair when there is one and pinned host memory otherwise; `p2p` refuses unless the pair has peer access; `host` forces host memory and never enables peer access. Same kernels and same greedy output either way, slower over host memory |
 | `QZ_NO_PREFLIGHT` | unset | Load even when the memory check says the context does not fit |
+| `QZ_EMB_VRAM` | unset | Qwen: `1` keeps the token embedding and the DSpine codebook on every card. By default they are one copy in pinned host memory that the cards read over PCIe (a few rows per step), which saves 1.6 GB per card |
 | `QZ_TRACE` | unset | Directory for one JSON file per request, read with `quartz/server/quartz_trace.py` |
 | `QZ_NO_SWITCH` | unset | `1` keeps the drafter for the whole answer. By default, with `--dspine`, Qwen switches between DSpine and MTP on acceptance, and Inkling between DSpark rounds and single steps on measured speed |
 | `QZ_SW_MARGIN`, `QZ_SW_PROBE`, `QZ_SW_HI`, `QZ_SW_WIN` | Qwen: `0.95`, `384`, `3.4`, `128` | Leave DSpine when its tok/s over the last `win` tokens drops below `margin` times MTP's (the last measured MTP rate; before any, an estimate from DSpine's round time). Leave MTP after `probe` tokens to re-measure DSpine, or at `hi` tokens per round or more |

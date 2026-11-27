@@ -195,8 +195,26 @@ inline int qz_engine::init(const char * path, int steps_, int slot_t_, int adapt
         K.dev = qz_dev_of(c);
         qz_mem_scope mem_target("target");
         K.ld.slice = qz_tp_slice;
+        // The token embedding is read a few rows at a time (a row per decode step, a chunk's
+        // rows per prefill GEMM, the drafter's 16), so it lives once in pinned host memory
+        // and every card reads it over PCIe: 1.35 GB less VRAM per card. QZ_EMB_VRAM=1 keeps
+        // a copy on each card.
+        static const bool emb_host = !getenv("QZ_EMB_VRAM");
+        auto is_emb = [](const char * n) { return strcmp(n, "token_embd.weight") == 0; };
+        if (emb_host) {
+            if (c == 0) K.ld.host = is_emb;
+            else K.ld.skip = is_emb;
+        }
         if (!K.ld.load(path, g, qz_dev_of(c), c)) { fprintf(stderr, "card %d load failed\n", c); return 1; }
-        printf("card %d: weights %.2f GB in %.1f s, %.2f GB free\n", c, K.ld.need_bytes / 1e9, K.ld.load_seconds, K.ld.free_after / 1e9);
+        if (emb_host && c > 0) {   // card 0's host copy
+            const qz_dev_tensor * e0 = C[0].ld.get("token_embd.weight");
+            const int64_t ie = K.ld.find("token_embd.weight");
+            if (!e0 || ie < 0) { fprintf(stderr, "missing embedding\n"); return 1; }
+            qz_dev_tensor & e = K.ld.ts[ie];
+            e.vals = e0->vals; e.scal = e0->scal; e.vstride = e0->vstride; e.host = true;
+        }
+        printf("card %d: weights %.2f GB in %.1f s, %.2f GB free%s\n", c, K.ld.need_bytes / 1e9, K.ld.load_seconds, K.ld.free_after / 1e9,
+               emb_host && c == 0 ? "; embedding in host memory" : "");
         CHECK(hipSetDevice(qz_dev_of(c)));
         CHECK(qz_card_stream(c, &K.st));
         auto find2 = [&](int il, const char * suf) -> const qz_dev_tensor & {
