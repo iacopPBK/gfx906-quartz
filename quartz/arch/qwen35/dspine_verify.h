@@ -437,6 +437,7 @@ __global__ void __launch_bounds__(512) mv_argmax(qz_trunk_args A, unsigned int h
         const int gid = i0 + A.tp_card * A.hrows;
         A.y_part[2 * blockIdx.x] = b0;
         A.y_part[2 * blockIdx.x + 1] = __int_as_float(gid);
+#if QZ_NC == 2
         #pragma unroll
         for (int k = 0; k < QZ_NC - 1; k++) {
             QZ_XCK(qz_xck_store(A.tp_card, k + 1, XS_HM_VER));
@@ -445,6 +446,11 @@ __global__ void __launch_bounds__(512) mv_argmax(qz_trunk_args A, unsigned int h
         __threadfence_system();
         QZ_XCK(qz_xck_end(A.tp_card));
         qz_xflag_b(A, htok, 64 + blockIdx.x);
+#else   // hop 1 of qz_xhm2: the pair partner only, its flag 64 + block
+        QZ_XCK(qz_xck_store(A.tp_card, qz_xkpair(A), XS_HM_VER));
+        *(float2 *)(qz_xhm_pair_px(A) + (size_t) (htok & 1) * MV_T * 2 + 2 * blockIdx.x) = make_float2(b0, __int_as_float(gid));
+        qz_xflag_k(A, htok, qz_xkpair(A), 64 + blockIdx.x);
+#endif
     }
 }
 
@@ -452,6 +458,7 @@ __global__ void __launch_bounds__(64) mv_verify(qz_trunk_args A, const int * tok
                                                unsigned int htok, unsigned int vtok, int verify) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     (void) vtok;
+#if QZ_NC == 2
     for (int b = 64; b < 64 + MV_T; b++) qz_xwait_b(A, htok, b);
     for (int t = 0; t < MV_T; t++) {
         float bv = __builtin_nontemporal_load(A.y_part + 2 * t);
@@ -463,6 +470,10 @@ __global__ void __launch_bounds__(64) mv_verify(qz_trunk_args A, const int * tok
         }
         A.out_tok[t] = bi;
     }
+#else
+    qz_xhm2(A, htok, (size_t) (htok & 1) * MV_T * 2, 4 * MV_T, MV_T, A.y_part, 64, XS_HM_VER, 2);
+    for (int t = 0; t < MV_T; t++) A.out_tok[t] = __float_as_int(A.y_part[2 * t + 1]);
+#endif
     int m = 0;
     if (verify) {
         while (m < MV_T - 1 && A.out_tok[m] == toks_d[m + 1]) m++;

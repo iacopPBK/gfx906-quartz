@@ -573,6 +573,7 @@ __device__ __forceinline__ void qz_mtp_pass(
                 // Merge with the peers' shares: one pair, block 0 alone.
                 const unsigned int tok = xs + 1;
                 const int gid = i0 + A.tp_card * A.hrows;
+#if QZ_NC == 2
                 #pragma unroll
                 for (int k = 0; k < QZ_NC - 1; k++) {
                     QZ_XCK(qz_xck_store(A.tp_card, k + 1, XS_HM_MTP));
@@ -590,6 +591,12 @@ __device__ __forceinline__ void qz_mtp_pass(
                     qz_xfold(bestv, best, pv, pi);
                 }
                 *am_out = best;
+#else
+                // two hops (qz_xhm2): the pair partner, then the cross partner
+                float r[2] = {b0, __int_as_float(gid)};
+                qz_xhm2(A, tok, (size_t)(tok & 1) * QZ_TMAX * 2, 4 * QZ_TMAX, 1, r, 0, XS_HM_MTP, 0);
+                *am_out = __float_as_int(r[1]);
+#endif
             }
         }
         xs++;
@@ -847,11 +854,16 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
             const int gid = i0 + A.tp_card * A.hrows;
             A.y_part[2 * blockIdx.x] = b0;
             A.y_part[2 * blockIdx.x + 1] = __int_as_float(gid);
+#if QZ_NC == 2
             #pragma unroll
             for (int k = 0; k < QZ_NC - 1; k++) {
                 QZ_XCK(qz_xck_store(A.tp_card, k + 1, XS_HM_CYC));
                 *(float2 *)(A.xhm_px[k] + (size_t)(htok & 1) * QZ_TMAX * 2 + 2 * blockIdx.x) = make_float2(b0, __int_as_float(gid));
             }
+#else       // hop 1 of qz_xhm2: the pair partner only
+            QZ_XCK(qz_xck_store(A.tp_card, qz_xkpair(A), XS_HM_CYC));
+            *(float2 *)(qz_xhm_pair_px(A) + (size_t)(htok & 1) * QZ_TMAX * 2 + 2 * blockIdx.x) = make_float2(b0, __int_as_float(gid));
+#endif
             __threadfence_system();
             QZ_XCK(qz_xck_end(A.tp_card));
         }
@@ -860,6 +872,7 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
     // cycle resumes at the bonus token.
     qz_grid_barrier(bst, ++kb);
     if (blockIdx.x == 0 && tid == 0) {
+#if QZ_NC == 2
         qz_xflag(A, htok);
         qz_xwait(A, htok);
         for (int t = 0; t < T; t++) {
@@ -874,6 +887,11 @@ qz_cycle(qz_barrier_state * bst, qz_trunk_args A) {
             }
             A.out_tok[t] = best;
         }
+#else
+        // rows' own pairs in y_part, merged in place over the two hops
+        qz_xhm2(A, htok, (size_t)(htok & 1) * QZ_TMAX * 2, 4 * QZ_TMAX, T, A.y_part, 0, XS_HM_CYC, 1);
+        for (int t = 0; t < T; t++) A.out_tok[t] = __float_as_int(A.y_part[2 * t + 1]);
+#endif
     }
     if (blockIdx.x == 0 && tid == 0) {
         int m = 0;

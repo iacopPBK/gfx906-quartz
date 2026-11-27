@@ -45,8 +45,9 @@ each other through local memory, so the PCIe link between four real GPUs is not
 exercised.
 
 On some hosts, one GPU writing to several peers at once drops P2P to a fraction of a GB/s.
-The exchanges therefore write to one peer per step: two hops for the decode
-sums, and one copy stream per card for the prefill partials. `make tp4 XCHECK=1`
+The exchanges therefore write to one peer per step: two hops for the decode and
+verify sums and the head merges of both models, and one copy stream per card for
+the prefill partials. `make tp4 XCHECK=1`
 builds `build/tp4chk`, which checks this rule under emulation
 (`core/xcheck.h`). After each request it prints, per code site and card, every
 store to a second peer within one step (between system fences, or after the

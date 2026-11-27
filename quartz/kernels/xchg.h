@@ -234,6 +234,55 @@ __device__ __forceinline__ void qz_xfold(float & bv, int & bi, float pv, int pi)
     if (pv > bv || (pv == bv && pi < bi)) { bv = pv; bi = pi; }
 }
 
+// my slot in the pair partner's head-merge inbox (hop 1)
+template <class XA> __device__ __forceinline__ float * qz_xhm_pair_px(const XA & A) {
+    static_assert(XA::NC == 4, "the two-hop head merge is for four cards");
+    return (A.tp_card & 1) ? A.xhm_px[2] : A.xhm_px[0];
+}
+// Head merge in two hops at four cards, one thread, over n rows of {value, id} pairs
+// in r (r[2t], the id's bits in r[2t + 1]), merged in place. The merge is a total
+// order (qz_xfold), so (pair, then cross) gives the same winner as any order. off is
+// the parity offset in a slot of `slot` floats; flags at index fb. mode 0: this thread
+// pushes r to the pair partner and flags it; 1: each row's block already pushed its
+// pair (and fenced), this thread flags; 2: each row's block pushed and flagged at
+// fb + t. Then the pair winners go to the cross partner (slot 1), one flag at fb.
+template <class XA> __device__ __forceinline__ void qz_xhm2(const XA & A, unsigned int tok, size_t off, size_t slot, int n,
+                                                            float * r, int fb, int site, int mode) {
+    const int kp = qz_xkpair(A);
+    if (mode == 0)
+        for (int t = 0; t < n; t++) {
+            QZ_XCK(qz_xck_store(A.tp_card, kp, site));
+            *(float2 *) (qz_xhm_pair_px(A) + off + 2 * t) = make_float2(r[2 * t], r[2 * t + 1]);
+        }
+    if (mode == 2) {
+        for (int t = 0; t < n; t++) qz_xwait_slot(A, tok, (kp - 1) * QZ_XFS + fb + t);
+    } else {
+        qz_xflag_k(A, tok, kp, fb);
+        qz_xwait_slot(A, tok, (kp - 1) * QZ_XFS + fb);
+    }
+    const float * mp = A.xhm_mine + (size_t) (kp - 1) * slot + off;
+    QZ_XCK(qz_xck_end(A.tp_card));
+    for (int t = 0; t < n; t++) {
+        float bv = __builtin_nontemporal_load(r + 2 * t);
+        int bi = __float_as_int(__builtin_nontemporal_load(r + 2 * t + 1));
+        qz_xfold(bv, bi, __builtin_nontemporal_load(mp + 2 * t), __float_as_int(__builtin_nontemporal_load(mp + 2 * t + 1)));
+        r[2 * t] = bv;
+        r[2 * t + 1] = __int_as_float(bi);
+        QZ_XCK(qz_xck_store(A.tp_card, 2, site));
+        *(float2 *) (A.xhm_px[1] + off + 2 * t) = make_float2(bv, __int_as_float(bi));
+    }
+    qz_xflag_k(A, tok, 2, fb);
+    qz_xwait_slot(A, tok, QZ_XFS + fb);
+    const float * mc = A.xhm_mine + slot + off;
+    for (int t = 0; t < n; t++) {
+        float bv = r[2 * t];
+        int bi = __float_as_int(r[2 * t + 1]);
+        qz_xfold(bv, bi, __builtin_nontemporal_load(mc + 2 * t), __float_as_int(__builtin_nontemporal_load(mc + 2 * t + 1)));
+        r[2 * t] = bv;
+        r[2 * t + 1] = __int_as_float(bi);
+    }
+}
+
 // ---- exchange handles for kernels that push and sum inline (Inkling) ---------------
 // qz_xpush: this card's slot in the one peer it pushes to, at one offset: the peer at two
 // cards, the pair partner (hop 1) at four; the arch runs hop 2 (Inkling: cyc_xwait2).
