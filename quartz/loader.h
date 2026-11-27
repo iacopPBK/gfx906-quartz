@@ -7,6 +7,7 @@
 #include "mem.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <string>
 #include <vector>
@@ -66,3 +67,25 @@ public:
     int64_t find(const char * name) const;   // index into ts, -1 when absent
     const qz_dev_tensor * get(const char * name) const { const int64_t i = find(name); return i < 0 ? nullptr : &ts[i]; }
 };
+
+// One copy of tensor `name` in pinned host memory for all cards, for a tensor read a few
+// rows at a time (the token embedding): set before each card's load (or plan), card 0's
+// loader places it in host memory and the later cards' skip it. QZ_EMB_VRAM=1 turns it
+// off (every card loads its own copy). Returns whether it is on.
+inline bool qz_host_once(qz_loader & L, int card, const char * name) {
+    if (getenv("QZ_EMB_VRAM")) return false;
+    const std::string n = name;
+    auto is = [n](const char * x) { return n == x; };
+    if (card == 0) L.host = is;
+    else L.skip = [is, prev = L.skip](const char * x) { return is(x) || (prev && prev(x)); };
+    return true;
+}
+// after a later card's load: point its skipped copy of `name` at card 0's host one
+inline bool qz_host_share(qz_loader & L, const qz_loader & L0, const char * name) {
+    const qz_dev_tensor * e0 = L0.get(name);
+    const int64_t i = L.find(name);
+    if (!e0 || i < 0 || !e0->host) return false;
+    qz_dev_tensor & e = L.ts[i];
+    e.vals = e0->vals; e.scal = e0->scal; e.vstride = e0->vstride; e.host = true;
+    return true;
+}

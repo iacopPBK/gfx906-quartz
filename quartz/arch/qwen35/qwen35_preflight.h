@@ -35,11 +35,7 @@ inline int qz_vram_check(const char * model, int max_ctx, int steps, size_t scra
     for (int c = 0; c < QZ_NC; c++) {
         qz_loader L;
         L.slice = qz_tp_slice;
-        if (!getenv("QZ_EMB_VRAM")) {   // the embedding is in host memory (engine.h), on no card
-            auto is_emb = [](const char * n) { return strcmp(n, "token_embd.weight") == 0; };
-            if (c == 0) L.host = is_emb;
-            else L.skip = is_emb;
-        }
+        qz_host_once(L, c, "token_embd.weight");   // in host memory (engine.h), on no card
         if (!L.plan(g, c)) return 0;
         weights[c] = (double) L.need_bytes;
         size_t fr = 0, tot = 0;
