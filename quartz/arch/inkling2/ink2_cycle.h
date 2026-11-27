@@ -77,7 +77,12 @@ struct cyc_args {
 
 // the exchange handles at inbox offset off (kernels/xchg.h): this card's pushes, and its
 // inbox to sum from
+#if QZ_NC == 2
 #define INK_XDST(A, off) ({ qz_xpush<QZ_NC> d_; _Pragma("unroll") for (int k_ = 0; k_ < QZ_NC - 1; k_++) d_.p[k_] = (A).xin_px[k_] + (off); QZ_XCK(d_.card = (A).card;) d_; })
+#else   // hop 1 goes to the pair partner only: peer k = 1 (even card, slot 0) or 3 (odd, slot 2)
+#define INK_XDST(A, off) ({ qz_xpush<QZ_NC> d_ = {}; d_.p[0] = (((A).card & 1) ? (A).xin_px[2] : (A).xin_px[0]) + (off); \
+                            QZ_XCK(d_.card = (A).card; d_.k = ((A).card & 1) ? 3 : 1;) d_; })
+#endif
 #define INK_XSRC(A, off) (qz_xinbox<QZ_NC>{ (A).xin_mine + (off), (A).xin_slot, (A).card })
 
 // The card's partial is in the peer inbox: pushed, fenced, grid barrier passed. The
@@ -89,6 +94,60 @@ template <class XA> __device__ __forceinline__ void cyc_xwait(const XA & A, unsi
     }
     __syncthreads();
 }
+
+// cyc_xwait for the consumers of rows x D inbox elements: the nw waiting blocks (this is
+// w; block 0 is w = 0) and own, this card's partial, row stride rsf floats. At four cards
+// the exchange takes two hops, as the Qwen row exchange (kernels/xchg.h), so that no GPU
+// writes to two peers at once: the pushes went to the pair partner (INK_XDST), hop 1
+// waits for its flag; for hop 2 each waiting block sums the pair over its chunk of the
+// elements, pushes the sums to the cross partner (me ^ 2, slot 1), flags it with its own
+// flag w, and waits for all nw of the cross partner's flags. qz_xinbox then adds the two
+// pair sums, lower pair first.
+// At two cards it is cyc_xwait, by the macro, so the arguments are not even evaluated.
+#if QZ_NC == 2
+#define cyc_xwait2(A, tok, off, own, rsf, rows, w, nw) cyc_xwait(A, tok)
+#else
+template <class XA> __device__ __forceinline__ void cyc_xwait2(const XA & A, unsigned int tok, size_t off, const float * own,
+                                                               int rsf, int rows, int w, int nw) {
+    {
+        const int tid = threadIdx.x;
+        const bool odd = A.card & 1;
+        const int ps = odd ? 2 : 0;                    // the pair partner's slot, peer k = ps + 1
+        if (tid == 0) {
+            if (w == 0) {
+                __threadfence_system();
+                QZ_XCK(qz_xck_end(A.card));
+                QZ_XCK(qz_xck_store(A.card, ps + 1, XS_FLAGK));
+                __hip_atomic_store(odd ? A.xflag_px[2] : A.xflag_px[0], tok, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+                QZ_XCK(qz_xck_end(A.card));
+            }
+            qz_xwait_slot(A, tok, ps * QZ_XFS);
+        }
+        __syncthreads();
+        const float * pin = qz_gp(A.xin_mine) + off + (size_t) ps * A.xin_slot;
+        float * dst = qz_gp(A.xin_px[1]) + off;
+        own = qz_gp(own);
+        const int n = rows * D, ch = (n + nw - 1) / nw, e1 = min(n, (w + 1) * ch);
+        QZ_XCK(qz_xck_end(A.card));
+        for (int e = w * ch + tid; e < e1; e += blockDim.x) {
+            const int r = e / D, i = e - r * D;
+            const float o = own[(size_t) r * rsf + i], pv = __builtin_nontemporal_load(pin + e);
+            QZ_XCK(qz_xck_store(A.card, 2, XS_HOP2));
+            dst[e] = odd ? __fadd_rn(pv, o) : __fadd_rn(o, pv);
+        }
+        __threadfence_system();
+        QZ_XCK(qz_xck_end(A.card));
+        __syncthreads();
+        if (tid == 0) {
+            QZ_XCK(qz_xck_store(A.card, 2, XS_FLAGK));
+            __hip_atomic_store(A.xflag_px[1] + w, tok, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            QZ_XCK(qz_xck_end(A.card));
+        }
+        if (tid < nw) qz_xwait_slot(A, tok, QZ_XFS + tid);
+        __syncthreads();
+    }
+}
+#endif
 
 // Phase wrappers. The compiler sees the table's pointers as generic, so these pass them
 // through qz_gp() (kernels/dev.h); the inlined bodies infer global loads and stores. The
@@ -818,7 +877,7 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
         if (blockIdx.x < CG) {
             if (ai > 0) {
                 CK appk * ep = e - 1;
-                cyc_xwait(A, xs);
+                cyc_xwait2(A, xs, (size_t) (xs & 1) * D, A.PART1, D, 1, g1.w, CG);
                 c_cxconv(A.PART1, INK_XSRC(A, (size_t) (xs & 1) * D), ep->fconv, ep->hsf, A.X, nullptr, g1.w, tid, e->tap);
             }
             if (pre) c_cpre(pre, A.P, A.X, e->pre_out, g1.w, tid);
@@ -857,7 +916,7 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
         BAR();
         // ---- P1, chain group 1: the attention sum + conv, the ffn mix (and norm)
         if (blockIdx.x < CG) {
-            cyc_xwait(A, xs);
+            cyc_xwait2(A, xs, (size_t) (xs & 1) * D, A.PART0, D, 1, g1.w, CG);
             c_cxconv(A.PART0, INK_XSRC(A, (size_t) (xs & 1) * D), e->pconv, e->hsa, A.X, e->blk, g1.w, tid);
             if (msg) c_cmix<1, false>(&e->mff, e->qff, A.F, nullptr, 0.f, g1, ce1, tid);
             else c_cmix<1, true>(&e->mff, e->qff, A.F, e->nb.j, A.eps, g1, ce1, tid);
@@ -884,7 +943,7 @@ __global__ __launch_bounds__(512) void ink2_cycle(unsigned int * bst, const cyc_
     if (b0) {        // the last ffn sum and conv
         CK cyc_args & A = *(CK cyc_args *) Ag;
         CK appk * ep = (CK appk *) A.tab + napp - 1;
-        cyc_xwait(A, xs);
+        cyc_xwait2(A, xs, (size_t) (xs & 1) * D, A.PART1, D, 1, 0, 1);
         c_xconv_b0(A.PART1, INK_XSRC(A, (size_t) (xs & 1) * D), ep->fconv, ep->hsf, A.X, nullptr, tid_k);
         if (tid_k == 0) *Ag->xseq = xs;
     }

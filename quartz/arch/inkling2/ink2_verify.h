@@ -1154,7 +1154,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         if (chain) {
             if (ai > 0) {
                 CK appk * ep = er - 1;
-                cyc_xwait(Av, xs);
+                cyc_xwait2(Av, xs, 2 * D + (size_t) (xs & 1) * VR * D, Av.PART1, rsf, nr, blockIdx.x, nr * CG);
                 const int slot = (int) ((ep->hsf - Vq->hist) / (3 * CHL));
                 v_cxconv(Av.PART1, INK_XSRC(Av, 2 * D + (size_t) (xs & 1) * VR * D), ep->fconv, ep->hsf, xr, nullptr, cw, tid,
                          tr, rsf, Vq->uh + ((size_t) (slot * VR + tr)) * CHL + H_F, er->tap);
@@ -1210,7 +1210,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
         cyc_barrier(vbst, ++kb);
         // ---- P1, the row's chain group: the attention sum and conv, the ffn mix and norm
         if (chain) {
-            cyc_xwait(Av, xs);
+            cyc_xwait2(Av, xs, 2 * D + (size_t) (xs & 1) * VR * D, Av.PART0, rsf, nr, blockIdx.x, nr * CG);
             const int slot = (int) ((er->hsa - Vq->hist) / (3 * CHL));
             v_cxconv(Av.PART0, INK_XSRC(Av, 2 * D + (size_t) (xs & 1) * VR * D), er->pconv, er->hsa, xr, er->blk, cw, tid,
                      tr, rsf, Vq->uh + ((size_t) (slot * VR + tr)) * CHL + H_A);
@@ -1250,7 +1250,7 @@ __global__ __launch_bounds__(512) void ink2_verify(unsigned int * vbst, const va
     if (blockIdx.x < (unsigned) nr) {
         const int r = blockIdx.x;
         CK appk * ep = (CK appk *) Vp->A.tab + (size_t) r * napp + (napp - 1);
-        cyc_xwait(Vp->A, xs);
+        cyc_xwait2(Vp->A, xs, 2 * D + (size_t) (xs & 1) * VR * D, Vp->A.PART1, rsf, nr, r, nr);
         const int slot = (int) ((ep->hsf - Vp->hist) / (3 * CHL));
         v_xconv_b0(Vp->A.PART1, INK_XSRC(Vp->A, 2 * D + (size_t) (xs & 1) * VR * D), ep->fconv, ep->hsf,
                    (float *) ((char *) Vp->A.X + (size_t) r * rs), nullptr, tid_k, r, rsf,

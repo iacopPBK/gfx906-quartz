@@ -536,6 +536,7 @@ static __global__ __launch_bounds__(256) void k_ds_markov(const float * joint, f
     const float l = tanhf(joint[2 * DS_R + k]);
     lat1[k] = l;
     if (k == 0) lat1[DS_R] = 1.f;
+#if QZ_NC == 2
     #pragma unroll
     for (int j = 0; j < QZ_NC - 1; j++) {
         volatile float * p = (volatile float *) P.lat1[j];
@@ -545,6 +546,19 @@ static __global__ __launch_bounds__(256) void k_ds_markov(const float * joint, f
     __syncthreads();
     if (k == 0)
         for (int j = 0; j < QZ_NC - 1; j++) ds_flag(P.fl[j], seq);
+#else
+    {               // one peer at a time: its rows, fenced, then its flag
+        #pragma unroll
+        for (int j = 0; j < QZ_NC - 1; j++) {
+            volatile float * p = (volatile float *) P.lat1[j];
+            p[k] = l;
+            if (k == 0) p[DS_R] = 1.f;
+            __threadfence_system();
+            __syncthreads();
+            if (k == 0) ds_flag(P.fl[j], seq);
+        }
+    }
+#endif
 }
 // ---- sampled drafts: an exact draw from q = softmax(s * invTq) by Gumbel-max. z = s * invTq
 // + G with G = -log(-log(u)), u in (0, 1) from a counter-based hash of the request's seed,

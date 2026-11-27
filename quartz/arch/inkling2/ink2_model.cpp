@@ -283,6 +283,10 @@ struct ink2_ctx : qz_ctx {
         // adjacent verify tier to refresh its estimate. QZ_DS_ROWS=2..8 fixes n (read per call).
         const char * e_rows = getenv("QZ_DS_ROWS");
         const int rows_fixed = e_rows && *e_rows ? atoi(e_rows) : 0;
+        // the verify runs one chain group of CG blocks per row in a grid of ncu blocks, so a
+        // card with fewer than VR * CG blocks (a virtual card: 30) caps the rows
+        int rows_cap = VR;
+        for (int c = 0; c < QZ_NC; c++) rows_cap = std::min(rows_cap, E.C[c].ncu / CG);
         static constexpr double RT_SEED[VR + 1] = { 0.0, 0.0, 0.51, 0.61, 0.66, 0.84, 0.90, 0.95, 1.00 };
         static double rt_ms[VR + 1] = {0};               // per n round time (ms), across requests
         static int rt_n[VR + 1] = {0};                   // its samples
@@ -379,7 +383,7 @@ struct ink2_ctx : qz_ctx {
             if (!anchor) anc = pick();
             anchor = false;
             if (emit(anc)) break;
-            const int nr = pick_rows(), nd = nr - 1;
+            const int nr = std::min(pick_rows(), rows_cap), nd = nr - 1;
             if (!dsr || pos + nr > E.ctx || !spec) {
                 hi = std::max(hi, pos);
                 E.step(anc, pos++, true);

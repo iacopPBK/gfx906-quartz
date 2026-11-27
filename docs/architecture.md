@@ -39,7 +39,10 @@ four. Each card has one inbox slot per other card: card `me`'s peer `k` is
 reads peer `k` from its own slot `k - 1` (`kernels/xchg.h`). At two cards that is
 the single slot of before, with the same bits. At four, a sum is
 `(p0 + p1) + (p2 + p3)` in card order on every card, so all cards hold the same
-values. The vocabulary head's merge (`qz_xfold`: max, lower id on ties) does not
+values. Both models' decode and verify sums take two hops at four cards, so that no
+GPU writes to two peers at once (on some hosts that drops P2P to a fraction of a
+GB/s): the partials go to the pair partner `me ^ 1`, then the pair sums to the cross
+partner `me ^ 2`, with the same bits as the one-hop sum. The vocabulary head's merge (`qz_xfold`: max, lower id on ties) does not
 depend on order. Greedy output at four cards differs from two only where the
 reordered sums break a near-tie.
 
